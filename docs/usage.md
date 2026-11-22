@@ -7,7 +7,7 @@
 - FFmpeg 和 ffprobe 单独安装。支持 **NVIDIA (NVENC) / Intel (QSV) / AMD (AMF)** 10-bit HEVC 显卡硬件加速，也可在无独显或硬编不可用时完全使用 CPU (`libx265`) 运行。
 - HDR 文件需要相应设备和播放器才能显示其完整亮度范围。
 
-FFmpeg 应包含 `zscale`、`colorchannelmixer`、`lut1d`、`libx265`、`framehash`；使用音效时还需 `extrastereo`、`stereowiden`、`volume`、`alimiter`。若使用显卡硬件加速，建议使用支持 `-mastering_display`、`-content_light` 及对应 `hevc_nvenc` / `hevc_qsv` / `hevc_amf` 编码器的较新完整 FFmpeg 构建。
+FFmpeg 应包含 `zscale`、`colorchannelmixer`、`lut1d`、`libx265`、`framehash`；使用音效时还需 `extrastereo`、`stereowiden`、`volume`、`alimiter`。使用显卡硬件加速时需较新完整 FFmpeg（支持 `-mastering_display`、`-content_light` 及 `hevc_nvenc` / `hevc_qsv` / `hevc_amf`）；使用杜比视界转换时，Profile 8.1/7 无损直剥需要 `dovi_rpu`（Profile 7 另需 `dovi_split` 或 `filter_units`），Profile 5/8.4 色彩还原需要 `libplacebo` 及支持 Vulkan 的显卡驱动。
 
 可通过 [FFmpeg 下载页](https://ffmpeg.org/download.html)寻找 Windows 构建。程序依次查找自身 `bin` 文件夹、同目录、系统 `PATH` 和常见 WinGet 安装目录。
 
@@ -44,6 +44,16 @@ SDR2HDR/
 - **CPU 软件编码 (x265)**：始终使用 `libx265` 软件编码，速度较慢但兼容性最广，同体积下压缩率通常更高。
 
 注：画面色调变换、缩放与 10-bit 抖动仍在高精度浮点与 `zscale` 管线中完成，显卡主要加速耗时最多的 10-bit HEVC 编码阶段，在 2K / 4K 视频下可大幅缩短导出时间。
+
+## 杜比视界（DV）转 HDR10
+
+选择任意杜比视界视频（MP4 / MKV / MOV 等），程序会自动读取容器配置记录与首帧 RPU 元数据，并按 Profile 选择最佳路径：
+
+- **Profile 8.1（含 HDR10 兼容层）**：不重编码，使用 `dovi_rpu=strip=1` 直接剥离 RPU 与 `dvcC` 配置盒，保留原生 10-bit HDR10 视频流，秒级完成、零画质损失。
+- **Profile 7（双层蓝光）**：不重编码，使用 `dovi_split=mode=bl,dovi_rpu=strip=1` 保留 10-bit HDR10 基础层（BL）并剥离增强层（EL）与 RPU（注：不烘焙 FEL 增强层的额外亮度增量）。
+- **Profile 5（IPTPQc2，普通屏幕偏绿偏紫）与 Profile 8.4（HLG 杜比视界）**：由于没有标准 HDR10 基础层，程序自动通过 `libplacebo`（`apply_dolbyvision=true`）将画面还原为标准 10-bit PQ / BT.2020，再交由已选显卡硬编或 CPU 编码输出，并彻底清除残留的杜比视界元数据标记。
+
+在无损直剥模式下，界面会自动锁定尺寸、画质和编码器，但仍可选择原声保留或双声道虚拟环绕音效，也支持 10 秒试转。
 
 ## 给已有 HDR 加音效
 

@@ -1,26 +1,29 @@
 # SDR2HDR Desktop
 
-一个面向 Windows 的离线视频转换工具：将普通 SDR 视频处理为 HDR10，支持 NVIDIA / Intel / AMD 显卡硬件加速与 CPU 自动回退，提供四档画面编码、双声道虚拟环绕，以及自动逐帧校验的画面无损编码。
+一个面向 Windows 的离线视频转换工具：支持将普通 **SDR 视频** 和 **杜比视界（Dolby Vision Profile 5 / 7 / 8.1 / 8.4）** 转换为标准 **HDR10**，支持 NVIDIA / Intel / AMD 显卡硬件加速与 CPU 自动回退，提供四档画面编码、双声道虚拟环绕，以及自动逐帧校验的画面无损编码。
 
 ![SDR2HDR Desktop 界面](assets/app.png)
 
 ## 功能
 
-- 输出 HEVC Main 10、10-bit、PQ / BT.2020、MP4 / hvc1 视频。
+- **SDR 转 HDR10**：输出 HEVC Main 10、10-bit、PQ / BT.2020、MP4 / hvc1 视频。
+- **杜比视界（DV）转 HDR10**：自动识别 Profile 5 / 7 / 8.1 / 8.4——
+  - **Profile 8.1 / Profile 7（含 HDR10 兼容层）**：秒级无损直剥（不重编码，保留原生 10-bit HDR10 基础层并剥离 RPU／增强层，零画质损失）；
+  - **Profile 5（IPTPQc2，普通屏幕偏绿偏紫）与 Profile 8.4（HLG 杜比视界）**：通过 `libplacebo` 进行杜比视界色彩还原，再由显卡硬编或 CPU 导出标准 HDR10。
 - 支持 **NVIDIA NVENC / Intel QSV / AMD AMF** 10-bit 显卡硬编加速；启动时自动进行实测与 HDR10 元数据自检，不可用时无缝回退至 **CPU (libx265)**。
 - 保持原尺寸和帧率，或选择短边 1440 / 2160 的输出尺寸。
 - 提供快速、标准、精细、画面无损四种编码方式。
 - 无损档自动比较编码前后每一帧的像素摘要，全部一致才保存最终文件。
-- 可选双声道虚拟环绕；也可只给已有 HDR 视频加音效，直接保留原视频轨道。
+- 可选双声道虚拟环绕；也可只给已有 HDR10 视频加音效，直接保留原视频轨道。
 - 支持先试转 10 秒、取消任务、导出检查和转换记录。
 - 离线运行，不自动上传视频，保留原文件。
 
 ## 开始使用
 
 1. 在仓库的 **Releases** 页面下载 Windows 压缩包，解压后运行 `SDR2HDR.exe`。
-2. 准备包含 `zscale`、`libx265`、`lut1d` 等组件的较新完整 FFmpeg（若使用显卡硬编并写入 HDR10 静态元数据，需 FFmpeg 支持 `-mastering_display` / `-content_light` 及对应 `hevc_nvenc` / `hevc_qsv` / `hevc_amf`）。将其加入 `PATH`，或把 `ffmpeg.exe`、`ffprobe.exe` 放入程序旁的 `bin` 文件夹。
-3. 选择 SDR 视频、导出位置、编码器（默认“自动（优先显卡加速）”）、转换方式和音效，先点击 **先试转 10 秒** 检查效果。
-4. 点击 **导出完整 HDR**，等待转换和文件检查完成。
+2. 准备包含 `zscale`、`libx265`、`lut1d`、`dovi_rpu`、`libplacebo` 等组件的较新完整 FFmpeg（若使用显卡硬编并写入 HDR10 静态元数据，需 FFmpeg 支持 `-mastering_display` / `-content_light` 及对应 `hevc_nvenc` / `hevc_qsv` / `hevc_amf`）。将其加入 `PATH`，或把 `ffmpeg.exe`、`ffprobe.exe` 放入程序旁的 `bin` 文件夹。
+3. 选择 SDR 或杜比视界视频、导出位置、编码器（默认“自动（优先显卡加速）”）、转换方式和音效，先点击 **先试转 10 秒** 检查效果。
+4. 点击 **导出完整 HDR**（或 **无损导出 HDR10**），等待转换和文件检查完成。
 
 Windows 程序包已包含 Python 运行环境，无需另装 Python；FFmpeg 需要单独准备。
 
@@ -68,7 +71,9 @@ q = 0.65 × ln(1 + 5 × max(x, 0)) / ln(6)
 ```powershell
 python source/app.py
 python source/hdr_core.py --list-encoders
+python source/hdr_core.py --list-dv-tools
 python source/hdr_core.py "input.mp4" "output_HDR.mp4" --encoder auto --quality fine
+python source/hdr_core.py "dolby_vision.mkv" "output_HDR10.mp4" --dv-mode auto
 python source/hdr_core.py "input.mp4" "output_HDR_cpu.mp4" --encoder cpu --quality fine
 python source/hdr_core.py "input.mp4" "output_lossless.mp4" --quality lossless
 python source/hdr_core.py "input.mp4" "output_HDR_surround.mp4" --audio-effect surround

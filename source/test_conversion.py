@@ -406,6 +406,258 @@ class ConversionTests(unittest.TestCase):
             self.assertTrue(res_ll["validation"]["lossless_pixels"]["all_frames_equal"])
             self.assertEqual(res_ll["validation"]["lossless_pixels"]["frames_compared"], 30)
 
+    def _build_rpu_nal(self, profile="8.1"):
+        bits = []
+        def put(val, n):
+            for i in range(n - 1, -1, -1):
+                bits.append((val >> i) & 1)
+        def ue(val):
+            v = val + 1
+            n = v.bit_length() - 1
+            put(0, n)
+            put(v, n + 1)
+        def se(val):
+            ue(val * 2 - 1 if val > 0 else -val * 2)
+
+        put(2, 6); put(18, 11)
+        put(0, 4); put(0, 4)
+        put(1, 1); put(0, 1); put(0, 2); ue(14); put(2, 2)
+        put(1 if profile == "5" else 0, 1)
+        ue(2); ue(2); ue(4)
+        put(0, 1); put(0, 3); put(0, 1); put(1, 1)
+        put(1, 1); put(0, 1); ue(0)
+        ue(0); ue(0)
+        for _ in range(3):
+            ue(0); put(0, 10); put(1023, 10)
+        ue(0); ue(0)
+        for _ in range(3):
+            ue(0); ue(0); put(0, 1)
+            se(0); put(0, 14)
+            se(1); put(0, 14)
+        ue(0); ue(0); ue(0)
+        if profile == "5":
+            ycc = [8192, 0, 8192, 8192, -2048, -2048, 8192, 8192, 0]
+            off = [0, 1 << 27, 1 << 27]
+            lms = [16384, 0, 0, 0, 16384, 0, 0, 0, 16384]
+        else:
+            ycc = [8192, 0, 12080, 8192, -1348, -4681, 8192, 15413, 0]
+            off = [0, 1 << 27, 1 << 27]
+            lms = [5888, 9626, 870, 2708, 12030, 1646, 369, 1437, 14578]
+        for c in ycc:
+            put(c & 0xFFFF, 16)
+        for o in off:
+            put(o & 0xFFFFFFFF, 32)
+        for c in lms:
+            put(c & 0xFFFF, 16)
+        put(18 if profile == "8.4" else 65535, 16)
+        put(0, 16); put(0, 16); put(0, 32)
+        put(10, 5)
+        put(3 if profile == "5" else 0, 2)
+        put(0, 2)
+        put(2 if profile == "5" else 1, 2)
+        put(1, 12); put(3079, 12); put(0, 10)
+        ue(0)
+        while len(bits) % 8:
+            bits.append(0)
+        payload = bytes(sum(bits[i + j] << (7 - j) for j in range(8)) for i in range(0, len(bits), 8))
+        crc = 0xFFFFFFFF
+        for byte in payload:
+            crc ^= byte << 24
+            for _ in range(8):
+                crc = (((crc << 1) ^ 0x04C11DB7) if (crc & 0x80000000) else (crc << 1)) & 0xFFFFFFFF
+        raw = b"\x19" + payload + crc.to_bytes(4, "big") + b"\x80"
+        escaped = bytearray()
+        zeros = 0
+        for b in raw:
+            if zeros == 2 and b <= 3:
+                escaped.append(3)
+                zeros = 0
+            escaped.append(b)
+            zeros = zeros + 1 if b == 0 else 0
+        return b"\x00\x00\x00\x01\x7c\x01" + bytes(escaped)
+
+    def make_dolby_vision_source(self, profile="8.1", with_el=False, omit_cll=False, name=None):
+        ffmpeg = core.find_tool("ffmpeg")
+        raw = self.dir / f"base_dv_{profile}_{with_el}_{omit_cll}.hevc"
+        if profile == "5":
+            x265p = "aud=1:bframes=0:range=full:repeat-headers=1"
+        elif profile == "8.4":
+            x265p = "aud=1:bframes=0:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:range=limited:repeat-headers=1"
+        else:
+            cll_part = "" if omit_cll else ":max-cll=1000,1000"
+            x265p = (
+                "aud=1:bframes=0:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
+                f"hdr10=1:repeat-headers=1:master-display={core.MASTERING_DISPLAY}{cll_part}"
+            )
+        r = core.capture([
+            ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=256x144:r=25:d=0.4",
+            "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-preset", "ultrafast",
+            "-x265-params", x265p, "-f", "hevc", str(raw),
+        ])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        suffix = (b"\x00\x00\x00\x01\x7e\x01\x00\x00\x03\x01\xaa\xbb" if with_el else b"") + self._build_rpu_nal(profile)
+        marker = b"\x00\x00\x00\x01\x46\x01"
+        parts = raw.read_bytes().split(marker)
+        self.assertGreater(len(parts), 1)
+        injected = bytearray(parts[0])
+        for part in parts[1:]:
+            injected.extend(marker)
+            injected.extend(part)
+            injected.extend(suffix)
+        dv_hevc = self.dir / f"dv_{profile}_{with_el}_{omit_cll}.hevc"
+        dv_hevc.write_bytes(bytes(injected))
+        mp4 = self.dir / (name or f"dv_{profile}.mp4")
+        r_mux = core.capture([
+            ffmpeg, "-y", "-v", "error", "-r", "25", "-i", str(dv_hevc),
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.4",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy", "-bsf:v", "dovi_rpu=compression=none",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2",
+            "-strict", "unofficial", str(mp4),
+        ])
+        self.assertEqual(r_mux.returncode, 0, r_mux.stderr)
+        return mp4
+
+    def test_dolby_vision_profile_detection_and_command_routing(self):
+        fake_p7_info = {
+            "streams": [
+                {
+                    "index": 0, "codec_type": "video", "codec_name": "hevc",
+                    "width": 3840, "height": 2160, "pix_fmt": "yuv420p10le",
+                    "color_space": "bt2020nc", "color_primaries": "bt2020",
+                    "color_transfer": "smpte2084", "color_range": "tv",
+                    "avg_frame_rate": "24000/1001", "duration": "120.0",
+                    "side_data_list": [{
+                        "side_data_type": "DOVI configuration record",
+                        "dv_profile": 7, "dv_bl_signal_compatibility_id": 6,
+                        "el_present_flag": 1, "rpu_present_flag": 1, "bl_present_flag": 1,
+                    }],
+                },
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2, "sample_rate": "48000", "duration": "120.0"},
+            ],
+            "format": {"duration": "120.0"},
+        }
+        dv7 = core.detect_dolby_vision(fake_p7_info)
+        self.assertIsNotNone(dv7)
+        self.assertEqual(dv7["profile_code"], "7")
+        self.assertTrue(dv7["strip_supported"])
+        self.assertTrue(dv7["el_present"])
+
+        dest = self.dir / "p7_out.mp4"
+        tools_all = dict(dovi_rpu=True, dovi_split=True, filter_units=True, libplacebo=True, strip_available=True, strip_reason="", libplacebo_reason="")
+        cmd7, plan7 = core.build_command(core.Options("p7.mkv", str(dest)), fake_p7_info, dest, dv_info=dv7, dv_tools=tools_all)
+        self.assertEqual(plan7["video_operation"], "dv_strip")
+        self.assertEqual(cmd7[cmd7.index("-bsf:v") + 1], "dovi_split=mode=bl,dovi_rpu=strip=1")
+        self.assertEqual(cmd7[cmd7.index("-c:v") + 1], "copy")
+
+        # Fallback to filter_units when dovi_split is unavailable.
+        tools_no_split = {**tools_all, "dovi_split": False}
+        cmd7_fb, _ = core.build_command(core.Options("p7.mkv", str(dest)), fake_p7_info, dest, dv_info=dv7, dv_tools=tools_no_split)
+        self.assertEqual(cmd7_fb[cmd7_fb.index("-bsf:v") + 1], "filter_units=remove_types=63,dovi_rpu=strip=1")
+
+        # Missing dovi_rpu raises clear ConversionError.
+        with self.assertRaisesRegex(core.ConversionError, "dovi_rpu"):
+            core.build_command(core.Options("p7.mkv", str(dest)), fake_p7_info, dest, dv_info=dv7, dv_tools={**tools_all, "dovi_rpu": False})
+
+        # 4000-nit source_max_pq metadata derivation for DV Profile 5 re-encode.
+        mastering_4k, cll_4k, peak_4k = core._dv_static_metadata({"source_max_pq": 3696})
+        self.assertEqual(peak_4k, 4000)
+        self.assertIn("L(40000000,1)", mastering_4k)
+        self.assertEqual(cll_4k, "4000,1000")
+
+        # Dual-track Profile 7 detection (DOVI record on secondary enhancement stream).
+        dual_p7_info = {
+            "streams": [
+                {**fake_p7_info["streams"][0], "side_data_list": []},
+                {"index": 1, "codec_type": "video", "codec_name": "hevc", "width": 1920, "height": 1080,
+                 "side_data_list": fake_p7_info["streams"][0]["side_data_list"]},
+                {**fake_p7_info["streams"][1], "index": 2},
+            ],
+            "format": {"duration": "120.0"},
+        }
+        dv7_dual = core.detect_dolby_vision(dual_p7_info)
+        self.assertIsNotNone(dv7_dual)
+        self.assertTrue(dv7_dual["dual_track"])
+        self.assertTrue(dv7_dual["strip_supported"])
+
+    def test_real_dolby_vision_conversions(self):
+        core.clear_dv_tools_cache()
+        tools = core.detect_dv_tools(force=True)
+        self.assertTrue(tools["dovi_rpu"])
+
+        # 1. DV Profile 8.1 -> lossless stream-copy strip + surround audio option
+        dv81 = self.make_dolby_vision_source("8.1", name="dv81.mp4")
+        insp81 = core.inspect_input(dv81)
+        self.assertEqual(insp81["kind"], "dv_strip")
+        self.assertEqual(insp81["dv"]["profile_code"], "8.1")
+
+        out81 = self.dir / "dv81_HDR10.mp4"
+        res81 = core.convert(core.Options(str(dv81), str(out81), audio_effect="surround"))
+        self.assertEqual(res81["plan"]["video_operation"], "dv_strip")
+        self.assertEqual(res81["video_codec"], "copy")
+        self.assertTrue(res81["validation"]["checks"]["no_dovi"])
+        self.assertTrue(all(res81["validation"]["checks"].values()))
+
+        # 2. DV Profile 8.1 without MaxCLL/MaxFALL (common Blu-ray base layer) still passes
+        dv81_nocll = self.make_dolby_vision_source("8.1", omit_cll=True, name="dv81_nocll.mp4")
+        out81_nocll = self.dir / "dv81_nocll_HDR10.mp4"
+        res81_nocll = core.convert(core.Options(str(dv81_nocll), str(out81_nocll)))
+        self.assertEqual(res81_nocll["plan"]["video_operation"], "dv_strip")
+        self.assertTrue(res81_nocll["validation"]["checks"]["no_dovi"])
+
+        # 3. DV with Enhancement Layer (NAL 63) + RPU (NAL 62) -> verify both NAL 62 & 63 stripped
+        dv7_sim = self.make_dolby_vision_source("8.1", with_el=True, name="dv7_el.mp4")
+        out7 = self.dir / "dv7_HDR10.mp4"
+        info7 = core.probe(dv7_sim)
+        dv7_meta = {**core.detect_dolby_vision(info7, dv7_sim), "dv_profile": 7, "el_present": True, "profile_code": "7"}
+        with patch.object(core, "detect_dolby_vision", return_value=dv7_meta):
+            res7 = core.convert(core.Options(str(dv7_sim), str(out7)))
+        self.assertEqual(res7["plan"]["video_operation"], "dv_strip")
+        self.assertIn("dovi_split=mode=bl", res7["plan"]["dv_bsf"])
+        raw7 = self.dir / "dv7_out.hevc"
+        core.capture([core.find_tool("ffmpeg"), "-y", "-v", "error", "-i", str(out7), "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", str(raw7)])
+        raw7_bytes = raw7.read_bytes()
+        self.assertNotIn(b"\x00\x00\x01\x7c\x01", raw7_bytes)
+        self.assertNotIn(b"\x00\x00\x01\x7e\x01", raw7_bytes)
+
+        if not tools["libplacebo"]:
+            self.skipTest("libplacebo/Vulkan not available on this host")
+
+        # 4. DV Profile 5 (IPTPQc2) -> libplacebo + encoder (and reject dv_mode='strip')
+        dv5 = self.make_dolby_vision_source("5", name="dv5.mp4")
+        insp5 = core.inspect_input(dv5)
+        self.assertEqual(insp5["kind"], "dv_reencode")
+        self.assertEqual(insp5["dv"]["profile_code"], "5")
+
+        with self.assertRaisesRegex(core.ConversionError, "无法无损直剥"):
+            core.convert(core.Options(str(dv5), str(self.dir / "dv5_bad_strip.mp4"), dv_mode="strip"))
+
+        out5 = self.dir / "dv5_HDR10.mp4"
+        res5 = core.convert(core.Options(str(dv5), str(out5), quality="standard", encoder="auto"))
+        self.assertEqual(res5["plan"]["video_operation"], "dv_reencode")
+        self.assertTrue(res5["validation"]["checks"]["no_dovi"])
+        self.assertTrue(all(res5["validation"]["checks"].values()))
+
+        # DV Profile 5 lossless mode -> bit-exact frame verification against libplacebo reference
+        out5_ll = self.dir / "dv5_HDR10_lossless.mp4"
+        res5_ll = core.convert(core.Options(str(dv5), str(out5_ll), quality="lossless", encoder="auto"))
+        self.assertTrue(res5_ll["plan"]["lossless_video"])
+        self.assertTrue(res5_ll["validation"]["lossless_pixels"]["all_frames_equal"])
+        self.assertEqual(res5_ll["validation"]["lossless_pixels"]["frames_compared"], 10)
+
+        # 5. DV Profile 8.4 (HLG Dolby Vision) -> libplacebo + PQ HDR10
+        dv84 = self.make_dolby_vision_source("8.4", name="dv84.mp4")
+        insp84 = core.inspect_input(dv84)
+        self.assertEqual(insp84["kind"], "dv_reencode")
+        self.assertEqual(insp84["dv"]["profile_code"], "8.4")
+
+        out84 = self.dir / "dv84_HDR10.mp4"
+        res84 = core.convert(core.Options(str(dv84), str(out84), quality="fast", encoder="auto"))
+        self.assertEqual(res84["plan"]["video_operation"], "dv_reencode")
+        self.assertTrue(res84["validation"]["checks"]["PQ"])
+        self.assertTrue(res84["validation"]["checks"]["no_dovi"])
+        self.assertTrue(all(res84["validation"]["checks"].values()))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

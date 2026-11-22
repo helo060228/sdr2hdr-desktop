@@ -23,11 +23,13 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128
 ALGORITHM_ID = "Fixed logarithmic SDR-to-PQ tone expansion with chroma gain 0.56"
+DV_STRIP_ALGORITHM_ID = "Lossless Dolby Vision RPU/EL strip preserving native 10-bit HDR10 base layer"
+DV_REENCODE_ALGORITHM_ID = "Dolby Vision to HDR10 conversion via libplacebo (apply_dolbyvision=true)"
 MASTERING_DISPLAY = "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)"
 CONTENT_LIGHT = "1000,1000"
 HW_MIN_WIDTH = 160
@@ -66,6 +68,8 @@ ENCODER_SPECS = {
 }
 _ENCODER_CACHE: dict[str, dict[str, dict]] = {}
 _ENCODER_CACHE_LOCK = threading.Lock()
+_DV_TOOLS_CACHE: dict[str, dict] = {}
+_DV_TOOLS_CACHE_LOCK = threading.Lock()
 # Stereo spatial expansion uses channel difference, short cross delay,
 # modest gain and peak limiting. Output remains a two-channel AAC stream.
 SURROUND_FILTER = (
@@ -127,6 +131,15 @@ def progress_seconds(fields: dict, previous=0.0) -> float:
 def pq_encode(nits: float) -> float:
     x = max(0.0, nits / 10000.0) ** M1
     return ((C1 + C2 * x) / (1 + C3 * x)) ** M2
+
+
+def pq_decode(code: float) -> float:
+    e = max(0.0, min(1.0, code)) ** (1.0 / M2)
+    num = max(0.0, e - C1)
+    den = C2 - C3 * e
+    if den <= 0:
+        return 10000.0
+    return 10000.0 * ((num / den) ** (1.0 / M1))
 
 
 def curve(x: float, peak: float = 1000.0) -> float:
@@ -194,10 +207,221 @@ def video_stream(info: dict) -> dict:
     return videos[0]
 
 
-def is_hdr_video(info: dict) -> bool:
+def _has_dovi_side_data(side_data_list: list[dict] | None) -> bool:
+    for item in side_data_list or ():
+        kind = str(item.get("side_data_type") or "").upper()
+        if "DOVI" in kind or "DOLBY VISION" in kind:
+            return True
+    return False
+
+
+def _probe_first_frame_side_data(path: Path, stream_index: int) -> list[dict]:
+    try:
+        frame = capture([find_tool("ffprobe"), "-v", "error", "-select_streams", str(stream_index),
+                         "-read_intervals", "%+#1", "-show_frames", "-of", "json", str(path)], timeout=20)
+    except (subprocess.TimeoutExpired, OSError, ConversionError):
+        return []
+    if frame.returncode or not frame.stdout.strip():
+        return []
+    try:
+        frame_data = json.loads(frame.stdout)
+    except json.JSONDecodeError:
+        return []
+    return [s for f in frame_data.get("frames", []) for s in f.get("side_data_list", [])]
+
+
+def _int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def detect_dolby_vision(info: dict, path: Path | None = None) -> dict | None:
+    """Inspect stream and (when needed) first-frame metadata for Dolby Vision."""
     v = video_stream(info)
-    return v.get("color_transfer") in ("smpte2084", "arib-std-b67") or any(
-        "DOVI" in s.get("side_data_type", "").upper() for s in v.get("side_data_list", []))
+    stream_side = v.get("side_data_list") or []
+    dovi_rec = next((s for s in stream_side if "DOVI" in str(s.get("side_data_type") or "").upper()), None)
+    dual_track_p7 = False
+    if dovi_rec is None:
+        for s in info.get("streams", []):
+            if s.get("codec_type") != "video" or s.get("index") == v.get("index"):
+                continue
+            if s.get("disposition", {}).get("attached_pic"):
+                continue
+            other_rec = next((x for x in (s.get("side_data_list") or [])
+                              if "DOVI" in str(x.get("side_data_type") or "").upper()), None)
+            if other_rec is not None:
+                dovi_rec = other_rec
+                dual_track_p7 = True
+                break
+
+    codec_tag = str(v.get("codec_tag_string") or "").lower()
+    trc = v.get("color_transfer")
+    pix_fmt = str(v.get("pix_fmt") or "")
+    need_frame_probe = (
+        path is not None and path.is_file() and (
+            dovi_rec is not None
+            or codec_tag in ("dvhe", "dvh1")
+            or (
+                v.get("codec_name") in ("hevc", "av1")
+                and pix_fmt in ("yuv420p10le", "p010le", "")
+                and trc in ("smpte2084", "arib-std-b67", "unknown", "unspecified", None)
+            )
+        )
+    )
+    frame_side = _probe_first_frame_side_data(path, v["index"]) if need_frame_probe else []
+    dv_meta = next((s for s in frame_side if "DOLBY VISION METADATA" in str(s.get("side_data_type") or "").upper()), None)
+    has_frame_dv = dv_meta is not None or _has_dovi_side_data(frame_side)
+
+    if dovi_rec is None and not has_frame_dv and codec_tag not in ("dvhe", "dvh1"):
+        return None
+
+    dv_profile = _int_or_none(dovi_rec.get("dv_profile")) if dovi_rec else None
+    bl_compat = _int_or_none(dovi_rec.get("dv_bl_signal_compatibility_id")) if dovi_rec else None
+    el_present = bool(dovi_rec and dovi_rec.get("el_present_flag")) or dual_track_p7
+
+    if dv_profile is None and dv_meta is not None:
+        vdr_profile = _int_or_none(dv_meta.get("vdr_rpu_profile"))
+        disable_residual = _int_or_none(dv_meta.get("disable_residual_flag"))
+        sig_cs = _int_or_none(dv_meta.get("signal_color_space"))
+        bl_full = _int_or_none(dv_meta.get("bl_video_full_range_flag"))
+        sig_eotf = _int_or_none(dv_meta.get("signal_eotf"))
+        if sig_cs == 3 or (bl_full == 1 and trc not in ("smpte2084", "arib-std-b67")):
+            dv_profile, bl_compat = 5, 0
+        elif vdr_profile == 1 or disable_residual == 0:
+            dv_profile, bl_compat, el_present = 7, 6, True
+        elif trc == "arib-std-b67" or sig_eotf == 18:
+            dv_profile, bl_compat = 8, 4
+        elif trc == "smpte2084":
+            dv_profile, bl_compat = 8, 1
+    if dv_profile == 7:
+        el_present = True
+
+    has_hdr10_bl = (
+        v.get("codec_name") == "hevc"
+        and pix_fmt == "yuv420p10le"
+        and trc == "smpte2084"
+        and v.get("color_primaries") == "bt2020"
+        and v.get("color_space") == "bt2020nc"
+    )
+    strip_supported = has_hdr10_bl and ((dv_profile == 8 and bl_compat == 1) or dv_profile == 7)
+
+    if dv_profile == 5:
+        profile_code, profile_label = "5", "Profile 5 (IPTPQc2)"
+    elif dv_profile == 7:
+        profile_code, profile_label = "7", "Profile 7 (双层蓝光 HDR10 基础层)"
+    elif dv_profile == 8 and bl_compat == 1:
+        profile_code, profile_label = "8.1", "Profile 8.1 (HDR10 兼容层)"
+    elif dv_profile == 8 and bl_compat == 4:
+        profile_code, profile_label = "8.4", "Profile 8.4 (HLG 杜比视界)"
+    elif dv_profile == 8 and bl_compat == 2:
+        profile_code, profile_label = "8.2", "Profile 8.2 (SDR 兼容层)"
+    elif dv_profile == 8 and bl_compat is not None:
+        profile_code, profile_label = f"8.{bl_compat}", f"Profile 8.{bl_compat}"
+    elif dv_profile is not None:
+        profile_code, profile_label = str(dv_profile), f"Profile {dv_profile}"
+    else:
+        profile_code, profile_label = "unknown", "未知 Profile"
+
+    all_side = list(stream_side) + list(frame_side)
+    source_has_mastering = any("Mastering display" in str(s.get("side_data_type") or "") for s in all_side)
+    source_has_content_light = any("Content light" in str(s.get("side_data_type") or "") for s in all_side)
+    source_max_pq = _int_or_none(dv_meta.get("source_max_pq")) if dv_meta else None
+
+    return dict(
+        dv_profile=dv_profile,
+        bl_compat=bl_compat,
+        profile_code=profile_code,
+        profile_label=profile_label,
+        el_present=el_present,
+        dual_track=dual_track_p7,
+        has_hdr10_bl=has_hdr10_bl,
+        strip_supported=strip_supported,
+        recommended_mode="strip" if strip_supported else "reencode",
+        source_max_pq=source_max_pq,
+        source_has_mastering=source_has_mastering,
+        source_has_content_light=source_has_content_light,
+    )
+
+
+def _dv_static_metadata(dv_info: dict | None) -> tuple[str, str, int]:
+    peak = 1000
+    max_pq = dv_info.get("source_max_pq") if dv_info else None
+    if isinstance(max_pq, int) and 0 < max_pq <= 4095:
+        nits = pq_decode(max_pq / 4095.0)
+        if nits <= 1100:
+            peak = 1000
+        elif nits >= 3500:
+            peak = 4000
+        else:
+            peak = max(1000, min(4000, int(round(nits / 100.0) * 100)))
+    mastering = f"G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L({peak * 10000},1)"
+    content_light = f"{peak},1000"
+    return mastering, content_light, peak
+
+
+def is_hdr_video(info: dict, path: Path | None = None) -> bool:
+    v = video_stream(info)
+    if v.get("color_transfer") in ("smpte2084", "arib-std-b67") or _has_dovi_side_data(v.get("side_data_list")):
+        return True
+    if path is not None:
+        return detect_dolby_vision(info, path) is not None
+    return False
+
+
+def dv_properties(info: dict, dv: dict, strip: bool) -> dict:
+    v = video_stream(info)
+    try:
+        width, height = int(v["width"]), int(v["height"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ConversionError("视频没有提供有效的画面尺寸，无法开始转换。") from None
+    if width <= 0 or height <= 0:
+        raise ConversionError("视频的画面尺寸无效，无法开始转换。")
+    if not strip and v.get("field_order") not in (None, "unknown", "progressive"):
+        raise ConversionError("暂不处理隔行扫描视频。请先去隔行，避免改变运动效果。")
+    rotation = next((_finite_number(s.get("rotation")) or 0 for s in v.get("side_data_list", []) if "rotation" in s), 0)
+    sar = 1.0 if strip else _positive_ratio(v.get("sample_aspect_ratio"), 1.0)
+    if not strip and abs(rotation) % 180 == 90:
+        width, height, sar = height, width, 1 / sar
+    fps = _positive_ratio(v.get("avg_frame_rate"), _positive_ratio(v.get("r_frame_rate"), 25.0))
+    duration = _known_duration(v.get("duration"), info.get("format", {}).get("duration"))
+    color_range = "full" if v.get("color_range") == "pc" else ("limited" if v.get("color_range") == "tv" else "unknown")
+    return dict(
+        width=width, height=height, sar=sar, fps=fps or 25, duration=duration,
+        matrix=v.get("color_space") or "unknown",
+        transfer=v.get("color_transfer") or "unknown",
+        primaries=v.get("color_primaries") or "unknown",
+        range=color_range, guessed=[], stream_index=v["index"],
+        pixel_format=v.get("pix_fmt") or "", dv=dv,
+    )
+
+
+def inspect_input(path: Path, info: dict | None = None) -> dict:
+    """Classify an input file as sdr, dv_strip, dv_reencode, or hdr10."""
+    info = info if info is not None else probe(path)
+    dv = detect_dolby_vision(info, path)
+    if dv is not None:
+        strip = dv["strip_supported"]
+        return dict(
+            kind="dv_strip" if strip else "dv_reencode",
+            dv=dv,
+            properties=dv_properties(info, dv, strip=strip),
+            info=info,
+        )
+    if is_hdr_video(info):
+        return dict(
+            kind="hdr10",
+            dv=None,
+            properties=hdr_copy_properties(info),
+            info=info,
+        )
+    return dict(
+        kind="sdr",
+        dv=None,
+        properties=source_properties(info),
+        info=info,
+    )
 
 
 def hdr_copy_properties(info: dict) -> dict:
@@ -302,6 +526,16 @@ def filter_chain(p: dict, width: int, height: int, lut_name="tone.cube") -> str:
     ])
 
 
+def dv_filter_chain(width: int, height: int, pix_fmt: str = "yuv420p10le") -> str:
+    """Convert Dolby Vision (e.g. Profile 5 IPTPQc2 / Profile 8.4 HLG) to PQ BT.2020."""
+    return (
+        f"libplacebo=w={width}:h={height}:format={pix_fmt}:"
+        "colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084:range=tv:"
+        "apply_dolbyvision=true:peak_detect=false:tonemapping=clip:gamut_mode=clip:"
+        "dithering=ordered_fixed,setsar=1"
+    )
+
+
 @dataclasses.dataclass
 class Options:
     source: str
@@ -313,12 +547,19 @@ class Options:
     audio_effect: str = "original"
     copy_hdr_video: bool = False
     encoder: str = "auto"
+    dv_mode: str = "auto"
 
 
 def clear_encoder_cache() -> None:
     """Clear cached runtime encoder capability probe results."""
     with _ENCODER_CACHE_LOCK:
         _ENCODER_CACHE.clear()
+
+
+def clear_dv_tools_cache() -> None:
+    """Clear cached runtime Dolby Vision filter/BSF probe results."""
+    with _DV_TOOLS_CACHE_LOCK:
+        _DV_TOOLS_CACHE.clear()
 
 
 def _hardware_encoder_args(encoder_key: str, quality: str) -> tuple[list[str], dict]:
@@ -413,7 +654,88 @@ def _hdr_probe_checks(path: Path) -> tuple[dict[str, bool], dict, dict, list]:
     side = [s for f in frame_data.get("frames", []) for s in f.get("side_data_list", [])]
     checks["mastering_metadata"] = any("Mastering display" in s.get("side_data_type", "") for s in side)
     checks["content_light_metadata"] = any("Content light" in s.get("side_data_type", "") for s in side)
+    checks["no_dovi"] = (
+        not _has_dovi_side_data(v.get("side_data_list"))
+        and not _has_dovi_side_data(side)
+        and (v.get("codec_tag_string") or "").lower() not in ("dvhe", "dvh1")
+    )
     return checks, data, v, side
+
+
+def _compiled_bsfs(ffmpeg_path: str) -> set[str]:
+    try:
+        result = capture([ffmpeg_path, "-hide_banner", "-bsfs"], timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return set()
+    if result.returncode:
+        return set()
+    bsfs = set()
+    for line in result.stdout.splitlines():
+        token = line.strip()
+        if token and not token.endswith(":"):
+            bsfs.add(token)
+    return bsfs
+
+
+def _compiled_filters(ffmpeg_path: str) -> set[str]:
+    try:
+        result = capture([ffmpeg_path, "-hide_banner", "-filters"], timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return set()
+    if result.returncode:
+        return set()
+    filters = set()
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\s*[.\w]{2,3}\s+(\S+)\s+", line)
+        if match:
+            filters.add(match.group(1))
+    return filters
+
+
+def detect_dv_tools(force: bool = False) -> dict:
+    """Check FFmpeg Dolby Vision BSF and libplacebo/Vulkan availability."""
+    ffmpeg_path = find_tool("ffmpeg")
+    with _DV_TOOLS_CACHE_LOCK:
+        if not force and ffmpeg_path in _DV_TOOLS_CACHE:
+            return dict(_DV_TOOLS_CACHE[ffmpeg_path])
+    bsfs = _compiled_bsfs(ffmpeg_path)
+    filters = _compiled_filters(ffmpeg_path)
+    has_dovi_rpu = "dovi_rpu" in bsfs
+    has_dovi_split = "dovi_split" in bsfs
+    has_filter_units = "filter_units" in bsfs
+    has_libplacebo_compiled = "libplacebo" in filters
+    libplacebo_ok = False
+    libplacebo_reason = ""
+    if not has_libplacebo_compiled:
+        libplacebo_reason = "当前 FFmpeg 未编译 libplacebo 滤镜，无法转换杜比视界 Profile 5／8.4，请安装完整 FFmpeg 构建。"
+    else:
+        try:
+            probe_cmd = [
+                ffmpeg_path, "-hide_banner", "-nostdin", "-y", "-v", "error", "-f", "lavfi",
+                "-i", "color=c=gray:s=64x64:r=25:d=0.04",
+                "-vf", dv_filter_chain(64, 64, pix_fmt="yuv420p10le"),
+                "-f", "null", "-",
+            ]
+            r = capture(probe_cmd, timeout=15)
+            if r.returncode == 0:
+                libplacebo_ok = True
+            else:
+                libplacebo_reason = "libplacebo／Vulkan 初始化失败（请检查显卡驱动是否支持 Vulkan）：" + (r.stderr.strip()[-200:] or "未知错误")
+        except (subprocess.TimeoutExpired, OSError):
+            libplacebo_reason = "libplacebo／Vulkan 自检超时或无法启动。"
+    strip_reason = "" if has_dovi_rpu else "当前 FFmpeg 缺少 dovi_rpu 比特流滤镜，无法无损剥离杜比视界，请升级完整 FFmpeg。"
+    result = dict(
+        dovi_rpu=has_dovi_rpu,
+        dovi_split=has_dovi_split,
+        filter_units=has_filter_units,
+        libplacebo=libplacebo_ok,
+        strip_available=has_dovi_rpu,
+        strip_reason=strip_reason,
+        libplacebo_reason=libplacebo_reason,
+    )
+    with _DV_TOOLS_CACHE_LOCK:
+        _DV_TOOLS_CACHE[ffmpeg_path] = dict(result)
+    return dict(result)
 
 
 def _compiled_video_encoders(ffmpeg_path: str) -> set[str]:
@@ -556,27 +878,85 @@ def resolve_encoder(requested: str, quality: str, width: int, height: int,
 
 
 def build_command(opts: Options, info: dict, destination: Path,
-                  detected_encoders: dict | None = None) -> tuple[list[str], dict]:
-    p = hdr_copy_properties(info) if opts.copy_hdr_video else source_properties(info)
-    if opts.copy_hdr_video and opts.resolution != "original":
-        raise ConversionError("给已有 HDR 加音效时，请保持原尺寸，画面将直接复制。")
+                  detected_encoders: dict | None = None,
+                  dv_info: dict | None = None,
+                  dv_tools: dict | None = None) -> tuple[list[str], dict]:
     if opts.audio_effect not in ("original", "surround"):
         raise ConversionError("未知音效设置。")
-    w, h = (p["width"], p["height"]) if opts.copy_hdr_video else dimensions(p, opts.resolution)
     if opts.quality not in ("fast", "standard", "fine", "lossless"):
         raise ConversionError("未知的画面编码档位。")
-    lossless_video = opts.quality == "lossless" and not opts.copy_hdr_video
+    if opts.dv_mode not in ("auto", "strip", "reencode"):
+        raise ConversionError("未知的杜比视界处理模式。")
+
+    dv = None
     if opts.copy_hdr_video:
+        video_operation = "copy_hdr"
+        p = hdr_copy_properties(info)
+        if opts.resolution != "original":
+            raise ConversionError("给已有 HDR 加音效时，请保持原尺寸，画面将直接复制。")
+    else:
+        dv = dv_info if dv_info is not None else detect_dolby_vision(info)
+        if dv is not None:
+            if opts.dv_mode == "strip":
+                if not dv["strip_supported"]:
+                    raise ConversionError(
+                        f"杜比视界 {dv['profile_label']} 不含兼容的 10-bit HDR10 基础层，无法无损直剥，请使用自动模式或重编码模式。"
+                    )
+                if opts.resolution != "original":
+                    raise ConversionError("杜比视界无损直剥不支持调整分辨率，请保持原尺寸或改用重编码模式。")
+                video_operation = "dv_strip"
+            elif opts.dv_mode == "reencode":
+                video_operation = "dv_reencode"
+            else:
+                video_operation = "dv_strip" if (dv["strip_supported"] and opts.resolution == "original") else "dv_reencode"
+            p = dv_properties(info, dv, strip=(video_operation == "dv_strip"))
+        else:
+            video_operation = "sdr_to_hdr"
+            p = source_properties(info)
+
+    stream_copy = video_operation in ("copy_hdr", "dv_strip")
+    w, h = (p["width"], p["height"]) if stream_copy else dimensions(p, opts.resolution)
+    lossless_video = opts.quality == "lossless" and not stream_copy
+    dv_bsf = None
+    mastering_str, content_light_str, peak_nits = MASTERING_DISPLAY, CONTENT_LIGHT, 1000
+    tools = None
+
+    if video_operation == "copy_hdr":
         encoder_key, encoder_note = "copy", ""
         is_hw = False
         video_codec = "copy"
         encoder_label = "HDR 画面直拷"
         preset, crf = None, None
         quality_control = "stream copy"
+    elif video_operation == "dv_strip":
+        tools = dv_tools if dv_tools is not None else detect_dv_tools()
+        if not tools.get("dovi_rpu"):
+            raise ConversionError(tools.get("strip_reason") or "当前 FFmpeg 缺少 dovi_rpu 比特流滤镜，无法无损剥离杜比视界。")
+        if dv.get("el_present") or dv.get("dv_profile") == 7:
+            if tools.get("dovi_split"):
+                dv_bsf = "dovi_split=mode=bl,dovi_rpu=strip=1"
+            elif tools.get("filter_units"):
+                dv_bsf = "filter_units=remove_types=63,dovi_rpu=strip=1"
+            else:
+                raise ConversionError("当前 FFmpeg 缺少 dovi_split／filter_units 比特流滤镜，无法剥离 Profile 7 增强层。")
+        else:
+            dv_bsf = "dovi_rpu=strip=1"
+        encoder_key, encoder_note = "copy", f"杜比视界 {dv['profile_label']}：无损剥离杜比视界层，保留原生 HDR10 基础层"
+        is_hw = False
+        video_codec = "copy"
+        encoder_label = "无损直剥 (Stream Copy)"
+        preset, crf = None, None
+        quality_control = "stream copy (dovi strip)"
     else:
+        if video_operation == "dv_reencode":
+            tools = dv_tools if dv_tools is not None else detect_dv_tools()
+            if not tools.get("libplacebo"):
+                raise ConversionError(tools.get("libplacebo_reason") or "当前 FFmpeg 或显卡驱动不支持 libplacebo／Vulkan，无法转换杜比视界。")
+            mastering_str, content_light_str, peak_nits = _dv_static_metadata(dv)
         encoder_key, encoder_note = resolve_encoder(opts.encoder, opts.quality, w, h, detected=detected_encoders)
         is_hw = encoder_key in HARDWARE_PRIORITY
         encoder_label = ENCODER_SPECS[encoder_key]["label"]
+
     filter_threads = min(16, os.cpu_count() or 4) if is_hw else min(8, os.cpu_count() or 4)
     codec_threads = min(8, os.cpu_count() or 4)
     args = [find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "warning", "-n",
@@ -585,52 +965,66 @@ def build_command(opts: Options, info: dict, destination: Path,
         args += ["-ss", str(opts.start)]
     if is_hw:
         args += [
-            f"-mastering_display:{p['stream_index']}", MASTERING_DISPLAY,
-            f"-content_light:{p['stream_index']}", CONTENT_LIGHT,
+            f"-mastering_display:{p['stream_index']}", mastering_str,
+            f"-content_light:{p['stream_index']}", content_light_str,
         ]
     args += ["-i", opts.source]
     if opts.duration is not None:
         args += ["-t", str(opts.duration)]
     args += ["-map", f"0:{p['stream_index']}", "-map", "0:a:0?", "-map_metadata", "-1", "-map_chapters", "-1"]
-    if opts.copy_hdr_video:
+
+    if video_operation == "copy_hdr":
         args += ["-c:v", "copy", "-tag:v", "hvc1"]
+    elif video_operation == "dv_strip":
+        args += ["-c:v", "copy", "-bsf:v", dv_bsf, "-tag:v", "hvc1"]
     elif is_hw:
         enc_args, enc_meta = _hardware_encoder_args(encoder_key, opts.quality)
         video_codec = enc_meta["codec"]
         preset = enc_meta["preset"]
         crf = enc_meta["crf"]
         quality_control = enc_meta["quality_control"]
-        # Append p010le after setsar=1 rather than replacing yuv420p10le so zscale's
-        # bit-exact 10-bit dithered plane layout is preserved before semi-planar packing.
+        if video_operation == "dv_reencode":
+            # Direct p010le output in libplacebo is >3x faster at 4K for lossy encodes;
+            # lossless mode uses exact yuv420p10le first for bit-exact SHA-256 verification.
+            vf = (dv_filter_chain(w, h, pix_fmt="yuv420p10le") + ",format=p010le"
+                  if lossless_video else dv_filter_chain(w, h, pix_fmt="p010le"))
+        else:
+            # Append p010le after setsar=1 rather than replacing yuv420p10le so zscale's
+            # bit-exact 10-bit dithered plane layout is preserved before semi-planar packing.
+            vf = filter_chain(p, w, h) + ",format=p010le"
         args += [
-            "-vf", filter_chain(p, w, h) + ",format=p010le",
+            "-vf", vf,
             *enc_args,
             "-g", str(max(1, round(p["fps"] * 2))), "-fps_mode", "passthrough", "-enc_time_base", "filter",
             "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv",
             "-tag:v", "hvc1",
         ]
+        if video_operation == "dv_reencode" and tools and tools.get("dovi_rpu"):
+            args += ["-bsf:v", "dovi_rpu=strip=1"]
     else:
         preset, crf = {"fast": ("ultrafast", 17), "standard": ("fast", 17),
                        "fine": ("medium", 16), "lossless": ("fast", None)}[opts.quality]
         video_codec = "libx265"
         quality_control = "x265 lossless=1" if lossless_video else f"CRF {crf}"
-        # Static metadata describes our synthetic encoding target, not a measured
-        # physical mastering display. 1000/1000 are conservative content upper bounds,
-        # enforced by the LUT's per-channel 1000-nit ceiling, not measured MaxFALL.
+        vf = dv_filter_chain(w, h, pix_fmt="yuv420p10le") if video_operation == "dv_reencode" else filter_chain(p, w, h)
         params = ("colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
                   "hdr10=1:hdr10-opt=0:repeat-headers=1:"
-                  f"master-display={MASTERING_DISPLAY}:"
-                  f"max-cll={CONTENT_LIGHT}:pools={codec_threads}:frame-threads=3:log-level=warning")
+                  f"master-display={mastering_str}:"
+                  f"max-cll={content_light_str}:pools={codec_threads}:frame-threads=3:log-level=warning")
         if lossless_video:
             params += ":lossless=1"
-        args += ["-vf", filter_chain(p, w, h), "-c:v", "libx265", "-preset", preset]
+        args += ["-vf", vf, "-c:v", "libx265", "-preset", preset]
         if crf is not None:
             args += ["-crf", str(crf)]
         args += [
-             "-profile:v", "main10", "-pix_fmt", "yuv420p10le", "-x265-params", params,
-             "-g", str(max(1, round(p["fps"] * 2))), "-fps_mode", "passthrough", "-enc_time_base", "filter",
-             "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv",
-             "-tag:v", "hvc1"]
+            "-profile:v", "main10", "-pix_fmt", "yuv420p10le", "-x265-params", params,
+            "-g", str(max(1, round(p["fps"] * 2))), "-fps_mode", "passthrough", "-enc_time_base", "filter",
+            "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv",
+            "-tag:v", "hvc1",
+        ]
+        if video_operation == "dv_reencode" and tools and tools.get("dovi_rpu"):
+            args += ["-bsf:v", "dovi_rpu=strip=1"]
+
     audio = next((s for s in info.get("streams", []) if s.get("codec_type") == "audio"), None)
     sample_rate = _finite_number(audio.get("sample_rate")) if audio else None
     channels = _finite_number(audio.get("channels")) if audio else None
@@ -648,7 +1042,7 @@ def build_command(opts: Options, info: dict, destination: Path,
     expected_duration = min(opts.duration or float("inf"), max(0, p["duration"] - opts.start))
     return args, dict(source=p, width=w, height=h, preset=preset, crf=crf,
                       lossless_video=lossless_video,
-                      encoder_requested="copy" if opts.copy_hdr_video else opts.encoder,
+                      encoder_requested="copy" if stream_copy else opts.encoder,
                       encoder=encoder_key,
                       video_codec=video_codec,
                       encoder_label=encoder_label,
@@ -658,7 +1052,16 @@ def build_command(opts: Options, info: dict, destination: Path,
                       audio=args[args.index("-c:a") + 1],
                       audio_effect=opts.audio_effect,
                       audio_filter=SURROUND_FILTER if opts.audio_effect == "surround" else None,
-                      video_operation="copy_hdr" if opts.copy_hdr_video else "sdr_to_hdr",
+                      video_operation=video_operation,
+                      dolby_vision=dv,
+                      dv_bsf=dv_bsf,
+                      mastering_display=mastering_str,
+                      content_light=content_light_str,
+                      nominal_peak_nits=peak_nits,
+                      clipped_stream_copy=bool(stream_copy and (opts.start or opts.duration is not None)),
+                      require_limited_range=(p.get("range") == "limited") if video_operation == "dv_strip" else True,
+                      require_mastering_metadata=bool(dv.get("source_has_mastering", False)) if video_operation == "dv_strip" else True,
+                      require_content_light_metadata=bool(dv.get("source_has_content_light", False)) if video_operation == "dv_strip" else True,
                       expect_audio=bool(audio and (not audio_duration or audio_duration > opts.start)),
                       expected_video_duration=expected_duration if math.isfinite(expected_duration) else None)
 
@@ -666,8 +1069,20 @@ def build_command(opts: Options, info: dict, destination: Path,
 def validate_export(path: Path, expected: dict) -> dict:
     checks, data, v, side = _hdr_probe_checks(path)
     checks["dimensions"] = (v.get("width"), v.get("height")) == (expected["width"], expected["height"])
+    optional_metadata = {}
+    if expected.get("video_operation") == "dv_strip":
+        if not expected.get("require_limited_range", True):
+            optional_metadata["limited_range"] = checks.pop("limited_range")
+        if not expected.get("require_mastering_metadata", True):
+            optional_metadata["mastering_metadata"] = checks.pop("mastering_metadata")
+        if not expected.get("require_content_light_metadata", True):
+            optional_metadata["content_light_metadata"] = checks.pop("content_light_metadata")
     if expected.get("expected_video_duration"):
-        checks["duration"] = abs(_known_duration(v.get("duration"), data.get("format", {}).get("duration")) - expected["expected_video_duration"]) < max(.15, 3 / expected["source"]["fps"])
+        actual_duration = _known_duration(v.get("duration"), data.get("format", {}).get("duration"))
+        if expected.get("clipped_stream_copy"):
+            checks["duration"] = actual_duration > 0
+        else:
+            checks["duration"] = abs(actual_duration - expected["expected_video_duration"]) < max(.15, 3 / expected["source"]["fps"])
     if expected.get("expect_audio"):
         checks["audio_present"] = any(s.get("codec_type") == "audio" for s in data.get("streams", []))
     if expected.get("audio_effect") == "surround":
@@ -675,7 +1090,10 @@ def validate_export(path: Path, expected: dict) -> dict:
         checks["stereo_aac_48k"] = a.get("codec_name") == "aac" and a.get("channels") == 2 and a.get("sample_rate") == "48000"
     if not all(checks.values()):
         raise ConversionError("输出验证未通过：" + "、".join(k for k, ok in checks.items() if not ok))
-    return dict(checks=checks, stream=v, first_frame_side_data=side, format=data.get("format", {}))
+    result = dict(checks=checks, stream=v, first_frame_side_data=side, format=data.get("format", {}))
+    if optional_metadata:
+        result["optional_metadata"] = optional_metadata
+    return result
 
 
 def _decoded_frame_hashes(command: list[str], cache: Path, cancel: threading.Event,
@@ -736,8 +1154,12 @@ def verify_lossless(opts: Options, plan: dict, encoded: Path, cache: Path,
     reference += ["-i", opts.source]
     if opts.duration is not None:
         reference += ["-t", str(opts.duration)]
-    reference += ["-map", f"0:{plan['source']['stream_index']}", "-an", "-sn", "-dn",
-                  "-vf", filter_chain(plan["source"], plan["width"], plan["height"])]
+    ref_filter = (
+        dv_filter_chain(plan["width"], plan["height"], pix_fmt="yuv420p10le")
+        if plan.get("video_operation") == "dv_reencode"
+        else filter_chain(plan["source"], plan["width"], plan["height"])
+    )
+    reference += ["-map", f"0:{plan['source']['stream_index']}", "-an", "-sn", "-dn", "-vf", ref_filter]
     suffix = ["-c:v", "rawvideo", "-threads:v", "1", "-pix_fmt", "yuv420p10le",
               "-fps_mode", "passthrough", "-f", "framehash", "-hash", "sha256", "pipe:1"]
     reference += suffix
@@ -803,17 +1225,31 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
     with tempfile.TemporaryDirectory(prefix="sdr2hdr-") as cache:
         cache_path = Path(cache)
         log_path = cache_path / "ffmpeg.log"
-        if not opts.copy_hdr_video:
+        dv_info = None if opts.copy_hdr_video else detect_dolby_vision(info, source)
+        command, plan = build_command(opts, info, temporary, dv_info=dv_info)
+        if plan["video_operation"] == "sdr_to_hdr":
             write_curve(cache_path / "tone.cube")
-        command, plan = build_command(opts, info, temporary)
         total = min(opts.duration or float("inf"), max(0, plan["source"]["duration"] - opts.start))
         if not math.isfinite(total):
             total = 0
-        encoding_message = (
-            "正在添加音效，HDR 画面直接保留…" if opts.copy_hdr_video else
-            f"正在使用 {plan['encoder_label']} 转换画面并处理音效…" if opts.audio_effect == "surround" else
-            f"正在使用 {plan['encoder_label']} 转换画面并编码 HDR…"
-        )
+        op = plan["video_operation"]
+        if op == "copy_hdr":
+            encoding_message = "正在添加音效，HDR 画面直接保留…"
+        elif op == "dv_strip":
+            encoding_message = (
+                "正在无损剥离杜比视界并处理环绕音效…" if opts.audio_effect == "surround"
+                else "正在无损剥离杜比视界并导出 HDR10…"
+            )
+        elif op == "dv_reencode":
+            encoding_message = (
+                f"正在使用 libplacebo + {plan['encoder_label']} 转换杜比视界并处理音效…" if opts.audio_effect == "surround"
+                else f"正在使用 libplacebo + {plan['encoder_label']} 将杜比视界转换为 HDR10…"
+            )
+        else:
+            encoding_message = (
+                f"正在使用 {plan['encoder_label']} 转换画面并处理音效…" if opts.audio_effect == "surround"
+                else f"正在使用 {plan['encoder_label']} 转换画面并编码 HDR…"
+            )
         callback(dict(stage="encoding", percent=0, plan=plan, message=encoding_message))
         try:
             with log_path.open("wb") as log:
@@ -866,18 +1302,48 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 raise Cancelled("转换已取消，原片保留。")
             publish_without_overwrite(temporary, output)
             validation["format"]["filename"] = str(output)
-            result = dict(tool_version=VERSION, algorithm="preserved HDR video stream" if opts.copy_hdr_video else ALGORITHM_ID, source=str(source), output=str(output),
+            if op == "copy_hdr":
+                algorithm_desc = "preserved HDR video stream"
+                method_desc = "HDR video stream copy"
+                video_enc_desc = "preserved HDR stream"
+                mastering_desc = "preserved from input HDR stream"
+                light_desc = "preserved from input HDR stream"
+                fidelity_desc = "Original HDR10 video packets are copied without re-encoding. Online platform transcoding is outside this tool."
+            elif op == "dv_strip":
+                algorithm_desc = DV_STRIP_ALGORITHM_ID
+                method_desc = f"Dolby Vision lossless stream-copy strip ({plan['dv_bsf']})"
+                video_enc_desc = "preserved HDR10 base layer (stream copy)"
+                mastering_desc = "preserved from input HDR10 base layer if present"
+                light_desc = "preserved from input HDR10 base layer if present"
+                fidelity_desc = "Dolby Vision RPU (and Profile 7 enhancement layer when present) is removed without re-encoding the 10-bit HDR10 base layer. Profile 7 FEL luminance deltas are not baked in."
+            elif op == "dv_reencode":
+                peak_nits = plan.get("nominal_peak_nits", 1000)
+                algorithm_desc = DV_REENCODE_ALGORITHM_ID
+                method_desc = f"libplacebo Dolby Vision reshaping/color conversion + 10-bit HEVC ({plan['video_codec']})"
+                video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
+                mastering_desc = f"BT.2020 / D65 / {peak_nits} nits synthetic HDR10 target derived from source metadata"
+                light_desc = f"{peak_nits}/1000 nits declared HDR10 static bounds; not per-frame measured MaxFALL"
+                fidelity_desc = "Dolby Vision metadata is applied and converted into static 10-bit PQ/BT.2020 HDR10 via libplacebo. Online platform transcoding is outside this tool."
+            else:
+                algorithm_desc = ALGORITHM_ID
+                method_desc = f"float RGB matrix (UV x0.56 equivalent) + 65536-point log curve + 10-bit HEVC ({plan['video_codec']})"
+                video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
+                mastering_desc = "BT.2020 / D65 / 1000 nits; synthetic encoding target, not a measured display"
+                light_desc = "1000-nit conservative MaxCLL/MaxFALL upper bounds, enforced by RGB PQ ceiling; not measured MaxFALL"
+                fidelity_desc = "Fixed tone and color adjustment changes the SDR presentation intentionally. Resampling and 10-bit quantization are part of the conversion. Extreme over-range samples are capped at 1000 nits. Online platform transcoding is outside this tool."
+            result = dict(tool_version=VERSION, algorithm=algorithm_desc, source=str(source), output=str(output),
                           options=dataclasses.asdict(opts), plan=plan, validation=validation,
                           elapsed_seconds=round(time.monotonic() - started, 2),
                           encoder=plan["encoder"],
                           video_codec=plan["video_codec"],
                           hardware_accelerated=plan["hardware_accelerated"],
-                          method="HDR video stream copy" if opts.copy_hdr_video else f"float RGB matrix (UV x0.56 equivalent) + 65536-point log curve + 10-bit HEVC ({plan['video_codec']})",
-                          video_encoding="preserved HDR stream" if opts.copy_hdr_video else f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})",
+                          dolby_vision=plan.get("dolby_vision"),
+                          method=method_desc,
+                          video_encoding=video_enc_desc,
                           audio_effect_description=("Stereo spatial enhancement through channel widening, short cross delay and peak limiting. AAC audio is re-encoded." if opts.audio_effect == "surround" else "Original audio retained where AAC stream copy is possible."),
-                          nominal_mastering_target="preserved from input HDR stream" if opts.copy_hdr_video else "BT.2020 / D65 / 1000 nits; synthetic encoding target, not a measured display",
-                          declared_light_bounds="preserved from input HDR stream" if opts.copy_hdr_video else "1000-nit conservative MaxCLL/MaxFALL upper bounds, enforced by RGB PQ ceiling; not measured MaxFALL",
-                          fidelity_limit="Fixed tone and color adjustment changes the SDR presentation intentionally. Resampling and 10-bit quantization are part of the conversion. Extreme over-range samples are capped at 1000 nits. Online platform transcoding is outside this tool.")
+                          nominal_mastering_target=mastering_desc,
+                          declared_light_bounds=light_desc,
+                          fidelity_limit=fidelity_desc)
             report = output.with_suffix(".hdr.json")
             try:
                 with report.open("x", encoding="utf-8") as f:
@@ -900,13 +1366,16 @@ def cli():
     import argparse
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(description="离线 SDR 转 HDR 与双声道空间增强")
+    parser = argparse.ArgumentParser(description="离线 SDR／杜比视界转 HDR10 与双声道空间增强")
     parser.add_argument("source", nargs="?")
     parser.add_argument("output", nargs="?")
     parser.add_argument("--resolution", choices=["original", "1440", "2160"], default="original")
     parser.add_argument("--quality", choices=["fast", "standard", "fine", "lossless"], default="standard")
     parser.add_argument("--encoder", choices=["auto", "cpu", "nvenc", "qsv", "amf"], default="auto")
+    parser.add_argument("--dv-mode", choices=["auto", "strip", "reencode"], default="auto",
+                        help="杜比视界模式：auto 自动选择（8.1/7 无损直剥，5/8.4 重编码），或手动指定 strip/reencode")
     parser.add_argument("--list-encoders", action="store_true", help="检测并列出当前环境可用的编码器")
+    parser.add_argument("--list-dv-tools", action="store_true", help="检测并列出杜比视界转换所需 FFmpeg 组件状态")
     parser.add_argument("--start", type=float, default=0)
     parser.add_argument("--duration", type=float)
     parser.add_argument("--audio-effect", choices=["original", "surround"], default="original")
@@ -916,8 +1385,11 @@ def cli():
         if args.list_encoders:
             print(json.dumps(detect_encoders(), ensure_ascii=False, indent=2), flush=True)
             return
+        if args.list_dv_tools:
+            print(json.dumps(detect_dv_tools(), ensure_ascii=False, indent=2), flush=True)
+            return
         if not args.source or not args.output:
-            parser.error("请提供输入视频和输出路径（或使用 --list-encoders 查看可用编码器）。")
+            parser.error("请提供输入视频和输出路径（或使用 --list-encoders / --list-dv-tools 查看环境状态）。")
         option_fields = {f.name for f in dataclasses.fields(Options)}
         opts = Options(**{k: v for k, v in vars(args).items() if k in option_fields})
         convert(opts, lambda p: print(json.dumps(p, ensure_ascii=False), flush=True))

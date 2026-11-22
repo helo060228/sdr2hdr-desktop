@@ -38,6 +38,24 @@ q(x) = 0.65 × ln(1 + 5 × max(x, 0)) / ln(6)
 
 MaxCLL / MaxFALL 的 `1000 / 1000` 是预设上界标记，不是逐片测量结果，也不代表视频每帧均达到该亮度。显示端仍可能进行自身的色调映射。
 
+## 杜比视界（DV）转 HDR10
+
+工具自动识别杜比视界 Profile，并区分两种处理路径：
+
+### 1. 无损直剥（Profile 8.1 / Profile 7）
+
+- 仅在底层轨道为标准 HEVC 10-bit `yuv420p10le`、PQ（`smpte2084`）、BT.2020（`bt2020nc`）且保持原尺寸时启用。
+- Profile 8.1 采用 `-c:v copy -bsf:v dovi_rpu=strip=1 -tag:v hvc1`；Profile 7（含单轨 EL NAL 63 与双轨蓝光 Remux）采用 `-c:v copy -bsf:v dovi_split=mode=bl,dovi_rpu=strip=1 -tag:v hvc1`（旧版 FFmpeg 回退 `filter_units=remove_types=63,dovi_rpu=strip=1`）。
+- 导出校验强制确认输出容器与首帧均无任何残留的 `DOVI` / `Dolby Vision` 元数据或 `dvhe` / `dvh1` 标签；对于原片基础层未携带 `MaxCLL/MaxFALL` 的蓝光片源不作误报拦截。
+
+### 2. 色彩还原重编码（Profile 5 / Profile 8.4 及其他无 HDR10 兼容层 DV）
+
+- 通过 `libplacebo` 执行杜比视界 RPU 重塑与色彩空间映射：
+  `libplacebo=w=<W>:h=<H>:format=<pix_fmt>:colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084:range=tv:apply_dolbyvision=true:peak_detect=false:tonemapping=clip:gamut_mode=clip:dithering=ordered_fixed,setsar=1`
+- 禁用动态峰值检测（`peak_detect=false`）并采用 `tonemapping=clip:gamut_mode=clip`，在保持原始 HDR 动态范围的同时避免逐帧亮度呼吸效应。
+- 显卡有损编码直接让 `libplacebo` 输出 `p010le` 以减少 CPU 格式转换瓶颈；CPU 编码与无损档使用确定性的 `yuv420p10le` 输出并通过逐帧 SHA-256 校验。
+- 静态 HDR10 元数据优先参考首帧 RPU 的 `source_max_pq`（映射到 1000～4000 尼特），并在编码输出端附加 `-bsf:v dovi_rpu=strip=1` 避免残留杜比视界头信息。
+
 ## 编码策略
 
 支持 CPU 软件编码（`libx265`）与三种 Windows 显卡硬件编码器（`hevc_nvenc`、`hevc_qsv`、`hevc_amf`），默认按 `nvenc > qsv > amf > cpu` 自动选用通过自检的编码器。

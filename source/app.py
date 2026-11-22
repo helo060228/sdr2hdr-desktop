@@ -15,11 +15,9 @@ from hdr_core import (
     Options,
     VERSION,
     convert,
+    detect_dv_tools,
     detect_encoders,
-    hdr_copy_properties,
-    is_hdr_video,
-    probe,
-    source_properties,
+    inspect_input,
 )
 
 
@@ -35,8 +33,8 @@ ENCODER_LABELS = {
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(f"SDR 转 HDR · 离线转换器 {VERSION}")
-        root.geometry(f"{min(840, root.winfo_screenwidth()-80)}x{min(810, root.winfo_screenheight()-90)}")
+        root.title(f"SDR / 杜比视界转 HDR10 · 离线转换器 {VERSION}")
+        root.geometry(f"{min(840, root.winfo_screenwidth()-80)}x{min(820, root.winfo_screenheight()-90)}")
         root.minsize(710, 580)
         root.configure(bg="#f4f5f7")
         self.queue = queue.Queue()
@@ -49,10 +47,12 @@ class App:
         self.encoder = tk.StringVar(value="自动（优先显卡加速）")
         self.audio_effect = tk.StringVar(value="原声（保留）")
         self.detected_encoders = None
-        self.input_is_hdr = False
-        self.status = tk.StringVar(value="选择视频，制作 HDR 或添加环绕音效。")
-        self.info = tk.StringVar(value="支持 MP4、MOV、MKV 等本地视频；保留原文件。")
-        self.encoder_status = tk.StringVar(value="正在检测可用的显卡硬件加速…")
+        self.dv_tools = None
+        self.input_kind = "sdr"
+        self.input_dv = None
+        self.status = tk.StringVar(value="选择 SDR、杜比视界或 HDR 视频开始处理。")
+        self.info = tk.StringVar(value="支持 MP4、MOV、MKV 等本地视频；自动识别 SDR 与杜比视界 Profile 5 / 7 / 8.1 / 8.4。")
+        self.encoder_status = tk.StringVar(value="正在检测显卡硬件加速与杜比视界组件…")
         self.progress = tk.DoubleVar()
         self.detail = tk.StringVar(value="")
         self.controls = []
@@ -81,7 +81,7 @@ class App:
                 viewport.yview_scroll(-int(event.delta / 120), "units")
         root.bind_all("<MouseWheel>", wheel)
         ttk.Label(box, text="把画质和音效，一起写进视频", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(box, text="SDR 转 HDR10；已有 HDR 可直接加音效，保留原画面。", style="Sub.TLabel").pack(anchor="w", pady=(9, 23))
+        ttk.Label(box, text="SDR 转 HDR10 · 杜比视界 (DV) 转 HDR10 · 已有 HDR10 无损加音效。", style="Sub.TLabel").pack(anchor="w", pady=(9, 23))
         self.path_row(box, "原始视频", self.input, self.pick_input, "选择视频")
         ttk.Label(box, textvariable=self.info, style="Sub.TLabel", wraplength=700).pack(anchor="w", pady=(2, 17))
         self.path_row(box, "导出文件", self.output, self.pick_output, "保存到…")
@@ -130,13 +130,28 @@ class App:
     def detect_encoders_async(self):
         def probe_worker():
             try:
-                self.queue.put(dict(stage="encoders", encoders=detect_encoders()))
+                encoders = detect_encoders()
+                dv_tools = detect_dv_tools()
+                self.queue.put(dict(stage="encoders", encoders=encoders, dv_tools=dv_tools))
             except Exception as e:
                 self.queue.put(dict(stage="encoders", error=str(e)))
         threading.Thread(target=probe_worker, daemon=True).start()
 
     def update_encoding_note(self):
         notes = []
+        if self.input_kind == "dv_strip":
+            if self.dv_tools is not None and not self.dv_tools.get("dovi_rpu"):
+                notes.append("提示：" + (self.dv_tools.get("strip_reason") or "缺少 dovi_rpu 滤镜，无法无损直剥。"))
+            else:
+                notes.append("杜比视界无损直剥：画面直接复制不重编码，输出尺寸／画质／编码器已自动锁定；仍可选音效。")
+            self.encoding_note.set("\n".join(notes))
+            return
+        if self.input_kind == "hdr10":
+            notes.append("已有标准 HDR10：将直接保留原视频轨道，仅按音效设置处理音频。")
+            self.encoding_note.set("\n".join(notes))
+            return
+        if self.input_kind == "dv_reencode" and self.dv_tools is not None and not self.dv_tools.get("libplacebo"):
+            notes.append("提示：" + (self.dv_tools.get("libplacebo_reason") or "当前环境不支持 libplacebo／Vulkan。"))
         enc_key = ENCODER_LABELS[self.encoder.get()]
         is_lossless = self.quality.get() == "画面无损编码"
         if self.detected_encoders is not None and enc_key in HARDWARE_PRIORITY:
@@ -160,33 +175,49 @@ class App:
         self.controls += [entry, button]
 
     def pick_input(self):
-        p = filedialog.askopenfilename(title="选择 SDR 视频", filetypes=[("视频", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.ts"), ("所有文件", "*.*")])
+        p = filedialog.askopenfilename(title="选择 SDR／杜比视界／HDR 视频", filetypes=[("视频", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.ts"), ("所有文件", "*.*")])
         if p:
             self.set_input(p)
+
+    def _next_output_path(self, source: Path, suffix: str) -> str:
+        dest = source.with_name(source.stem + suffix)
+        count = 2
+        while dest.exists():
+            dest = source.with_name(source.stem + suffix.replace(".mp4", f"_{count}.mp4"))
+            count += 1
+        return str(dest)
 
     def set_input(self, path):
         self.input.set(path)
         source = Path(path)
-        dest = source.with_name(source.stem + "_HDR.mp4")
-        count = 2
-        while dest.exists():
-            dest = source.with_name(source.stem + f"_HDR_{count}.mp4")
-            count += 1
-        self.output.set(str(dest))
-        initial_output = str(dest)
+        initial_output = self._next_output_path(source, "_HDR.mp4")
+        self.output.set(initial_output)
         self.info.set("正在读取视频信息…")
         def read():
             try:
-                info = probe(source)
-                hdr = is_hdr_video(info)
-                p = hdr_copy_properties(info) if hdr else source_properties(info)
+                inspected = inspect_input(source)
+                kind = inspected["kind"]
+                p = inspected["properties"]
+                dv = inspected["dv"]
                 duration_label = f"{p['duration']:.1f} 秒" if p["duration"] else "时长未提供"
-                msg = f"{p['width']} × {p['height']}  ·  {p['fps']:g} 帧/秒  ·  {duration_label}  ·  " + ("HDR · 画面直拷" if hdr else "SDR")
-                if p["guessed"]:
-                    msg += "\n" + "；".join(p["guessed"])
-                self.queue.put(dict(stage="input", path=path, message=msg, hdr=hdr, initial_output=initial_output))
+                base = f"{p['width']} × {p['height']}  ·  {p['fps']:g} 帧/秒  ·  {duration_label}  ·  "
+                if kind == "dv_strip":
+                    msg = base + f"杜比视界 {dv['profile_label']} → 秒级无损直剥 HDR10"
+                    if dv.get("dv_profile") == 7:
+                        msg += "\n说明：保留原生 10-bit HDR10 基础层并剥离增强层与 RPU，零重编码损失（不烘焙 FEL 增量）。"
+                    else:
+                        msg += "\n说明：直接剥离杜比视界 RPU 并保留原生 HDR10 码流，零重编码、零画质损失。"
+                elif kind == "dv_reencode":
+                    msg = base + f"杜比视界 {dv['profile_label']} → libplacebo 还原 + HDR10"
+                elif kind == "hdr10":
+                    msg = base + "HDR10 · 画面直拷（仅加音效）"
+                else:
+                    msg = base + "SDR → HDR10"
+                    if p["guessed"]:
+                        msg += "\n" + "；".join(p["guessed"])
+                self.queue.put(dict(stage="input", path=path, message=msg, kind=kind, dv=dv, initial_output=initial_output))
             except Exception as e:
-                self.queue.put(dict(stage="input", path=path, message=str(e)))
+                self.queue.put(dict(stage="input", path=path, message=str(e), kind="sdr", dv=None))
         threading.Thread(target=read, daemon=True).start()
 
     def pick_output(self):
@@ -224,9 +255,23 @@ class App:
         self.set_busy(True)
         def run():
             try:
-                opts.copy_hdr_video = is_hdr_video(probe(Path(source)))
-                if opts.copy_hdr_video and audio_effect == "original":
-                    raise ConversionError("这个视频已经是 HDR，无需重复转换。请选择“虚拟环绕（双声道）”，即可只处理声音并保留 HDR 画面。")
+                inspected = inspect_input(Path(source))
+                kind = inspected["kind"]
+                if kind == "hdr10":
+                    opts.copy_hdr_video = True
+                    opts.resolution = "original"
+                    if audio_effect == "original":
+                        raise ConversionError("这个视频已经是标准 HDR10，无需重复转换。请选择“虚拟环绕（双声道）”，即可只处理声音并保留 HDR 画面。")
+                elif kind == "dv_strip":
+                    opts.copy_hdr_video = False
+                    opts.resolution = "original"
+                    opts.dv_mode = "strip"
+                elif kind == "dv_reencode":
+                    opts.copy_hdr_video = False
+                    opts.dv_mode = "reencode"
+                else:
+                    opts.copy_hdr_video = False
+                    opts.dv_mode = "auto"
                 result = convert(opts, self.queue.put, self.cancel)
                 self.queue.put(dict(stage="finished", result=result))
             except Cancelled as e:
@@ -244,7 +289,7 @@ class App:
         self.start_button.configure(state="disabled" if busy else "normal")
         self.preview_button.configure(state="disabled" if busy else "normal")
         self.stop_button.configure(state="normal" if busy else "disabled")
-        if not busy and self.input_is_hdr:
+        if not busy and self.input_kind in ("hdr10", "dv_strip"):
             self.resolution_combo.configure(state="disabled")
             self.quality_combo.configure(state="disabled")
             self.encoder_combo.configure(state="disabled")
@@ -261,23 +306,30 @@ class App:
                 if stage == "input":
                     if self.input.get() == p["path"]:
                         self.info.set(p["message"])
-                        self.input_is_hdr = p.get("hdr", False)
-                        if self.input_is_hdr:
+                        self.input_kind = p.get("kind", "sdr")
+                        self.input_dv = p.get("dv")
+                        if self.input_kind in ("hdr10", "dv_strip"):
                             self.resolution.set("保持原尺寸")
-                            if self.output.get() == p.get("initial_output"):
-                                name = Path(p["path"])
-                                dest = name.with_name(name.stem + "_环绕.mp4")
-                                n = 2
-                                while dest.exists():
-                                    dest = name.with_name(name.stem + f"_环绕_{n}.mp4")
-                                    n += 1
-                                self.output.set(str(dest))
+                        if self.output.get() == p.get("initial_output"):
+                            name = Path(p["path"])
+                            if self.input_kind == "hdr10":
+                                self.output.set(self._next_output_path(name, "_环绕.mp4"))
+                            elif self.input_kind in ("dv_strip", "dv_reencode"):
+                                self.output.set(self._next_output_path(name, "_HDR10.mp4"))
+                        button_text = {
+                            "dv_strip": "无损导出 HDR10",
+                            "dv_reencode": "导出完整 HDR10",
+                            "hdr10": "导出环绕 HDR",
+                        }.get(self.input_kind, "导出完整 HDR")
+                        self.start_button.configure(text=button_text)
                         self.set_busy(self.running)
+                        self.update_encoding_note()
                 elif stage == "encoders":
                     if "error" in p:
                         self.encoder_status.set("未能自动检测编码器（转换时将再次检查）：" + p["error"])
                     else:
                         self.detected_encoders = p["encoders"]
+                        self.dv_tools = p.get("dv_tools")
                         hw_labels = []
                         for key in HARDWARE_PRIORITY:
                             info = self.detected_encoders.get(key, {})
@@ -285,9 +337,18 @@ class App:
                                 suffix = "（含无损）" if info.get("lossless") else "（无损需用 CPU）"
                                 hw_labels.append(info["short_label"] + suffix)
                         if hw_labels:
-                            self.encoder_status.set("已检测到显卡加速：" + "、".join(hw_labels) + "；其余情况自动回退 CPU (x265)。")
+                            enc_part = "显卡加速：" + "、".join(hw_labels)
                         else:
-                            self.encoder_status.set("未检测到支持 10-bit HDR10 的显卡硬编，将使用 CPU 软件编码 (x265)。")
+                            enc_part = "显卡加速：未检测到可用硬编（使用 CPU x265）"
+                        dv_part = ""
+                        if self.dv_tools:
+                            if self.dv_tools.get("strip_available") and self.dv_tools.get("libplacebo"):
+                                dv_part = "；杜比视界：支持 8.1/7 无损直剥 + 5/8.4 色彩还原"
+                            elif self.dv_tools.get("strip_available"):
+                                dv_part = "；杜比视界：支持 8.1/7 无损直剥（缺 libplacebo／Vulkan）"
+                            else:
+                                dv_part = "；杜比视界：当前 FFmpeg 缺少 dovi_rpu／libplacebo"
+                        self.encoder_status.set(enc_part + dv_part + "。")
                         self.update_encoding_note()
                 elif stage in ("encoding", "verifying", "done"):
                     self.progress.set(p.get("percent", 0))
