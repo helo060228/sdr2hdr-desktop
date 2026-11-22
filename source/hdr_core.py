@@ -1,7 +1,10 @@
-"""Offline SDR-to-HDR transcoder with fixed logarithmic tone expansion.
+"""Offline SDR / Dolby Vision to HDR10 transcoder.
 
-Processing intentionally operates in encoded nonlinear RGB. The result is a
-stylized HDR presentation, not a colorimetric recovery of an HDR master.
+SDR-to-HDR offers two styles:
+- natural (default): colorimetric BT.1886 linear BT.709->BT.2020 luminance-preserving
+  expansion with highlight protection (450 nits peak) to preserve skin tones and detail.
+- vivid (legacy): fixed logarithmic expansion in nonlinear RGB for stylized high-contrast
+  presentations such as anime and dark scenes.
 """
 from __future__ import annotations
 
@@ -23,15 +26,45 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128
 ALGORITHM_ID = "Fixed logarithmic SDR-to-PQ tone expansion with chroma gain 0.56"
+NATURAL_ALGORITHM_ID = "Colorimetric BT.1886 linear BT.709-to-BT.2020 luminance-preserving highlight-protected SDR-to-PQ expansion (450 nits peak)"
 DV_STRIP_ALGORITHM_ID = "Lossless Dolby Vision RPU/EL strip preserving native 10-bit HDR10 base layer"
 DV_REENCODE_ALGORITHM_ID = "Dolby Vision to HDR10 conversion via libplacebo (apply_dolbyvision=true)"
 MASTERING_DISPLAY = "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)"
 CONTENT_LIGHT = "1000,1000"
+NATURAL_CONTENT_LIGHT = "450,200"
+NATURAL_BASE_NITS = 190.0
+NATURAL_KNEE = 0.62
+NATURAL_BOOST_NITS = 260.0
+NATURAL_PEAK_NITS = 450.0
+NATURAL_LUT_SIZE = 49
+M_BT709_TO_BT2020 = (
+    (0.6274040, 0.3292820, 0.0433136),
+    (0.0690970, 0.9195400, 0.0113612),
+    (0.0163916, 0.0880132, 0.8955950),
+)
+Y_BT2020 = (0.2627, 0.6780, 0.0593)
+_NATURAL_LUT_CACHE: dict[int, str] = {}
+_NATURAL_LUT_LOCK = threading.Lock()
+_GPU_FILTER_CACHE: dict[str, dict] = {}
+_GPU_FILTER_CACHE_LOCK = threading.Lock()
+PRIMARY_TO_BT2020 = {
+    "bt709": M_BT709_TO_BT2020,
+    "smpte170m": (
+        (0.5952542, 0.3493139, 0.0554319),
+        (0.0812437, 0.8915033, 0.0272530),
+        (0.0155123, 0.0819116, 0.9025760),
+    ),
+    "bt470bg": (
+        (0.6550368, 0.3021610, 0.0428023),
+        (0.0721406, 0.9166311, 0.0112283),
+        (0.0171134, 0.0978535, 0.8850332),
+    ),
+}
 HW_MIN_WIDTH = 160
 HW_MIN_HEIGHT = 128
 HW_MAX_DIM = 8192
@@ -186,10 +219,10 @@ def find_tool(name: str) -> str:
     raise ConversionError(f"找不到 {filename}。请安装包含 zscale／libx265 的完整 FFmpeg，或将 ffmpeg.exe 和 ffprobe.exe 放进工具旁的 bin 文件夹。")
 
 
-def capture(args: list[str], timeout=60) -> subprocess.CompletedProcess:
+def capture(args: list[str], timeout=60, cwd: Path | str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           encoding="utf-8", errors="replace", timeout=timeout,
-                          creationflags=CREATE_NO_WINDOW)
+                          cwd=cwd, creationflags=CREATE_NO_WINDOW)
 
 
 def probe(path: Path) -> dict:
@@ -485,7 +518,8 @@ def source_properties(info: dict) -> dict:
     duration = _known_duration(v.get("duration"), info.get("format", {}).get("duration"))
     return dict(width=width, height=height, sar=sar, fps=fps or 25, duration=duration,
                 matrix=matrix, primaries=primaries, transfer=trc, range=range_,
-                guessed=guessed, stream_index=v["index"], pixel_format=pix_fmt)
+                guessed=guessed, stream_index=v["index"], pixel_format=pix_fmt,
+                codec_name=v.get("codec_name", ""), rotation=rotation)
 
 
 def dimensions(p: dict, resolution="original") -> tuple[int, int]:
@@ -495,6 +529,94 @@ def dimensions(p: dict, resolution="original") -> tuple[int, int]:
         ratio = target / min(w, h)
         w, h = w * ratio, h * ratio
     return max(2, round(w / 2) * 2), max(2, round(h / 2) * 2)
+
+
+def natural_target_nits(y: float) -> float:
+    """Luminance-preserving highlight-protected SDR->HDR target brightness (nits)."""
+    y = max(0.0, y)
+    if y <= NATURAL_KNEE:
+        return NATURAL_BASE_NITS * y
+    if y <= 1.0:
+        t = (y - NATURAL_KNEE) / (1.0 - NATURAL_KNEE)
+        return NATURAL_BASE_NITS * y + NATURAL_BOOST_NITS * (t * t)
+    return NATURAL_PEAK_NITS
+
+
+def natural_reference_rgb(rgb: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Analytical BT.1886 linear BT.709->BT.2020 luminance-preserving PQ transform."""
+    r0, g0, b0 = (max(0.0, min(1.0, v)) ** 2.4 for v in rgb)
+    r20 = M_BT709_TO_BT2020[0][0] * r0 + M_BT709_TO_BT2020[0][1] * g0 + M_BT709_TO_BT2020[0][2] * b0
+    g20 = M_BT709_TO_BT2020[1][0] * r0 + M_BT709_TO_BT2020[1][1] * g0 + M_BT709_TO_BT2020[1][2] * b0
+    b20 = M_BT709_TO_BT2020[2][0] * r0 + M_BT709_TO_BT2020[2][1] * g0 + M_BT709_TO_BT2020[2][2] * b0
+    y = Y_BT2020[0] * r20 + Y_BT2020[1] * g20 + Y_BT2020[2] * b20
+    if y <= 1e-9:
+        return (0.0, 0.0, 0.0)
+    gain = natural_target_nits(y) / y
+    rn, gn, bn = r20 * gain, g20 * gain, b20 * gain
+    peak = max(rn, gn, bn)
+    if peak > NATURAL_PEAK_NITS:
+        scale = NATURAL_PEAK_NITS / peak
+        rn, gn, bn = rn * scale, gn * scale, bn * scale
+    return (pq_encode(rn), pq_encode(gn), pq_encode(bn))
+
+
+def write_natural_lut(path: Path, size: int = NATURAL_LUT_SIZE):
+    """Write a cached 49^3 tetrahedral 3D LUT for natural highlight-protected HDR10."""
+    with _NATURAL_LUT_LOCK:
+        cached = _NATURAL_LUT_CACHE.get(size)
+    if cached is None:
+        inv = 1.0 / (size - 1)
+        pow_tbl = [(i * inv) ** 2.4 for i in range(size)]
+        m00, m01, m02 = M_BT709_TO_BT2020[0]
+        m10, m11, m12 = M_BT709_TO_BT2020[1]
+        m20, m21, m22 = M_BT709_TO_BT2020[2]
+        yr, yg, yb = Y_BT2020
+        knee = NATURAL_KNEE
+        inv_span = 1.0 / (1.0 - knee)
+        base = NATURAL_BASE_NITS
+        boost = NATURAL_BOOST_NITS
+        cap = NATURAL_PEAK_NITS
+        lines = [f'TITLE "Colorimetric Highlight-Protected SDR-to-PQ (450 nits)"\nLUT_3D_SIZE {size}\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n']
+        append = lines.append
+        for bi in range(size):
+            b0 = pow_tbl[bi]
+            b_r, b_g, b_b = m02 * b0, m12 * b0, m22 * b0
+            for gi in range(size):
+                g0 = pow_tbl[gi]
+                gb_r, gb_g, gb_b = m01 * g0 + b_r, m11 * g0 + b_g, m21 * g0 + b_b
+                for ri in range(size):
+                    r0 = pow_tbl[ri]
+                    r20 = m00 * r0 + gb_r
+                    g20 = m10 * r0 + gb_g
+                    b20 = m20 * r0 + gb_b
+                    y = yr * r20 + yg * g20 + yb * b20
+                    if y <= 1e-9:
+                        append("0.0000000 0.0000000 0.0000000\n")
+                        continue
+                    if y <= knee:
+                        tn = base * y
+                    else:
+                        t = (y - knee) * inv_span
+                        tn = base * y + boost * t * t
+                    gain = tn / y
+                    rn, gn, bn = r20 * gain, g20 * gain, b20 * gain
+                    peak = rn if rn >= gn and rn >= bn else (gn if gn >= bn else bn)
+                    if peak > cap:
+                        s = cap / peak
+                        rn *= s
+                        gn *= s
+                        bn *= s
+                    xr = (rn * 0.0001) ** M1
+                    pr = ((C1 + C2 * xr) / (1.0 + C3 * xr)) ** M2
+                    xg = (gn * 0.0001) ** M1
+                    pg = ((C1 + C2 * xg) / (1.0 + C3 * xg)) ** M2
+                    xb = (bn * 0.0001) ** M1
+                    pb = ((C1 + C2 * xb) / (1.0 + C3 * xb)) ** M2
+                    append(f"{pr:.7f} {pg:.7f} {pb:.7f}\n")
+        cached = "".join(lines)
+        with _NATURAL_LUT_LOCK:
+            _NATURAL_LUT_CACHE[size] = cached
+    path.write_text(cached, encoding="ascii", newline="\n")
 
 
 def write_curve(path: Path, peak=1000.0):
@@ -507,9 +629,23 @@ def write_curve(path: Path, peak=1000.0):
             f.write(f"{value:.10f} {value:.10f} {value:.10f}\n")
 
 
-def filter_chain(p: dict, width: int, height: int, lut_name="tone.cube") -> str:
+def filter_chain(p: dict, width: int, height: int, lut_name="tone.cube", style="vivid") -> str:
     # LUT filename is controlled by the application; FFmpeg runs in a private
     # temporary directory. No user filename is interpolated into filter syntax.
+    if style == "natural":
+        if lut_name != "natural.cube":
+            raise ValueError("Unexpected LUT filename")
+        flags = (f"pin={p['primaries']}:tin={p['transfer']}:min={p['matrix']}:rin={p['range']}:"
+                 "p=bt709:t=bt709:m=gbr:r=full:filter=spline36")
+        return ",".join([
+            "zscale=" + flags, "format=gbrpf32le",
+            "lut3d=file=natural.cube:interp=tetrahedral",
+            "setparams=range=full:color_primaries=bt2020:color_trc=smpte2084:colorspace=gbr",
+            f"zscale=pin=bt2020:tin=smpte2084:min=gbr:rin=full:p=bt2020:t=smpte2084:m=bt2020nc:r=limited:w={width}:h={height}:filter=spline36:d=error_diffusion",
+            "format=yuv420p10le", "setsar=1",
+        ])
+    if style != "vivid":
+        raise ConversionError("未知的 HDR 风格设置。")
     if lut_name != "tone.cube":
         raise ValueError("Unexpected LUT filename")
     flags = (f"pin={p['primaries']}:tin={p['transfer']}:min={p['matrix']}:rin={p['range']}:"
@@ -523,6 +659,85 @@ def filter_chain(p: dict, width: int, height: int, lut_name="tone.cube") -> str:
         "setparams=range=full:color_primaries=bt2020:color_trc=smpte2084:colorspace=gbr",
         f"zscale=pin=bt2020:tin=smpte2084:min=gbr:rin=full:p=bt2020:t=smpte2084:m=bt2020nc:r=limited:w={width}:h={height}:filter=bilinear:d=error_diffusion",
         "format=yuv420p10le", "setsar=1",
+    ])
+
+
+def write_natural_shader(path: Path, primaries: str = "bt709"):
+    """Write a self-contained MAIN-stage GLSL shader for highlight-protected HDR10.
+
+    Running with libplacebo color_primaries=auto:color_trc=auto:disable_linear=true
+    keeps libplacebo from altering luminance when input-side HDR10 static metadata is
+    attached for hardware encoders, while executing exact BT.1886->BT.2020->PQ on GPU.
+    """
+    m = PRIMARY_TO_BT2020.get(primaries, M_BT709_TO_BT2020)
+    yr, yg, yb = Y_BT2020
+    span = 1.0 - NATURAL_KNEE
+    shader = (
+        "//!HOOK MAIN\n"
+        "//!BIND HOOKED\n"
+        "vec4 hook() {\n"
+        "    vec4 c = HOOKED_texOff(0);\n"
+        "    vec3 lin = pow(clamp(c.rgb, 0.0, 1.0), vec3(2.4));\n"
+        "    vec3 b20 = vec3(\n"
+        f"        dot(lin, vec3({m[0][0]:.7f}, {m[0][1]:.7f}, {m[0][2]:.7f})),\n"
+        f"        dot(lin, vec3({m[1][0]:.7f}, {m[1][1]:.7f}, {m[1][2]:.7f})),\n"
+        f"        dot(lin, vec3({m[2][0]:.7f}, {m[2][1]:.7f}, {m[2][2]:.7f}))\n"
+        "    );\n"
+        f"    float y = dot(b20, vec3({yr:.4f}, {yg:.4f}, {yb:.4f}));\n"
+        "    if (y <= 1e-9) return vec4(0.0, 0.0, 0.0, c.a);\n"
+        f"    float tn = (y <= {NATURAL_KNEE:.6f}) ? ({NATURAL_BASE_NITS:.6f} * y) : "
+        f"({NATURAL_BASE_NITS:.6f} * y + {NATURAL_BOOST_NITS:.6f} * pow(min((y - {NATURAL_KNEE:.6f}) / {span:.6f}, 1.0), 2.0));\n"
+        "    vec3 nits = b20 * (tn / y);\n"
+        "    float pk = max(nits.r, max(nits.g, nits.b));\n"
+        f"    if (pk > {NATURAL_PEAK_NITS:.6f}) nits *= ({NATURAL_PEAK_NITS:.6f} / pk);\n"
+        f"    vec3 x = pow(max(nits, vec3(0.0)) * 0.0001, vec3({M1:.13f}));\n"
+        f"    vec3 pq = pow(({C1:.10f} + {C2:.10f} * x) / (1.0 + {C3:.10f} * x), vec3({M2:.10f}));\n"
+        "    return vec4(pq, c.a);\n"
+        "}\n"
+    )
+    path.write_text(shader, encoding="ascii", newline="\n")
+
+
+def write_vivid_shader(path: Path, matrix: str = "bt709", peak: float = 1000.0):
+    """Write an mpv/libplacebo MAIN-stage GLSL shader for legacy high-contrast vivid HDR10."""
+    rows = chroma_matrix("bt709" if matrix == "gbr" else matrix)
+    ceiling = pq_encode(peak)
+    shader = (
+        "//!HOOK MAIN\n"
+        "//!BIND HOOKED\n"
+        "vec4 hook() {\n"
+        "    vec4 c = HOOKED_texOff(0);\n"
+        "    vec3 m = vec3(\n"
+        f"        dot(c.rgb, vec3({rows[0][0]:.10f}, {rows[0][1]:.10f}, {rows[0][2]:.10f})),\n"
+        f"        dot(c.rgb, vec3({rows[1][0]:.10f}, {rows[1][1]:.10f}, {rows[1][2]:.10f})),\n"
+        f"        dot(c.rgb, vec3({rows[2][0]:.10f}, {rows[2][1]:.10f}, {rows[2][2]:.10f}))\n"
+        "    );\n"
+        f"    vec3 q = clamp(0.65 * log(1.0 + 5.0 * max(m, vec3(0.0))) / log(6.0), 0.0, {ceiling:.10f});\n"
+        "    return vec4(q, c.a);\n"
+        "}\n"
+    )
+    path.write_text(shader, encoding="ascii", newline="\n")
+
+
+def gpu_sdr_filter_chain(p: dict, width: int, height: int, shader_name: str, style: str,
+                         use_hwdec: bool = False, pix_fmt: str = "p010le") -> str:
+    """Build a Vulkan/libplacebo GPU SDR->HDR10 filter chain matching CPU formulas."""
+    expected = {"natural": "natural.hook", "vivid": "vivid.hook"}.get(style)
+    if expected is None:
+        raise ConversionError("未知的 HDR 风格设置。")
+    if shader_name != expected:
+        raise ValueError("Unexpected shader filename")
+    prefix = ([] if use_hwdec else [
+        f"setparams=range={p['range']}:color_primaries={p['primaries']}:color_trc={p['transfer']}:colorspace={p['matrix']}"
+    ])
+    return ",".join([
+        *prefix,
+        (f"libplacebo=w={width}:h={height}:format={pix_fmt}:"
+         "colorspace=bt2020nc:color_primaries=auto:color_trc=auto:range=tv:"
+         "disable_linear=true:tonemapping=clip:gamut_mode=clip:peak_detect=false:"
+         f"dithering=ordered_fixed:custom_shader_path={shader_name}"),
+        "setparams=range=limited:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+        "setsar=1",
     ])
 
 
@@ -548,6 +763,8 @@ class Options:
     copy_hdr_video: bool = False
     encoder: str = "auto"
     dv_mode: str = "auto"
+    hdr_style: str = "natural"
+    gpu_filter: str = "auto"
 
 
 def clear_encoder_cache() -> None:
@@ -560,6 +777,12 @@ def clear_dv_tools_cache() -> None:
     """Clear cached runtime Dolby Vision filter/BSF probe results."""
     with _DV_TOOLS_CACHE_LOCK:
         _DV_TOOLS_CACHE.clear()
+
+
+def clear_gpu_filter_cache() -> None:
+    """Clear cached runtime GPU libplacebo/Vulkan SDR filter probe results."""
+    with _GPU_FILTER_CACHE_LOCK:
+        _GPU_FILTER_CACHE.clear()
 
 
 def _hardware_encoder_args(encoder_key: str, quality: str) -> tuple[list[str], dict]:
@@ -738,6 +961,71 @@ def detect_dv_tools(force: bool = False) -> dict:
     return dict(result)
 
 
+def detect_gpu_filter(force: bool = False) -> dict:
+    """Probe Vulkan/libplacebo custom GLSL shader and Vulkan hardware decode capabilities."""
+    ffmpeg_path = find_tool("ffmpeg")
+    with _GPU_FILTER_CACHE_LOCK:
+        if not force and ffmpeg_path in _GPU_FILTER_CACHE:
+            return dict(_GPU_FILTER_CACHE[ffmpeg_path])
+    filters = _compiled_filters(ffmpeg_path)
+    shader_ok = False
+    hwdec_ok = False
+    reason = ""
+    if "libplacebo" not in filters:
+        reason = "当前 FFmpeg 未编译 libplacebo 滤镜，将使用 CPU 浮点滤镜"
+    else:
+        with tempfile.TemporaryDirectory(prefix="sdr2hdr-gpu-probe-") as tmp:
+            tmp_path = Path(tmp)
+            write_natural_shader(tmp_path / "natural.hook", "bt709")
+            p_probe = dict(primaries="bt709", transfer="bt709", matrix="bt709", range="limited")
+            try:
+                r = capture([
+                    ffmpeg_path, "-hide_banner", "-nostdin", "-y", "-v", "error", "-f", "lavfi",
+                    "-i", "color=c=gray:s=64x64:r=25:d=0.04",
+                    "-vf", gpu_sdr_filter_chain(p_probe, 64, 64, "natural.hook", "natural", use_hwdec=False, pix_fmt="p010le"),
+                    "-f", "null", "-",
+                ], timeout=15, cwd=tmp_path)
+                if r.returncode == 0:
+                    shader_ok = True
+                else:
+                    reason = "libplacebo GPU 着色器初始化失败，将使用 CPU 浮点滤镜"
+            except (subprocess.TimeoutExpired, OSError):
+                reason = "libplacebo GPU 着色器自检超时，将使用 CPU 浮点滤镜"
+
+            if shader_ok:
+                compiled_enc = _compiled_video_encoders(ffmpeg_path)
+                probe_codec = "libx264" if "libx264" in compiled_enc else ("libx265" if "libx265" in compiled_enc else None)
+                if probe_codec:
+                    probe_in = tmp_path / "vk_probe.mp4"
+                    try:
+                        mk = capture([
+                            ffmpeg_path, "-hide_banner", "-nostdin", "-y", "-v", "error", "-f", "lavfi",
+                            "-i", "color=c=gray:s=128x128:r=25:d=0.08",
+                            "-c:v", probe_codec, "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+                            str(probe_in),
+                        ], timeout=15, cwd=tmp_path)
+                        if mk.returncode == 0:
+                            r_vk = capture([
+                                ffmpeg_path, "-hide_banner", "-nostdin", "-y", "-v", "error",
+                                "-init_hw_device", "vulkan=vk:0", "-hwaccel", "vulkan", "-hwaccel_output_format", "vulkan",
+                                "-i", str(probe_in),
+                                "-vf", gpu_sdr_filter_chain(p_probe, 128, 128, "natural.hook", "natural", use_hwdec=True, pix_fmt="p010le"),
+                                "-f", "null", "-",
+                            ], timeout=15, cwd=tmp_path)
+                            hwdec_ok = r_vk.returncode == 0
+                    except (subprocess.TimeoutExpired, OSError):
+                        hwdec_ok = False
+    result = dict(
+        libplacebo_shader=shader_ok,
+        vulkan_hwdec=hwdec_ok,
+        reason=reason,
+    )
+    with _GPU_FILTER_CACHE_LOCK:
+        _GPU_FILTER_CACHE[ffmpeg_path] = dict(result)
+    return dict(result)
+
+
 def _compiled_video_encoders(ffmpeg_path: str) -> set[str]:
     try:
         result = capture([ffmpeg_path, "-hide_banner", "-encoders"], timeout=15)
@@ -880,13 +1168,18 @@ def resolve_encoder(requested: str, quality: str, width: int, height: int,
 def build_command(opts: Options, info: dict, destination: Path,
                   detected_encoders: dict | None = None,
                   dv_info: dict | None = None,
-                  dv_tools: dict | None = None) -> tuple[list[str], dict]:
+                  dv_tools: dict | None = None,
+                  gpu_filter_caps: dict | None = None) -> tuple[list[str], dict]:
     if opts.audio_effect not in ("original", "surround"):
         raise ConversionError("未知音效设置。")
     if opts.quality not in ("fast", "standard", "fine", "lossless"):
         raise ConversionError("未知的画面编码档位。")
     if opts.dv_mode not in ("auto", "strip", "reencode"):
         raise ConversionError("未知的杜比视界处理模式。")
+    if opts.hdr_style not in ("natural", "vivid"):
+        raise ConversionError("未知的 HDR 风格设置。")
+    if opts.gpu_filter not in ("auto", "off"):
+        raise ConversionError("未知的 GPU 滤镜加速设置。")
 
     dv = None
     if opts.copy_hdr_video:
@@ -953,14 +1246,43 @@ def build_command(opts: Options, info: dict, destination: Path,
             if not tools.get("libplacebo"):
                 raise ConversionError(tools.get("libplacebo_reason") or "当前 FFmpeg 或显卡驱动不支持 libplacebo／Vulkan，无法转换杜比视界。")
             mastering_str, content_light_str, peak_nits = _dv_static_metadata(dv)
+        elif opts.hdr_style == "natural":
+            mastering_str, content_light_str, peak_nits = MASTERING_DISPLAY, NATURAL_CONTENT_LIGHT, int(NATURAL_PEAK_NITS)
         encoder_key, encoder_note = resolve_encoder(opts.encoder, opts.quality, w, h, detected=detected_encoders)
         is_hw = encoder_key in HARDWARE_PRIORITY
         encoder_label = ENCODER_SPECS[encoder_key]["label"]
 
+    use_gpu_filter = False
+    use_vulkan_hwdec = False
+    if video_operation == "sdr_to_hdr" and is_hw and not lossless_video and opts.gpu_filter == "auto":
+        eligible_input = (
+            p["matrix"] != "gbr"
+            and p["transfer"] in ("bt709", "smpte170m", "bt470bg", "bt2020-10", "bt2020-12")
+        )
+        if eligible_input:
+            gpu_caps = gpu_filter_caps if gpu_filter_caps is not None else detect_gpu_filter()
+            if gpu_caps.get("libplacebo_shader"):
+                use_gpu_filter = True
+                codec_name = p.get("codec_name", "")
+                pix_fmt = p.get("pixel_format", "")
+                hwdec_codec_ok = (
+                    (codec_name == "h264" and pix_fmt in ("yuv420p", "nv12"))
+                    or (codec_name in ("hevc", "av1") and pix_fmt in ("yuv420p", "yuv420p10le", "nv12", "p010le"))
+                )
+                hwdec_color_ok = (
+                    p["range"] == "limited"
+                    and p["transfer"] in ("bt709", "smpte170m", "bt2020-10", "bt2020-12")
+                )
+                use_vulkan_hwdec = bool(gpu_caps.get("vulkan_hwdec") and hwdec_codec_ok and hwdec_color_ok)
+                pipeline_note = "Vulkan 硬解 + libplacebo GPU 色彩管线" if use_vulkan_hwdec else "libplacebo GPU 色彩管线"
+                encoder_note = f"{encoder_note}（{pipeline_note}）" if encoder_note else f"已启用 {pipeline_note}"
+
     filter_threads = min(16, os.cpu_count() or 4) if is_hw else min(8, os.cpu_count() or 4)
     codec_threads = min(8, os.cpu_count() or 4)
-    args = [find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "warning", "-n",
+    args = [find_tool("ffmpeg"), "-hide_banner", "-loglevel", "warning", "-n",
             "-filter_threads", str(filter_threads), "-threads", str(codec_threads)]
+    if use_vulkan_hwdec:
+        args += ["-init_hw_device", "vulkan=vk:0", "-hwaccel", "vulkan", "-hwaccel_output_format", "vulkan"]
     if opts.start:
         args += ["-ss", str(opts.start)]
     if is_hw:
@@ -988,10 +1310,15 @@ def build_command(opts: Options, info: dict, destination: Path,
             # lossless mode uses exact yuv420p10le first for bit-exact SHA-256 verification.
             vf = (dv_filter_chain(w, h, pix_fmt="yuv420p10le") + ",format=p010le"
                   if lossless_video else dv_filter_chain(w, h, pix_fmt="p010le"))
+        elif use_gpu_filter:
+            shader_name = "natural.hook" if opts.hdr_style == "natural" else "vivid.hook"
+            vf = gpu_sdr_filter_chain(p, w, h, shader_name=shader_name, style=opts.hdr_style,
+                                      use_hwdec=use_vulkan_hwdec, pix_fmt="p010le")
         else:
             # Append p010le after setsar=1 rather than replacing yuv420p10le so zscale's
             # bit-exact 10-bit dithered plane layout is preserved before semi-planar packing.
-            vf = filter_chain(p, w, h) + ",format=p010le"
+            lut_name = "natural.cube" if opts.hdr_style == "natural" else "tone.cube"
+            vf = filter_chain(p, w, h, lut_name=lut_name, style=opts.hdr_style) + ",format=p010le"
         args += [
             "-vf", vf,
             *enc_args,
@@ -1006,7 +1333,11 @@ def build_command(opts: Options, info: dict, destination: Path,
                        "fine": ("medium", 16), "lossless": ("fast", None)}[opts.quality]
         video_codec = "libx265"
         quality_control = "x265 lossless=1" if lossless_video else f"CRF {crf}"
-        vf = dv_filter_chain(w, h, pix_fmt="yuv420p10le") if video_operation == "dv_reencode" else filter_chain(p, w, h)
+        if video_operation == "dv_reencode":
+            vf = dv_filter_chain(w, h, pix_fmt="yuv420p10le")
+        else:
+            lut_name = "natural.cube" if opts.hdr_style == "natural" else "tone.cube"
+            vf = filter_chain(p, w, h, lut_name=lut_name, style=opts.hdr_style)
         params = ("colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
                   "hdr10=1:hdr10-opt=0:repeat-headers=1:"
                   f"master-display={mastering_str}:"
@@ -1047,12 +1378,15 @@ def build_command(opts: Options, info: dict, destination: Path,
                       video_codec=video_codec,
                       encoder_label=encoder_label,
                       hardware_accelerated=is_hw,
+                      gpu_filter=use_gpu_filter,
+                      vulkan_hwdec=use_vulkan_hwdec,
                       encoder_note=encoder_note,
                       quality_control=quality_control,
                       audio=args[args.index("-c:a") + 1],
                       audio_effect=opts.audio_effect,
                       audio_filter=SURROUND_FILTER if opts.audio_effect == "surround" else None,
                       video_operation=video_operation,
+                      hdr_style=opts.hdr_style if video_operation == "sdr_to_hdr" else None,
                       dolby_vision=dv,
                       dv_bsf=dv_bsf,
                       mastering_display=mastering_str,
@@ -1083,6 +1417,9 @@ def validate_export(path: Path, expected: dict) -> dict:
             checks["duration"] = actual_duration > 0
         else:
             checks["duration"] = abs(actual_duration - expected["expected_video_duration"]) < max(.15, 3 / expected["source"]["fps"])
+    elif expected.get("require_nonzero_duration"):
+        actual_duration = _known_duration(v.get("duration"), data.get("format", {}).get("duration"))
+        checks["duration"] = actual_duration > 0
     if expected.get("expect_audio"):
         checks["audio_present"] = any(s.get("codec_type") == "audio" for s in data.get("streams", []))
     if expected.get("audio_effect") == "surround":
@@ -1154,11 +1491,12 @@ def verify_lossless(opts: Options, plan: dict, encoded: Path, cache: Path,
     reference += ["-i", opts.source]
     if opts.duration is not None:
         reference += ["-t", str(opts.duration)]
-    ref_filter = (
-        dv_filter_chain(plan["width"], plan["height"], pix_fmt="yuv420p10le")
-        if plan.get("video_operation") == "dv_reencode"
-        else filter_chain(plan["source"], plan["width"], plan["height"])
-    )
+    if plan.get("video_operation") == "dv_reencode":
+        ref_filter = dv_filter_chain(plan["width"], plan["height"], pix_fmt="yuv420p10le")
+    else:
+        style = plan.get("hdr_style") or "vivid"
+        lut_name = "natural.cube" if style == "natural" else "tone.cube"
+        ref_filter = filter_chain(plan["source"], plan["width"], plan["height"], lut_name=lut_name, style=style)
     reference += ["-map", f"0:{plan['source']['stream_index']}", "-an", "-sn", "-dn", "-vf", ref_filter]
     suffix = ["-c:v", "rawvideo", "-threads:v", "1", "-pix_fmt", "yuv420p10le",
               "-fps_mode", "passthrough", "-f", "framehash", "-hash", "sha256", "pipe:1"]
@@ -1201,10 +1539,22 @@ def publish_without_overwrite(temp: Path, final: Path):
     temp.unlink()
 
 
+def _next_partial_path(output: Path) -> Path:
+    base = output.stem if output.stem.endswith("_已转片段") else output.stem + "_已转片段"
+    candidate = output.with_name(base + output.suffix)
+    count = 2
+    while candidate.exists():
+        candidate = output.with_name(f"{base}_{count}{output.suffix}")
+        count += 1
+    return candidate
+
+
 def convert(opts: Options, callback: Callable[[dict], None] | None = None,
-            cancel: threading.Event | None = None) -> dict:
+            cancel: threading.Event | None = None,
+            keep_partial: threading.Event | None = None) -> dict:
     callback = callback or (lambda _: None)
     cancel = cancel or threading.Event()
+    keep_partial = keep_partial or threading.Event()
     source = Path(opts.source).expanduser().resolve()
     output = Path(opts.output).expanduser().resolve()
     if not source.is_file():
@@ -1228,7 +1578,15 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
         dv_info = None if opts.copy_hdr_video else detect_dolby_vision(info, source)
         command, plan = build_command(opts, info, temporary, dv_info=dv_info)
         if plan["video_operation"] == "sdr_to_hdr":
-            write_curve(cache_path / "tone.cube")
+            if plan.get("gpu_filter"):
+                if plan.get("hdr_style") == "natural":
+                    write_natural_shader(cache_path / "natural.hook", plan["source"]["primaries"])
+                else:
+                    write_vivid_shader(cache_path / "vivid.hook", plan["source"]["matrix"])
+            elif plan.get("hdr_style") == "natural":
+                write_natural_lut(cache_path / "natural.cube")
+            else:
+                write_curve(cache_path / "tone.cube")
         total = min(opts.duration or float("inf"), max(0, plan["source"]["duration"] - opts.start))
         if not math.isfinite(total):
             total = 0
@@ -1246,30 +1604,45 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 else f"正在使用 libplacebo + {plan['encoder_label']} 将杜比视界转换为 HDR10…"
             )
         else:
+            accel_prefix = "GPU 色彩管线 + " if plan.get("gpu_filter") else ""
             encoding_message = (
-                f"正在使用 {plan['encoder_label']} 转换画面并处理音效…" if opts.audio_effect == "surround"
-                else f"正在使用 {plan['encoder_label']} 转换画面并编码 HDR…"
+                f"正在使用 {accel_prefix}{plan['encoder_label']} 转换画面并处理音效…" if opts.audio_effect == "surround"
+                else f"正在使用 {accel_prefix}{plan['encoder_label']} 转换画面并编码 HDR…"
             )
         callback(dict(stage="encoding", percent=0, plan=plan, message=encoding_message))
         try:
+            keep_partial_triggered = False
             with log_path.open("wb") as log:
-                process = subprocess.Popen(command, cwd=cache, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                process = subprocess.Popen(command, cwd=cache, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=log, text=True, encoding="utf-8", errors="replace",
                                            creationflags=CREATE_NO_WINDOW)
+                progress = {}
+                last_percent = 0
+                last_seconds = 0.0
                 def stop_when_cancelled():
+                    nonlocal keep_partial_triggered
                     while process.poll() is None:
-                        if cancel.wait(.2):
+                        if cancel.is_set():
                             if process.poll() is None:
                                 try:
                                     process.terminate()
                                 except OSError:
                                     pass
                             return
+                        if keep_partial.is_set() and not keep_partial_triggered:
+                            keep_partial_triggered = True
+                            callback(dict(stage="stopping", percent=last_percent,
+                                          message="正在正常封包并保存已转换的 MP4 片段（请勿强行关闭）…"))
+                            try:
+                                if process.stdin:
+                                    process.stdin.write("q\n")
+                                    process.stdin.flush()
+                                    process.stdin.close()
+                            except (OSError, ValueError):
+                                pass
+                        time.sleep(.1)
                 watcher = threading.Thread(target=stop_when_cancelled, daemon=True)
                 watcher.start()
-                progress = {}
-                last_percent = 0
-                last_seconds = 0.0
                 for line in process.stdout:
                     key, sep, value = line.strip().partition("=")
                     if sep:
@@ -1284,24 +1657,39 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                         frame = progress.get("frame", "")
                         if _finite_number(frame) is None:
                             frame = ""
-                        callback(dict(stage="encoding", percent=last_percent,
-                                      seconds=seconds, total=total, speed=speed,
-                                      frame=frame, message=encoding_message))
+                        if not keep_partial_triggered:
+                            callback(dict(stage="encoding", percent=last_percent,
+                                          seconds=seconds, total=total, speed=speed,
+                                          frame=frame, message=encoding_message))
                 returncode = process.wait()
                 watcher.join(timeout=1)
             tail = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
             if cancel.is_set():
                 raise Cancelled("转换已取消，原片保留。")
-            if returncode:
-                raise ConversionError("转换失败：\n" + tail[-5000:])
-            callback(dict(stage="verifying", percent=99, message="正在检查 HDR、色深和编码标记…"))
-            validation = validate_export(temporary, plan)
-            if plan["lossless_video"]:
-                validation["lossless_pixels"] = verify_lossless(opts, plan, temporary, cache_path, cancel, callback)
+            is_partial = False
+            final_output = output
+            if keep_partial_triggered:
+                if not temporary.is_file() or temporary.stat().st_size == 0:
+                    raise Cancelled("已停止转换，当前尚无可保存的完整视频片段，原片保留。")
+                callback(dict(stage="verifying", percent=99, message="正在检查已转片段的 HDR、色深和编码标记…"))
+                partial_plan = {**plan, "expected_video_duration": None, "require_nonzero_duration": True}
+                try:
+                    validation = validate_export(temporary, partial_plan)
+                except ConversionError:
+                    raise Cancelled("已停止转换，当前尚无可保存的完整视频片段，原片保留。") from None
+                is_partial = True
+                final_output = _next_partial_path(output)
+            else:
+                if returncode:
+                    raise ConversionError("转换失败：\n" + tail[-5000:])
+                callback(dict(stage="verifying", percent=99, message="正在检查 HDR、色深和编码标记…"))
+                validation = validate_export(temporary, plan)
+                if plan["lossless_video"]:
+                    validation["lossless_pixels"] = verify_lossless(opts, plan, temporary, cache_path, cancel, callback)
             if cancel.is_set():
                 raise Cancelled("转换已取消，原片保留。")
-            publish_without_overwrite(temporary, output)
-            validation["format"]["filename"] = str(output)
+            publish_without_overwrite(temporary, final_output)
+            validation["format"]["filename"] = str(final_output)
             if op == "copy_hdr":
                 algorithm_desc = "preserved HDR video stream"
                 method_desc = "HDR video stream copy"
@@ -1324,19 +1712,39 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 mastering_desc = f"BT.2020 / D65 / {peak_nits} nits synthetic HDR10 target derived from source metadata"
                 light_desc = f"{peak_nits}/1000 nits declared HDR10 static bounds; not per-frame measured MaxFALL"
                 fidelity_desc = "Dolby Vision metadata is applied and converted into static 10-bit PQ/BT.2020 HDR10 via libplacebo. Online platform transcoding is outside this tool."
+            elif plan.get("hdr_style") == "natural":
+                algorithm_desc = NATURAL_ALGORITHM_ID
+                if plan.get("gpu_filter"):
+                    dec_prefix = "Vulkan hwdec + " if plan.get("vulkan_hwdec") else ""
+                    method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (BT.1886 BT.709->BT.2020 luminance-preserving 450 nits -> PQ) + 10-bit HEVC ({plan['video_codec']})"
+                else:
+                    method_desc = f"BT.1886 linear BT.709->BT.2020 luminance-preserving 49^3 tetrahedral 3D LUT + spline36 + 10-bit HEVC ({plan['video_codec']})"
+                video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
+                mastering_desc = "BT.2020 / D65 / 1000 nits mastering container; curve peak capped at 450 nits"
+                light_desc = "450/200 nits declared MaxCLL/MaxFALL matching highlight-protected curve ceiling (450 nits) and diffuse reference (~190 nits)"
+                fidelity_desc = "Colorimetric BT.709-to-BT.2020 mapping preserves chromaticity and diffuse skin tones while smoothly lifting specular highlights above knee to 450 nits. Lost SDR detail cannot be synthesized. Online platform transcoding is outside this tool."
             else:
                 algorithm_desc = ALGORITHM_ID
-                method_desc = f"float RGB matrix (UV x0.56 equivalent) + 65536-point log curve + 10-bit HEVC ({plan['video_codec']})"
+                if plan.get("gpu_filter"):
+                    dec_prefix = "Vulkan hwdec + " if plan.get("vulkan_hwdec") else ""
+                    method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (UV x0.56 + log curve) + 10-bit HEVC ({plan['video_codec']})"
+                else:
+                    method_desc = f"float RGB matrix (UV x0.56 equivalent) + 65536-point log curve + 10-bit HEVC ({plan['video_codec']})"
                 video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
                 mastering_desc = "BT.2020 / D65 / 1000 nits; synthetic encoding target, not a measured display"
                 light_desc = "1000-nit conservative MaxCLL/MaxFALL upper bounds, enforced by RGB PQ ceiling; not measured MaxFALL"
                 fidelity_desc = "Fixed tone and color adjustment changes the SDR presentation intentionally. Resampling and 10-bit quantization are part of the conversion. Extreme over-range samples are capped at 1000 nits. Online platform transcoding is outside this tool."
-            result = dict(tool_version=VERSION, algorithm=algorithm_desc, source=str(source), output=str(output),
+            result = dict(tool_version=VERSION, algorithm=algorithm_desc, source=str(source), output=str(final_output),
                           options=dataclasses.asdict(opts), plan=plan, validation=validation,
                           elapsed_seconds=round(time.monotonic() - started, 2),
+                          partial=is_partial,
+                          stopped_early=is_partial,
                           encoder=plan["encoder"],
                           video_codec=plan["video_codec"],
                           hardware_accelerated=plan["hardware_accelerated"],
+                          gpu_filter=plan.get("gpu_filter", False),
+                          vulkan_hwdec=plan.get("vulkan_hwdec", False),
+                          hdr_style=plan.get("hdr_style"),
                           dolby_vision=plan.get("dolby_vision"),
                           method=method_desc,
                           video_encoding=video_enc_desc,
@@ -1344,18 +1752,25 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                           nominal_mastering_target=mastering_desc,
                           declared_light_bounds=light_desc,
                           fidelity_limit=fidelity_desc)
-            report = output.with_suffix(".hdr.json")
+            report = final_output.with_suffix(".hdr.json")
             try:
                 with report.open("x", encoding="utf-8") as f:
                     json.dump(result, f, ensure_ascii=False, indent=2)
             except OSError:
                 pass  # A valid finished video must not be reported as failed over an optional log.
-            callback(dict(stage="done", percent=100, message="HDR 视频已导出并通过文件检查。", result=result))
+            done_msg = ("已停止并保留已转换的 HDR 视频片段（已通过文件检查）。"
+                        if is_partial else "HDR 视频已导出并通过文件检查。")
+            callback(dict(stage="done", percent=100, partial=is_partial, message=done_msg, result=result))
             return result
         finally:
             if process and process.poll() is None:
                 process.terminate()
                 process.wait(timeout=15)
+            if process and process.stdin:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
             if process and process.stdout:
                 process.stdout.close()
             if temporary.exists():
@@ -1371,11 +1786,16 @@ def cli():
     parser.add_argument("output", nargs="?")
     parser.add_argument("--resolution", choices=["original", "1440", "2160"], default="original")
     parser.add_argument("--quality", choices=["fast", "standard", "fine", "lossless"], default="standard")
+    parser.add_argument("--style", dest="hdr_style", choices=["natural", "vivid"], default="natural",
+                        help="SDR 转 HDR 风格：natural 自然高光保护（推荐电影实拍），vivid 高对比风格（原版，适合动漫/暗景）")
+    parser.add_argument("--gpu-filter", choices=["auto", "off"], default="auto",
+                        help="GPU 色彩滤镜加速：auto 自动启用 Vulkan/libplacebo GPU 着色器（不支持时回退 CPU），off 强制 CPU 滤镜")
     parser.add_argument("--encoder", choices=["auto", "cpu", "nvenc", "qsv", "amf"], default="auto")
     parser.add_argument("--dv-mode", choices=["auto", "strip", "reencode"], default="auto",
                         help="杜比视界模式：auto 自动选择（8.1/7 无损直剥，5/8.4 重编码），或手动指定 strip/reencode")
     parser.add_argument("--list-encoders", action="store_true", help="检测并列出当前环境可用的编码器")
     parser.add_argument("--list-dv-tools", action="store_true", help="检测并列出杜比视界转换所需 FFmpeg 组件状态")
+    parser.add_argument("--list-gpu-filter", action="store_true", help="检测并列出 Vulkan/libplacebo GPU 色彩管线状态")
     parser.add_argument("--start", type=float, default=0)
     parser.add_argument("--duration", type=float)
     parser.add_argument("--audio-effect", choices=["original", "surround"], default="original")
@@ -1388,8 +1808,11 @@ def cli():
         if args.list_dv_tools:
             print(json.dumps(detect_dv_tools(), ensure_ascii=False, indent=2), flush=True)
             return
+        if args.list_gpu_filter:
+            print(json.dumps(detect_gpu_filter(), ensure_ascii=False, indent=2), flush=True)
+            return
         if not args.source or not args.output:
-            parser.error("请提供输入视频和输出路径（或使用 --list-encoders / --list-dv-tools 查看环境状态）。")
+            parser.error("请提供输入视频和输出路径（或使用 --list-encoders / --list-dv-tools / --list-gpu-filter 查看环境状态）。")
         option_fields = {f.name for f in dataclasses.fields(Options)}
         opts = Options(**{k: v for k, v in vars(args).items() if k in option_fields})
         convert(opts, lambda p: print(json.dumps(p, ensure_ascii=False), flush=True))

@@ -6,23 +6,25 @@
 
 ## 功能
 
-- **SDR 转 HDR10**：输出 HEVC Main 10、10-bit、PQ / BT.2020、MP4 / hvc1 视频。
+- **SDR 转 HDR10（双风格可选）**：输出 HEVC Main 10、10-bit、PQ / BT.2020、MP4 / hvc1 视频——
+  - **自然高光保护（默认，推荐电影实拍）**：在线性光下完成标准 `BT.709 → BT.2020` 色域映射与等色度高光保护曲线（峰值 `450 nits`、`MaxCLL/MaxFALL = 450/200`、`spline36` 色度采样），稳住肤色、额头与白衣高光细节，同时保持深邃黑位；
+  - **高对比风格（原版，适合动漫与暗景）**：保留 v1.4 及以前的对数高对比曲线（`UV × 0.56`，暗部更沉、亮部更艳丽）。
 - **杜比视界（DV）转 HDR10**：自动识别 Profile 5 / 7 / 8.1 / 8.4——
   - **Profile 8.1 / Profile 7（含 HDR10 兼容层）**：秒级无损直剥（不重编码，保留原生 10-bit HDR10 基础层并剥离 RPU／增强层，零画质损失）；
   - **Profile 5（IPTPQc2，普通屏幕偏绿偏紫）与 Profile 8.4（HLG 杜比视界）**：通过 `libplacebo` 进行杜比视界色彩还原，再由显卡硬编或 CPU 导出标准 HDR10。
-- 支持 **NVIDIA NVENC / Intel QSV / AMD AMF** 10-bit 显卡硬编加速；启动时自动进行实测与 HDR10 元数据自检，不可用时无缝回退至 **CPU (libx265)**。
+- 支持 **NVIDIA NVENC / Intel QSV / AMD AMF** 10-bit 显卡硬编加速，并在显卡有损编码时自动启用 **Vulkan 硬解 + `libplacebo` GPU 色彩管线**（将色域转换、高光保护曲线与 10-bit 抖动移入 GPU 执行，不支持或无损/CPU 编码时无缝回退至 CPU 浮点滤镜）。
 - 保持原尺寸和帧率，或选择短边 1440 / 2160 的输出尺寸。
 - 提供快速、标准、精细、画面无损四种编码方式。
 - 无损档自动比较编码前后每一帧的像素摘要，全部一致才保存最终文件。
 - 可选双声道虚拟环绕；也可只给已有 HDR10 视频加音效，直接保留原视频轨道。
-- 支持先试转 10 秒、取消任务、导出检查和转换记录。
+- 支持先试转 10 秒、**停止并保留已转片段**（优雅封包为可正常播放的 `*_已转片段.mp4`）、彻底取消任务、导出检查和转换记录。
 - 离线运行，不自动上传视频，保留原文件。
 
 ## 开始使用
 
 1. 在仓库的 **Releases** 页面下载 Windows 压缩包，解压后运行 `SDR2HDR.exe`。
-2. 准备包含 `zscale`、`libx265`、`lut1d`、`dovi_rpu`、`libplacebo` 等组件的较新完整 FFmpeg（若使用显卡硬编并写入 HDR10 静态元数据，需 FFmpeg 支持 `-mastering_display` / `-content_light` 及对应 `hevc_nvenc` / `hevc_qsv` / `hevc_amf`）。将其加入 `PATH`，或把 `ffmpeg.exe`、`ffprobe.exe` 放入程序旁的 `bin` 文件夹。
-3. 选择 SDR 或杜比视界视频、导出位置、编码器（默认“自动（优先显卡加速）”）、转换方式和音效，先点击 **先试转 10 秒** 检查效果。
+2. 准备包含 `zscale`、`libx265`、`lut1d`、`lut3d`、`dovi_rpu`、`libplacebo` 等组件的较新完整 FFmpeg（若使用显卡硬编并写入 HDR10 静态元数据，需 FFmpeg 支持 `-mastering_display` / `-content_light` 及对应 `hevc_nvenc` / `hevc_qsv` / `hevc_amf`）。将其加入 `PATH`，或把 `ffmpeg.exe`、`ffprobe.exe` 放入程序旁的 `bin` 文件夹。
+3. 选择 SDR 或杜比视界视频、导出位置、HDR 风格（默认“自然高光保护（推荐电影）”）、编码器（默认“自动（优先显卡加速）”）、转换方式和音效，先点击 **先试转 10 秒** 检查效果。
 4. 点击 **导出完整 HDR**（或 **无损导出 HDR10**），等待转换和文件检查完成。
 
 Windows 程序包已包含 Python 运行环境，无需另装 Python；FFmpeg 需要单独准备。
@@ -31,17 +33,12 @@ Windows 程序包已包含 Python 运行环境，无需另装 Python；FFmpeg �
 
 ## 转换原理
 
-程序先读取输入视频的颜色矩阵和量化范围，在浮点 RGB 中进行色差调整与固定对数映射，再输出 PQ / BT.2020 的 10-bit 画面。
+SDR 转 HDR10 提供两种独立处理风格：
 
-核心处理包含 U/V 色差增益 `0.56` 和逐通道曲线：
+1. **自然高光保护（`natural`，默认）**：按 `BT.1886 (Gamma 2.4)` 解码至线性光并做标准 `BT.709 → BT.2020` 色域矩阵变换，依据 BT.2020 相对亮度 `Y` 施加同比例增益（`Y ≤ 0.62` 保持 `190·Y` 漫反射比例，`Y > 0.62` 按二次平滑曲线抬升至 `450 nits` 峰值），通过 `49³` 四面体插值 3D LUT（`lut3d`）与 `spline36` 色度处理输出 10-bit PQ / BT.2020，并写入与实际峰值匹配的 `MaxCLL = 450 / MaxFALL = 200` 元数据。三通道色度比例保持零偏移，在维持深黑位的同时避免实拍人脸额头、浅色皮肤与高光衣物过曝发白。
+2. **高对比风格（`vivid`，原版）**：在非线性浮点 RGB 中施加 `U/V × 0.56` 色差增益与逐通道固定对数曲线 `q = 0.65 × ln(1 + 5 × max(x, 0)) / ln(6)`（上限 1000 尼特，中性白约 390.5 尼特），适合动漫与偏暗的高对比风格化呈现。
 
-```text
-q = 0.65 × ln(1 + 5 × max(x, 0)) / ln(6)
-```
-
-结果按 PQ 码值解释，并设置 1000 尼特的处理上限。普通中性白的输出约为 PQ `0.65`，对应约 390 尼特参考亮度。最后通过 HEVC 编码保存画面，并写入 HDR10 颜色标记和静态元数据。
-
-这是一种风格化 HDR 增强。它不会恢复原片已经丢失的高光或细节，也不保证与原始 SDR 制作意图严格一致。
+无论哪种风格，都不会凭空恢复原 SDR 片源已经剪裁或丢失的高光细节。
 
 ## 四档编码与硬件加速
 
@@ -71,8 +68,10 @@ q = 0.65 × ln(1 + 5 × max(x, 0)) / ln(6)
 ```powershell
 python source/app.py
 python source/hdr_core.py --list-encoders
+python source/hdr_core.py --list-gpu-filter
 python source/hdr_core.py --list-dv-tools
-python source/hdr_core.py "input.mp4" "output_HDR.mp4" --encoder auto --quality fine
+python source/hdr_core.py "input.mp4" "output_HDR.mp4" --style natural --encoder auto --quality standard
+python source/hdr_core.py "anime.mp4" "output_HDR_vivid.mp4" --style vivid --encoder auto --quality fine
 python source/hdr_core.py "dolby_vision.mkv" "output_HDR10.mp4" --dv-mode auto
 python source/hdr_core.py "input.mp4" "output_HDR_cpu.mp4" --encoder cpu --quality fine
 python source/hdr_core.py "input.mp4" "output_lossless.mp4" --quality lossless

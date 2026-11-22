@@ -1,7 +1,7 @@
-"""Integration checks: real FFmpeg pixels compared with an analytical formula.
+"""Integration checks: real FFmpeg pixels compared with analytical formulas.
 
 Run: python -m unittest discover -s source -p test_conversion.py -v
-Requires FFmpeg with zscale/lut1d/libx265. No third-party Python packages needed.
+Requires FFmpeg with zscale/lut1d/lut3d/libx265. No third-party Python packages needed.
 """
 import json
 import math
@@ -261,6 +261,7 @@ class ConversionTests(unittest.TestCase):
                 {
                     "index": 1,
                     "codec_type": "video",
+                    "codec_name": "h264",
                     "width": 1920,
                     "height": 1080,
                     "pix_fmt": "yuv420p",
@@ -309,13 +310,17 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(plan_amf_auto["video_codec"], "hevc_amf")
 
         # Verify metadata placement before -i, filter chain ending, and codec-specific flags.
+        no_gpu_filter = dict(libplacebo_shader=False, vulkan_hwdec=False, reason="off")
+        yes_gpu_filter = dict(libplacebo_shader=True, vulkan_hwdec=True, reason="")
         for enc_key, expected_flags in [
             ("nvenc", ["-c:v", "hevc_nvenc", "-rc", "vbr", "-cq"]),
             ("qsv", ["-c:v", "hevc_qsv", "-global_quality"]),
             ("amf", ["-c:v", "hevc_amf", "-bitdepth", "10", "-rc", "cqp"]),
         ]:
-            cmd, plan = core.build_command(core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard"), fake_info, dest, detected_encoders=all_hw)
+            cmd, plan = core.build_command(core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard"),
+                                           fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=no_gpu_filter)
             self.assertEqual(plan["encoder"], enc_key)
+            self.assertFalse(plan["gpu_filter"])
             input_pos = cmd.index("-i")
             md_pos = cmd.index("-mastering_display:1")
             cl_pos = cmd.index("-content_light:1")
@@ -325,6 +330,34 @@ class ConversionTests(unittest.TestCase):
             self.assertTrue(vf.endswith("format=yuv420p10le,setsar=1,format=p010le"))
             for flag in expected_flags:
                 self.assertIn(flag, cmd)
+
+            # With libplacebo + Vulkan hwdec enabled, GPU shader path + Vulkan hwdec is selected.
+            cmd_g, plan_g = core.build_command(core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard"),
+                                               fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
+            self.assertTrue(plan_g["gpu_filter"])
+            self.assertTrue(plan_g["vulkan_hwdec"])
+            self.assertIn("-hwaccel", cmd_g)
+            self.assertIn("vulkan", cmd_g)
+            self.assertLess(cmd_g.index("-mastering_display:1"), cmd_g.index("-i"))
+            self.assertIn("custom_shader_path=natural.hook", cmd_g[cmd_g.index("-vf") + 1])
+
+        # Unsupported codec for Vulkan Video (e.g. ffv1) keeps GPU shader but skips -hwaccel vulkan.
+        ffv1_info = {**fake_info, "streams": [{**fake_info["streams"][0], "codec_name": "ffv1", "pix_fmt": "yuv444p10le"}, fake_info["streams"][1]]}
+        cmd_ffv1, plan_ffv1 = core.build_command(core.Options("in.mkv", str(dest), encoder="nvenc", quality="standard"),
+                                                 ffv1_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
+        self.assertTrue(plan_ffv1["gpu_filter"])
+        self.assertFalse(plan_ffv1["vulkan_hwdec"])
+        self.assertNotIn("-hwaccel", cmd_ffv1)
+        self.assertIn("setparams=", cmd_ffv1[cmd_ffv1.index("-vf") + 1])
+
+        # Lossless and gpu_filter='off' always use the deterministic CPU filter chain.
+        cmd_ll_hw, plan_ll_hw = core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc", quality="lossless"),
+                                                   fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
+        self.assertFalse(plan_ll_hw["gpu_filter"])
+        self.assertTrue(cmd_ll_hw[cmd_ll_hw.index("-vf") + 1].endswith("format=yuv420p10le,setsar=1,format=p010le"))
+        _, plan_off = core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc", gpu_filter="off"),
+                                         fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
+        self.assertFalse(plan_off["gpu_filter"])
 
         cmd_cpu, plan_cpu = core.build_command(core.Options("in.mp4", str(dest), encoder="cpu"), fake_info, dest, detected_encoders=all_hw)
         self.assertEqual(plan_cpu["encoder"], "cpu")
@@ -657,6 +690,196 @@ class ConversionTests(unittest.TestCase):
         self.assertTrue(res84["validation"]["checks"]["PQ"])
         self.assertTrue(res84["validation"]["checks"]["no_dovi"])
         self.assertTrue(all(res84["validation"]["checks"].values()))
+
+    def test_natural_style_lut_accuracy_and_skin_protection(self):
+        def expected_bt2020_linear(rgb):
+            lin = [v ** 2.4 for v in rgb]
+            return tuple(sum(row[j] * lin[j] for j in range(3)) for row in core.M_BT709_TO_BT2020)
+
+        def decoded_nits(rgb):
+            return tuple(core.pq_decode(v) for v in core.natural_reference_rgb(rgb))
+
+        # Verify zero skin chromaticity shift and highlight protection thresholds.
+        for skin in ((0.78, 0.62, 0.50), (0.92, 0.78, 0.65), (0.96, 0.88, 0.78)):
+            lin20 = expected_bt2020_linear(skin)
+            nits = decoded_nits(skin)
+            self.assertAlmostEqual(nits[1] / nits[0], lin20[1] / lin20[0], delta=1e-5)
+            self.assertAlmostEqual(nits[2] / nits[0], lin20[2] / lin20[0], delta=1e-5)
+
+        self.assertLess(max(decoded_nits((0.15, 0.12, 0.10))), 2.5)
+        self.assertLess(max(decoded_nits((0.92, 0.78, 0.65))), 150.0)
+        self.assertLess(max(decoded_nits((0.96, 0.88, 0.78))), 205.0)
+        self.assertLess(max(decoded_nits((0.95, 0.95, 0.94))), 305.0)
+        for ch in decoded_nits((1.0, 1.0, 1.0)):
+            self.assertAlmostEqual(ch, core.NATURAL_PEAK_NITS, delta=0.5)
+
+        # Verify real FFmpeg 49^3 tetrahedral lut3d matches analytical natural_reference_rgb.
+        rng = random.Random(2026)
+        samples = [
+            (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0),
+            (0.15, 0.12, 0.10), (0.5, 0.5, 0.5), (0.78, 0.62, 0.50), (0.92, 0.78, 0.65),
+            (0.96, 0.88, 0.78), (0.95, 0.95, 0.94), (-0.05, -0.05, -0.05), (1.15, 1.15, 1.15),
+        ]
+        samples += [tuple(rng.uniform(0.0, 1.0) for _ in range(3)) for _ in range(256 - len(samples))]
+        raw = b"".join(struct.pack("<f", rgb[channel]) for channel in (1, 2, 0) for rgb in samples)
+        p = dict(primaries="bt709", transfer="bt709", matrix="bt709", range="full")
+        chain = core.filter_chain(p, 16, 16, lut_name="natural.cube", style="natural")
+        lut_filter = [f for f in chain.split(",") if f.startswith("lut3d=")][0]
+        core.write_natural_lut(self.dir / "natural.cube")
+        r = subprocess.run(
+            [core.find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-f", "rawvideo",
+             "-pix_fmt", "gbrpf32le", "-s", "16x16", "-r", "1", "-i", "pipe:0",
+             "-vf", lut_filter, "-frames:v", "1", "-pix_fmt", "gbrpf32le", "-f", "rawvideo", "pipe:1"],
+            input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=self.dir, creationflags=core.CREATE_NO_WINDOW,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        floats = struct.unpack("<768f", r.stdout)
+        actual = [(floats[512 + i], floats[i], floats[256 + i]) for i in range(256)]
+        max_err = max(abs(a - b) for rgb, out in zip(samples, actual)
+                      for a, b in zip(core.natural_reference_rgb(rgb), out))
+        max_nits_err = max(abs(core.pq_decode(a) - core.pq_decode(b)) for rgb, out in zip(samples, actual)
+                           for a, b in zip(core.natural_reference_rgb(rgb), out))
+        visible_err = max(abs(a - b) for rgb, out in zip(samples, actual)
+                          for a, b in zip(core.natural_reference_rgb(rgb), out) if a >= 0.05)
+        self.assertLess(max_err, 4e-3)
+        self.assertLess(visible_err, 1e-3)
+        self.assertLess(max_nits_err, 1.0)
+        print(f"\nFFmpeg natural 49^3 lut3d vs analytical reference: visible PQ err={visible_err:.6f}, full PQ err={max_err:.6f}, max nits err={max_nits_err:.3f}")
+
+        # Verify real conversion in natural mode (standard + lossless) and vivid mode (legacy compatibility).
+        source = self.make_source(width=256, height=144, name="自然风格.mkv")
+        out_nat = self.dir / "自然风格_标准.mp4"
+        res_nat = core.convert(core.Options(str(source), str(out_nat), quality="standard", encoder="auto", hdr_style="natural"))
+        self.assertEqual(res_nat["plan"]["hdr_style"], "natural")
+        self.assertEqual(res_nat["plan"]["content_light"], "450,200")
+        self.assertTrue(all(res_nat["validation"]["checks"].values()))
+        cll_nat = next(s for s in res_nat["validation"]["first_frame_side_data"]
+                       if s.get("side_data_type") == "Content light level metadata")
+        self.assertEqual(cll_nat["max_content"], 450)
+        self.assertEqual(cll_nat["max_average"], 200)
+        report_nat = json.loads(out_nat.with_suffix(".hdr.json").read_text(encoding="utf-8"))
+        self.assertEqual(report_nat["hdr_style"], "natural")
+
+        out_nat_ll = self.dir / "自然风格_无损.mp4"
+        res_nat_ll = core.convert(core.Options(str(source), str(out_nat_ll), quality="lossless", encoder="auto", hdr_style="natural"))
+        self.assertEqual(res_nat_ll["plan"]["hdr_style"], "natural")
+        self.assertTrue(res_nat_ll["validation"]["lossless_pixels"]["all_frames_equal"])
+        self.assertEqual(res_nat_ll["validation"]["lossless_pixels"]["frames_compared"], 30)
+
+        out_vivid = self.dir / "高对比原版.mp4"
+        res_vivid = core.convert(core.Options(str(source), str(out_vivid), quality="fast", encoder="cpu", hdr_style="vivid"))
+        self.assertEqual(res_vivid["plan"]["hdr_style"], "vivid")
+        self.assertEqual(res_vivid["plan"]["content_light"], "1000,1000")
+        self.assertTrue(all(res_vivid["validation"]["checks"].values()))
+        cll_vivid = next(s for s in res_vivid["validation"]["first_frame_side_data"]
+                         if s.get("side_data_type") == "Content light level metadata")
+        self.assertEqual(cll_vivid["max_content"], 1000)
+        self.assertEqual(cll_vivid["max_average"], 1000)
+
+        with self.assertRaisesRegex(core.ConversionError, "HDR 风格"):
+            core.convert(core.Options(str(source), str(self.dir / "无效风格.mp4"), hdr_style="unknown"))
+
+    def test_gpu_libplacebo_sdr_pipeline_accuracy_and_conversion(self):
+        core.clear_gpu_filter_cache()
+        gpu_caps = core.detect_gpu_filter(force=True)
+        detected = core.detect_encoders()
+        available_hw = [key for key in core.HARDWARE_PRIORITY if detected[key]["available"]]
+        if not available_hw or not gpu_caps["libplacebo_shader"]:
+            self.skipTest("Hardware encoder or Vulkan/libplacebo GPU shader not available on this host")
+
+        ffmpeg = core.find_tool("ffmpeg")
+        skin_src = self.dir / "skin_h264.mp4"
+        r = core.capture([
+            ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=0xebc7a6:s=256x144:r=25:d=1.0",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1.0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2", str(skin_src),
+        ])
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        def center_yuv10(mp4_path: Path):
+            raw = subprocess.run(
+                [ffmpeg, "-hide_banner", "-v", "error", "-i", str(mp4_path), "-frames:v", "1",
+                 "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "pipe:1"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=core.CREATE_NO_WINDOW,
+            )
+            self.assertEqual(raw.returncode, 0, raw.stderr)
+            y = struct.unpack(f"<{256 * 144}H", raw.stdout[:256 * 144 * 2])[256 * 72 + 128]
+            u = struct.unpack(f"<{128 * 72}H", raw.stdout[256 * 144 * 2:256 * 144 * 2 + 128 * 72 * 2])[128 * 36 + 64]
+            v = struct.unpack(f"<{128 * 72}H", raw.stdout[256 * 144 * 2 + 128 * 72 * 2:])[128 * 36 + 64]
+            return (y, u, v)
+
+        for style, expected_cll in (("natural", (450, 200)), ("vivid", (1000, 1000))):
+            gpu_out = self.dir / f"gpu_{style}.mp4"
+            cpu_out = self.dir / f"cpu_{style}.mp4"
+            res_gpu = core.convert(core.Options(str(skin_src), str(gpu_out), quality="standard", encoder="auto",
+                                                hdr_style=style, gpu_filter="auto"))
+            res_cpu = core.convert(core.Options(str(skin_src), str(cpu_out), quality="standard", encoder="auto",
+                                                hdr_style=style, gpu_filter="off"))
+            self.assertTrue(res_gpu["plan"]["gpu_filter"])
+            self.assertEqual(res_gpu["plan"]["vulkan_hwdec"], gpu_caps["vulkan_hwdec"])
+            self.assertFalse(res_cpu["plan"]["gpu_filter"])
+            self.assertTrue(all(res_gpu["validation"]["checks"].values()))
+            cll = next(s for s in res_gpu["validation"]["first_frame_side_data"]
+                       if s.get("side_data_type") == "Content light level metadata")
+            self.assertEqual((cll["max_content"], cll["max_average"]), expected_cll)
+            g_yuv, c_yuv = center_yuv10(gpu_out), center_yuv10(cpu_out)
+            for g_ch, c_ch in zip(g_yuv, c_yuv):
+                self.assertLessEqual(abs(g_ch - c_ch), 4, f"{style} GPU {g_yuv} vs CPU {c_yuv}")
+
+        # Verify -ss / -t clipping works cleanly with Vulkan hwdec + libplacebo.
+        clip_out = self.dir / "gpu_clipped.mp4"
+        res_clip = core.convert(core.Options(str(skin_src), str(clip_out), quality="fast", encoder="auto",
+                                             start=0.2, duration=0.4, hdr_style="natural"))
+        self.assertTrue(res_clip["plan"]["gpu_filter"])
+        self.assertTrue(all(res_clip["validation"]["checks"].values()))
+
+    def test_graceful_stop_keeps_playable_hdr_partial_mp4(self):
+        ffmpeg = core.find_tool("ffmpeg")
+        source = self.dir / "长片 源.mp4"
+        r = core.capture([
+            ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=10",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=10",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2", str(source),
+        ])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        original_bytes = source.read_bytes()
+        output = self.dir / "长片_HDR.mp4"
+        keep_partial = threading.Event()
+        events = []
+
+        def on_progress(ev):
+            events.append(ev)
+            if ev.get("stage") == "encoding" and ev.get("seconds", 0) >= 0.4:
+                keep_partial.set()
+
+        result = core.convert(
+            core.Options(str(source), str(output), quality="standard", encoder="cpu"),
+            callback=on_progress,
+            keep_partial=keep_partial,
+        )
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["stopped_early"])
+        partial_path = Path(result["output"])
+        self.assertTrue(partial_path.is_file())
+        self.assertTrue(partial_path.name.endswith("_已转片段.mp4"))
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.dir.glob("*.part.mp4")), [])
+        self.assertEqual(source.read_bytes(), original_bytes)
+        self.assertTrue(all(result["validation"]["checks"].values()))
+        actual_dur = core._known_duration(
+            result["validation"]["stream"].get("duration"),
+            result["validation"]["format"].get("duration"),
+        )
+        self.assertGreater(actual_dur, 0.2)
+        self.assertLess(actual_dur, 9.5)
+        report = json.loads(partial_path.with_suffix(".hdr.json").read_text(encoding="utf-8"))
+        self.assertTrue(report["partial"])
+        self.assertEqual(report["output"], str(partial_path))
 
 
 if __name__ == "__main__":

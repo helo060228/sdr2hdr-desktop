@@ -7,7 +7,7 @@
 - FFmpeg 和 ffprobe 单独安装。支持 **NVIDIA (NVENC) / Intel (QSV) / AMD (AMF)** 10-bit HEVC 显卡硬件加速，也可在无独显或硬编不可用时完全使用 CPU (`libx265`) 运行。
 - HDR 文件需要相应设备和播放器才能显示其完整亮度范围。
 
-FFmpeg 应包含 `zscale`、`colorchannelmixer`、`lut1d`、`libx265`、`framehash`；使用音效时还需 `extrastereo`、`stereowiden`、`volume`、`alimiter`。使用显卡硬件加速时需较新完整 FFmpeg（支持 `-mastering_display`、`-content_light` 及 `hevc_nvenc` / `hevc_qsv` / `hevc_amf`）；使用杜比视界转换时，Profile 8.1/7 无损直剥需要 `dovi_rpu`（Profile 7 另需 `dovi_split` 或 `filter_units`），Profile 5/8.4 色彩还原需要 `libplacebo` 及支持 Vulkan 的显卡驱动。
+FFmpeg 应包含 `zscale`、`colorchannelmixer`、`lut1d`、`lut3d`、`libx265`、`framehash`；使用音效时还需 `extrastereo`、`stereowiden`、`volume`、`alimiter`。使用显卡硬件加速时需较新完整 FFmpeg（支持 `-mastering_display`、`-content_light` 及 `hevc_nvenc` / `hevc_qsv` / `hevc_amf`）；使用杜比视界转换时，Profile 8.1/7 无损直剥需要 `dovi_rpu`（Profile 7 另需 `dovi_split` 或 `filter_units`），Profile 5/8.4 色彩还原需要 `libplacebo` 及支持 Vulkan 的显卡驱动。
 
 可通过 [FFmpeg 下载页](https://ffmpeg.org/download.html)寻找 Windows 构建。程序依次查找自身 `bin` 文件夹、同目录、系统 `PATH` 和常见 WinGet 安装目录。
 
@@ -22,9 +22,16 @@ SDR2HDR/
 ## 普通 SDR 转 HDR
 
 1. 选择视频和新的导出文件名。
-2. 选择输出尺寸。默认保持原尺寸，不插帧；调整尺寸不会恢复原片没有的细节。
+2. 选择输出尺寸与 **HDR 风格**（默认“自然高光保护（推荐电影）”）。默认保持原尺寸，不插帧；调整尺寸不会恢复原片没有的细节。
 3. 选择编码方式与编码器（默认“自动（优先显卡加速）”）以及音效。
 4. 先试转 10 秒，检查亮度、颜色和声音，再导出全片。
+
+### HDR 风格选择
+
+- **自然高光保护（推荐电影）**（CLI：`--style natural`，默认）：按标准线性光完成 `BT.709 → BT.2020` 色域转换与等色度亮度映射，漫反射肤色稳在自然区间，只在最亮高光区平滑抬升至 `450 nits`，同时保持深邃暗部黑位与准确的 `450 / 200 nits` 静态元数据。适合实拍电影、剧集、Vlog 与人像，显著减少额头、亮面皮肤与白衣过曝发白。
+- **高对比风格（原版·适合动漫）**（CLI：`--style vivid`）：保留 v1.4 及以前版本的非线性对数曲线与色差调整，暗部更沉、亮部更锐利艳丽，适合二次元动漫、暗场景游戏或偏爱浓郁高对比观感的内容；在明亮实拍人脸上可能偏亮。
+
+注：当输入为杜比视界（DV）或已有标准 HDR10 视频时，“HDR 风格”下拉框会自动锁定，仅对普通 SDR 输入生效。
 
 程序支持常见容器中的逐行扫描 BT.709 / BT.601 SDR 视频。当前不直接处理隔行扫描、其他广色域 SDR 或未支持的 HDR 转换场景。
 
@@ -43,7 +50,14 @@ SDR2HDR/
 - **NVIDIA 显卡 (NVENC)** / **Intel 显卡 (QSV)** / **AMD 显卡 (AMF)**：强制使用指定显卡硬件加速；若本地环境不支持或规格不满足会明确提示原因。
 - **CPU 软件编码 (x265)**：始终使用 `libx265` 软件编码，速度较慢但兼容性最广，同体积下压缩率通常更高。
 
-注：画面色调变换、缩放与 10-bit 抖动仍在高精度浮点与 `zscale` 管线中完成，显卡主要加速耗时最多的 10-bit HEVC 编码阶段，在 2K / 4K 视频下可大幅缩短导出时间。
+注：当使用显卡硬件编码且环境通过 Vulkan / `libplacebo` 自检时，程序会自动启用 **Vulkan 硬解 + `libplacebo` GPU 色彩管线**（在 GPU 内完成色域变换、曲线计算、缩放与 10-bit 抖动），相比 CPU 浮点滤镜可明显提速（实测 1080p / 4K 约快 1.6×～1.7×）；若显卡驱动不支持 Vulkan、选择 CPU 编码或选择“画面无损编码”，会自动使用 CPU 高精度浮点与 `zscale` 管线。注：NVENC “精细画质”开启了 `p7 + multipass` 双遍分析，速度约为“标准画质”的一半，日常压制推荐优先选“标准画质”。
+
+## 停止并保留已转片段 vs 取消
+
+转换进行中界面右侧提供两个停止按钮：
+
+- **停止并保留**：向 FFmpeg 发送优雅退出信号，等待编码缓冲刷出并完整写入 MP4 `moov` 索引头与 `faststart`，经过 HDR10 文件检查后自动保存为 `原文件名_已转片段.mp4`（不占用原定目标文件名，也不会覆盖已有文件），可直接用播放器打开观看与拖动进度条。
+- **取消**：立即终止转码并清理未完成的临时文件，原片始终保持不变。
 
 ## 杜比视界（DV）转 HDR10
 

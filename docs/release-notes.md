@@ -1,24 +1,25 @@
-# SDR2HDR Desktop v1.4.0
+# SDR2HDR Desktop v1.5.0
 
-Windows 离线 **SDR / 杜比视界（Dolby Vision）转 HDR10** 工具，支持显卡硬件加速与杜比视界无损直剥。
+Windows 离线 **SDR / 杜比视界（Dolby Vision）转 HDR10** 工具，支持双风格 SDR 映射（自然高光保护 / 高对比原版）、显卡硬件加速与杜比视界无损直剥。
 
 ## 本次发布
 
-- **新增杜比视界（DV）转 HDR10**：自动识别 Profile 5 / 7 / 8.1 / 8.4：
-  - **Profile 8.1 / Profile 7**：保留原生 10-bit HDR10 基础层并无损剥离 RPU／增强层（`dovi_rpu=strip=1` / `dovi_split=mode=bl`），秒级完成、零重编码画质损失。
-  - **Profile 5（偏绿偏紫片源）与 Profile 8.4（iPhone HLG 杜比视界）**：自动通过 `libplacebo` 色彩还原为标准 10-bit PQ / BT.2020，并复用 NVIDIA NVENC / Intel QSV / AMD AMF 显卡硬编或 CPU 导出。
-- 导出检查新增 `no_dovi` 验证，确保输出文件不再残留杜比视界配置盒或 RPU 元数据。
-- 启动自动检测显卡硬编与 `dovi_rpu` / `libplacebo`（Vulkan）可用性，界面根据输入视频类型自动切换按钮与选项锁定状态。
-- 命令行新增 `--dv-mode {auto,strip,reencode}` 与 `--list-dv-tools`。
+- **新增 SDR 转 HDR10“自然高光保护（推荐电影）”默认模式**：针对实拍电影与人像在高光区（如受光额头、浅色皮肤、白衣）容易过曝发白的问题，在线性光下完成标准 `BT.709 → BT.2020` 色域变换与等色度高光保护曲线（漫反射基准 `190 nits`，高光平滑抬升至 `450 nits`），并写入精准的 `MaxCLL = 450 / MaxFALL = 200` 静态元数据——**在保持深邃黑位的同时，稳住肤色与高光细节**。
+- **完整保留“高对比风格（原版·适合动漫）”模式**：一键可切回 v1.4 及以前版本的对数高对比曲线，适合动漫与暗场景风格化转换。
+- **新增 Vulkan 硬解 + `libplacebo` GPU 色彩管线加速**：显卡有损编码时自动将解码、色域变换、HDR 曲线、缩放与 10-bit 抖动移至 GPU 执行，1080p / 4K 实测提速约 **1.6×～1.7×**（不支持 Vulkan 或使用无损／CPU 编码时无缝回退 CPU 浮点滤镜）。
+- **新增“停止并保留”按钮**：转换中途可随时优雅停止，正常封包写入 MP4 `moov + faststart` 与 HDR10 元数据，校验通过后自动保存为可直接播放的 `*_已转片段.mp4`；点击“取消”仍保持立即终止并清理临时文件。
+- 桌面端新增 **HDR 风格** 下拉选择与实时说明（杜比视界／已有 HDR10 自动锁定）；命令行新增 `--style {natural,vivid}`、`--gpu-filter {auto,off}` 与 `--list-gpu-filter`。
+- 全部 19 项真实 FFmpeg 集成测试通过（涵盖肤色高光保护、GPU 着色器精度、停止保留可播放 MP4、显卡硬编与杜比视界 Profile 5 / 7 / 8.1 / 8.4）。
 
 ## 下载与使用
 
-下载并解压 Windows ZIP，运行 `SDR2HDR.exe`。FFmpeg 和 ffprobe 需单独准备，可放入程序旁的 `bin` 文件夹。使用显卡硬编和杜比视界转换时，建议安装较新的完整 FFmpeg 构建（包含 `zscale`、`libx265`、`dovi_rpu`、`dovi_split`、`libplacebo` 及显卡编码器）。
+下载并解压 Windows ZIP，运行 `SDR2HDR.exe`。FFmpeg 和 ffprobe 需单独准备，可放入程序旁的 `bin` 文件夹。使用显卡硬编、自然高光保护和杜比视界转换时，建议安装较新的完整 FFmpeg 构建（包含 `zscale`、`lut1d`、`lut3d`、`libx265`、`dovi_rpu`、`dovi_split`、`libplacebo` 及显卡编码器）。
 
 包内提供 `SHA256SUMS.txt` 供校验。
 
 ## 使用范围
 
+- 无论选择“自然高光保护”还是“高对比风格”，都不会凭空恢复原 SDR 片源已经剪裁或压缩丢失的高光细节。
 - 杜比视界 Profile 7 无损直剥保留原生 HDR10 基础层，不烘焙 FEL 增强层的额外亮度增量；Profile 5 / 8.4 转换依赖 `libplacebo` 与支持 Vulkan 的显卡驱动。
 - 画面无损仅指重编码路径中 HDR 处理完成后的 10-bit 4:2:0 视频编码，不保证音频无损，也不保证平台转码后无损。QSV 与 AMF 不支持 10-bit HEVC 无损，“自动”模式会回退 CPU (`libx265`)。
 - 视频平台的接收和转码结果需要实际投稿验证。程序不会自动上传或发布视频。

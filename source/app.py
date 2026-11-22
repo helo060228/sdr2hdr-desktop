@@ -1,4 +1,5 @@
 """Small local desktop front end. All video processing stays on the computer."""
+import concurrent.futures
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from hdr_core import (
     convert,
     detect_dv_tools,
     detect_encoders,
+    detect_gpu_filter,
     inspect_input,
 )
 
@@ -29,6 +31,11 @@ ENCODER_LABELS = {
     "CPU 软件编码 (x265)": "cpu",
 }
 
+STYLE_LABELS = {
+    "自然高光保护（推荐电影）": "natural",
+    "高对比风格（原版·适合动漫）": "vivid",
+}
+
 
 class App:
     def __init__(self, root):
@@ -39,15 +46,18 @@ class App:
         root.configure(bg="#f4f5f7")
         self.queue = queue.Queue()
         self.cancel = threading.Event()
+        self.keep_partial = threading.Event()
         self.running = False
         self.input = tk.StringVar()
         self.output = tk.StringVar()
         self.resolution = tk.StringVar(value="保持原尺寸")
+        self.hdr_style = tk.StringVar(value="自然高光保护（推荐电影）")
         self.quality = tk.StringVar(value="标准画质")
         self.encoder = tk.StringVar(value="自动（优先显卡加速）")
         self.audio_effect = tk.StringVar(value="原声（保留）")
         self.detected_encoders = None
         self.dv_tools = None
+        self.gpu_filter_caps = None
         self.input_kind = "sdr"
         self.input_dv = None
         self.status = tk.StringVar(value="选择 SDR、杜比视界或 HDR 视频开始处理。")
@@ -88,22 +98,26 @@ class App:
         row = ttk.Frame(box)
         row.pack(fill="x", pady=(14, 10))
         ttk.Label(row, text="输出尺寸").grid(row=0, column=0, sticky="w")
-        c1 = ttk.Combobox(row, textvariable=self.resolution, values=["保持原尺寸", "2K · 短边 1440", "4K · 短边 2160"], state="readonly", width=24)
+        c1 = ttk.Combobox(row, textvariable=self.resolution, values=["保持原尺寸", "2K · 短边 1440", "4K · 短边 2160"], state="readonly", width=28)
         c1.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(row, text="转换方式").grid(row=0, column=1, sticky="w", padx=(32, 0))
-        c2 = ttk.Combobox(row, textvariable=self.quality, values=["快速试转", "标准画质", "精细画质", "画面无损编码"], state="readonly", width=24)
-        c2.grid(row=1, column=1, sticky="w", padx=(32, 0), pady=(6, 0))
-        ttk.Label(row, text="编码器").grid(row=2, column=0, sticky="w", pady=(12, 0))
-        c3 = ttk.Combobox(row, textvariable=self.encoder, values=list(ENCODER_LABELS.keys()), state="readonly", width=24)
-        c3.grid(row=3, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(row, text="音效").grid(row=2, column=1, sticky="w", padx=(32, 0), pady=(12, 0))
-        c4 = ttk.Combobox(row, textvariable=self.audio_effect, values=["原声（保留）", "虚拟环绕（双声道）"], state="readonly", width=24)
-        c4.grid(row=3, column=1, sticky="w", padx=(32, 0), pady=(6, 0))
-        self.resolution_combo, self.quality_combo, self.encoder_combo, self.audio_combo = c1, c2, c3, c4
-        self.controls += [c1, c2, c3, c4]
+        ttk.Label(row, text="HDR 风格").grid(row=0, column=1, sticky="w", padx=(28, 0))
+        c_style = ttk.Combobox(row, textvariable=self.hdr_style, values=list(STYLE_LABELS.keys()), state="readonly", width=28)
+        c_style.grid(row=1, column=1, sticky="w", padx=(28, 0), pady=(6, 0))
+        ttk.Label(row, text="转换方式").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        c2 = ttk.Combobox(row, textvariable=self.quality, values=["快速试转", "标准画质", "精细画质", "画面无损编码"], state="readonly", width=28)
+        c2.grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(row, text="编码器").grid(row=2, column=1, sticky="w", padx=(28, 0), pady=(12, 0))
+        c3 = ttk.Combobox(row, textvariable=self.encoder, values=list(ENCODER_LABELS.keys()), state="readonly", width=28)
+        c3.grid(row=3, column=1, sticky="w", padx=(28, 0), pady=(6, 0))
+        ttk.Label(row, text="音效").grid(row=4, column=0, sticky="w", pady=(12, 0))
+        c4 = ttk.Combobox(row, textvariable=self.audio_effect, values=["原声（保留）", "虚拟环绕（双声道）"], state="readonly", width=28)
+        c4.grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.resolution_combo, self.style_combo, self.quality_combo, self.encoder_combo, self.audio_combo = c1, c_style, c2, c3, c4
+        self.controls += [c1, c_style, c2, c3, c4]
         self.encoding_note = tk.StringVar()
         ttk.Label(box, textvariable=self.encoder_status, style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(0, 4))
         ttk.Label(box, textvariable=self.encoding_note, style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(0, 6))
+        c_style.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         c2.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         c3.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         ttk.Label(box, text="虚拟环绕通过声场扩展和短延迟增加空间感，输出双声道。\n原声模式尽可能保留原音轨；HDR 画面不会重复增强。", style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(0, 14))
@@ -115,6 +129,8 @@ class App:
         self.preview_button.pack(side="left", padx=10)
         self.stop_button = ttk.Button(actions, text="取消", command=self.stop, state="disabled")
         self.stop_button.pack(side="right")
+        self.save_partial_button = ttk.Button(actions, text="停止并保留", command=self.stop_and_keep, state="disabled")
+        self.save_partial_button.pack(side="right", padx=(0, 8))
         ttk.Progressbar(box, variable=self.progress, maximum=100).pack(fill="x", pady=(20, 12))
         ttk.Label(box, textvariable=self.status, wraplength=710).pack(anchor="w")
         ttk.Label(box, textvariable=self.detail, style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(5, 10))
@@ -123,6 +139,7 @@ class App:
         ttk.Label(box, text="B 站转码后仍需检查 HDR 档位；不同屏幕和平台的显示可能存在差异。\n本工具离线处理，不会自动上传或发布。", style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(17, 0))
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(100, self.poll)
+        self.update_encoding_note()
         self.detect_encoders_async()
         if len(sys.argv) > 1 and Path(sys.argv[1]).is_file():
             root.after(200, lambda: self.set_input(sys.argv[1]))
@@ -130,9 +147,14 @@ class App:
     def detect_encoders_async(self):
         def probe_worker():
             try:
-                encoders = detect_encoders()
-                dv_tools = detect_dv_tools()
-                self.queue.put(dict(stage="encoders", encoders=encoders, dv_tools=dv_tools))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                    f_enc = pool.submit(detect_encoders)
+                    f_dv = pool.submit(detect_dv_tools)
+                    f_gpu = pool.submit(detect_gpu_filter)
+                    encoders = f_enc.result()
+                    dv_tools = f_dv.result()
+                    gpu_filter = f_gpu.result()
+                self.queue.put(dict(stage="encoders", encoders=encoders, dv_tools=dv_tools, gpu_filter=gpu_filter))
             except Exception as e:
                 self.queue.put(dict(stage="encoders", error=str(e)))
         threading.Thread(target=probe_worker, daemon=True).start()
@@ -143,7 +165,7 @@ class App:
             if self.dv_tools is not None and not self.dv_tools.get("dovi_rpu"):
                 notes.append("提示：" + (self.dv_tools.get("strip_reason") or "缺少 dovi_rpu 滤镜，无法无损直剥。"))
             else:
-                notes.append("杜比视界无损直剥：画面直接复制不重编码，输出尺寸／画质／编码器已自动锁定；仍可选音效。")
+                notes.append("杜比视界无损直剥：画面直接复制不重编码，输出尺寸／HDR 风格／画质／编码器已自动锁定；仍可选音效。")
             self.encoding_note.set("\n".join(notes))
             return
         if self.input_kind == "hdr10":
@@ -152,6 +174,12 @@ class App:
             return
         if self.input_kind == "dv_reencode" and self.dv_tools is not None and not self.dv_tools.get("libplacebo"):
             notes.append("提示：" + (self.dv_tools.get("libplacebo_reason") or "当前环境不支持 libplacebo／Vulkan。"))
+        if self.input_kind == "sdr":
+            style_key = STYLE_LABELS[self.hdr_style.get()]
+            if style_key == "natural":
+                notes.append("自然高光保护：线性光 BT.709→BT.2020 色域映射，稳住肤色与额头／白衣高光细节，同时保持深邃黑位（峰值 450 nits）。")
+            else:
+                notes.append("高对比风格：原版对数曲线，暗部更沉、色彩更艳丽，适合动漫与暗景；明亮实拍人脸可能偏亮。")
         enc_key = ENCODER_LABELS[self.encoder.get()]
         is_lossless = self.quality.get() == "画面无损编码"
         if self.detected_encoders is not None and enc_key in HARDWARE_PRIORITY:
@@ -243,12 +271,15 @@ class App:
                 n += 1
             output = str(p)
         resolution = {"保持原尺寸": "original", "2K · 短边 1440": "1440", "4K · 短边 2160": "2160"}[self.resolution.get()]
+        hdr_style = STYLE_LABELS[self.hdr_style.get()]
         quality = {"快速试转": "fast", "标准画质": "standard", "精细画质": "fine", "画面无损编码": "lossless"}[self.quality.get()]
         encoder = ENCODER_LABELS[self.encoder.get()]
         audio_effect = {"原声（保留）": "original", "虚拟环绕（双声道）": "surround"}[self.audio_effect.get()]
-        opts = Options(source, output, resolution=resolution, quality=quality, duration=10 if preview else None, audio_effect=audio_effect, encoder=encoder)
+        opts = Options(source, output, resolution=resolution, quality=quality, duration=10 if preview else None,
+                       audio_effect=audio_effect, encoder=encoder, hdr_style=hdr_style)
         self.running = True
         self.cancel.clear()
+        self.keep_partial.clear()
         self.progress.set(0)
         self.status.set("正在准备…")
         self.detail.set("转换速度取决于视频尺寸与所选显卡/处理器；原片保持不变。")
@@ -272,7 +303,7 @@ class App:
                 else:
                     opts.copy_hdr_video = False
                     opts.dv_mode = "auto"
-                result = convert(opts, self.queue.put, self.cancel)
+                result = convert(opts, self.queue.put, self.cancel, self.keep_partial)
                 self.queue.put(dict(stage="finished", result=result))
             except Cancelled as e:
                 self.queue.put(dict(stage="cancelled", message=str(e)))
@@ -289,14 +320,26 @@ class App:
         self.start_button.configure(state="disabled" if busy else "normal")
         self.preview_button.configure(state="disabled" if busy else "normal")
         self.stop_button.configure(state="normal" if busy else "disabled")
-        if not busy and self.input_kind in ("hdr10", "dv_strip"):
-            self.resolution_combo.configure(state="disabled")
-            self.quality_combo.configure(state="disabled")
-            self.encoder_combo.configure(state="disabled")
+        self.save_partial_button.configure(state="normal" if busy else "disabled")
+        if not busy:
+            if self.input_kind in ("hdr10", "dv_strip"):
+                self.resolution_combo.configure(state="disabled")
+                self.quality_combo.configure(state="disabled")
+                self.encoder_combo.configure(state="disabled")
+            if self.input_kind != "sdr":
+                self.style_combo.configure(state="disabled")
 
     def stop(self):
         self.cancel.set()
+        self.save_partial_button.configure(state="disabled")
         self.status.set("正在取消并清理未完成的视频…")
+
+    def stop_and_keep(self):
+        if not self.running:
+            return
+        self.keep_partial.set()
+        self.save_partial_button.configure(state="disabled")
+        self.status.set("正在正常封包并保存已转换的 MP4 片段（请稍候）…")
 
     def poll(self):
         try:
@@ -330,6 +373,7 @@ class App:
                     else:
                         self.detected_encoders = p["encoders"]
                         self.dv_tools = p.get("dv_tools")
+                        self.gpu_filter_caps = p.get("gpu_filter")
                         hw_labels = []
                         for key in HARDWARE_PRIORITY:
                             info = self.detected_encoders.get(key, {})
@@ -340,6 +384,14 @@ class App:
                             enc_part = "显卡加速：" + "、".join(hw_labels)
                         else:
                             enc_part = "显卡加速：未检测到可用硬编（使用 CPU x265）"
+                        gpu_part = ""
+                        if self.gpu_filter_caps:
+                            if self.gpu_filter_caps.get("libplacebo_shader") and self.gpu_filter_caps.get("vulkan_hwdec"):
+                                gpu_part = "；色彩管线：Vulkan 全 GPU 加速"
+                            elif self.gpu_filter_caps.get("libplacebo_shader"):
+                                gpu_part = "；色彩管线：libplacebo GPU 加速"
+                            else:
+                                gpu_part = "；色彩管线：CPU 浮点滤镜"
                         dv_part = ""
                         if self.dv_tools:
                             if self.dv_tools.get("strip_available") and self.dv_tools.get("libplacebo"):
@@ -348,8 +400,11 @@ class App:
                                 dv_part = "；杜比视界：支持 8.1/7 无损直剥（缺 libplacebo／Vulkan）"
                             else:
                                 dv_part = "；杜比视界：当前 FFmpeg 缺少 dovi_rpu／libplacebo"
-                        self.encoder_status.set(enc_part + dv_part + "。")
+                        self.encoder_status.set(enc_part + gpu_part + dv_part + "。")
                         self.update_encoding_note()
+                elif stage == "stopping":
+                    self.save_partial_button.configure(state="disabled")
+                    self.status.set(p["message"])
                 elif stage in ("encoding", "verifying", "done"):
                     self.progress.set(p.get("percent", 0))
                     self.status.set(p["message"])
@@ -365,8 +420,12 @@ class App:
                     if stage == "finished":
                         self.last_output = p["result"]["output"]
                         encoder_label = p["result"].get("plan", {}).get("encoder_label")
-                        done_prefix = f"已完成（{encoder_label}）" if encoder_label else "已完成"
-                        self.status.set(f"{done_prefix}：HDR 视频和文件检查均通过。")
+                        if p["result"].get("partial"):
+                            prefix = f"已停止并保留片段（{encoder_label}）" if encoder_label else "已停止并保留片段"
+                            self.status.set(f"{prefix}：可正常播放，HDR10 检查均通过。")
+                        else:
+                            done_prefix = f"已完成（{encoder_label}）" if encoder_label else "已完成"
+                            self.status.set(f"{done_prefix}：HDR 视频和文件检查均通过。")
                         self.detail.set(self.last_output)
                     else:
                         self.status.set("已取消。" if stage == "cancelled" else "转换未完成。")
