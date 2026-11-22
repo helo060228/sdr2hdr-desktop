@@ -40,10 +40,27 @@ MaxCLL / MaxFALL 的 `1000 / 1000` 是预设上界标记，不是逐片测量结
 
 ## 编码策略
 
-- 快速：x265 `ultrafast`，CRF 17。
-- 标准：x265 `fast`，CRF 17。
-- 精细：x265 `medium`，CRF 16。
-- 画面无损：x265 `lossless=1`，不传 CRF 参数。
+支持 CPU 软件编码（`libx265`）与三种 Windows 显卡硬件编码器（`hevc_nvenc`、`hevc_qsv`、`hevc_amf`），默认按 `nvenc > qsv > amf > cpu` 自动选用通过自检的编码器。
+
+### CPU 软件编码（`libx265`）
+
+- 快速：`ultrafast`，CRF 17。
+- 标准：`fast`，CRF 17。
+- 精细：`medium`，CRF 16。
+- 画面无损：`lossless=1`（`fast` 预设），不传 CRF 参数。
+- HDR10 颜色标记与静态元数据通过 `-x265-params` 写入码流。
+
+### 显卡硬件编码（10-bit Main 10 / `p010le`）
+
+- **NVIDIA NVENC（`hevc_nvenc`）**：快速 `p2 / VBR CQ 22`；标准 `p5 / VBR CQ 20`；精细 `p7 / multipass qres / VBR CQ 18 / spatial-aq`；画面无损 `-preset p4 -tune lossless`（若本地显卡自检通过）。
+- **Intel QSV（`hevc_qsv`）**：快速 `faster / ICQ 22`；标准 `medium / ICQ 20`；精细 `slow / ICQ 18`（不支持无损档）。
+- **AMD AMF（`hevc_amf`）**：启用 `-bitdepth 10`，快速 `speed / CQP 22`；标准 `balanced / CQP 20`；精细 `quality / CQP 18`（不支持无损档）。
+
+### 滤镜衔接与元数据传播
+
+- 所有编码路径均保持相同的浮点色彩与 `zscale` 处理链，末尾输出 `yuv420p10le`、`setsar=1`。硬件编码路径仅在其后追加 `,format=p010le` 做平面到半平面打包转换，不修改前序抖动与色彩参数。
+- 硬件编码通过输入流选项 `-mastering_display:<stream>` 与 `-content_light:<stream>` 传入 HDR10 静态元数据（放在 `-i` 之前），并配合输出 VUI 标记（`bt2020` / `smpte2084` / `bt2020nc` / `tv`）和 `hvc1` 标签。
+- 硬件编码限用于 `160×128` 至 `8192×8192` 的输出分辨率；超出范围或显卡不支持无损时，“自动”模式会回退到 `libx265`。
 
 前三档根据画质目标分配码率，输出大小取决于内容复杂度。无损档保留进入编码器的 10-bit 4:2:0 像素，可能产生很大的码率。
 

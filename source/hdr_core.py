@@ -5,12 +5,14 @@ stylized HDR presentation, not a colorimetric recovery of an HDR master.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -21,11 +23,49 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128
 ALGORITHM_ID = "Fixed logarithmic SDR-to-PQ tone expansion with chroma gain 0.56"
+MASTERING_DISPLAY = "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)"
+CONTENT_LIGHT = "1000,1000"
+HW_MIN_WIDTH = 160
+HW_MIN_HEIGHT = 128
+HW_MAX_DIM = 8192
+HARDWARE_PRIORITY = ("nvenc", "qsv", "amf")
+ENCODER_SPECS = {
+    "cpu": {
+        "codec": "libx265",
+        "label": "CPU 软件编码 (x265)",
+        "short_label": "CPU (x265)",
+        "hardware": False,
+        "supports_lossless": True,
+    },
+    "nvenc": {
+        "codec": "hevc_nvenc",
+        "label": "NVIDIA 显卡加速 (NVENC)",
+        "short_label": "NVIDIA NVENC",
+        "hardware": True,
+        "supports_lossless": True,
+    },
+    "qsv": {
+        "codec": "hevc_qsv",
+        "label": "Intel 显卡加速 (QSV)",
+        "short_label": "Intel QSV",
+        "hardware": True,
+        "supports_lossless": False,
+    },
+    "amf": {
+        "codec": "hevc_amf",
+        "label": "AMD 显卡加速 (AMF)",
+        "short_label": "AMD AMF",
+        "hardware": True,
+        "supports_lossless": False,
+    },
+}
+_ENCODER_CACHE: dict[str, dict[str, dict]] = {}
+_ENCODER_CACHE_LOCK = threading.Lock()
 # Stereo spatial expansion uses channel difference, short cross delay,
 # modest gain and peak limiting. Output remains a two-channel AAC stream.
 SURROUND_FILTER = (
@@ -272,9 +312,251 @@ class Options:
     duration: float | None = None
     audio_effect: str = "original"
     copy_hdr_video: bool = False
+    encoder: str = "auto"
 
 
-def build_command(opts: Options, info: dict, destination: Path) -> tuple[list[str], dict]:
+def clear_encoder_cache() -> None:
+    """Clear cached runtime encoder capability probe results."""
+    with _ENCODER_CACHE_LOCK:
+        _ENCODER_CACHE.clear()
+
+
+def _hardware_encoder_args(encoder_key: str, quality: str) -> tuple[list[str], dict]:
+    if encoder_key == "nvenc":
+        configs = {
+            "fast": (
+                ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
+                 "-preset", "p2", "-tune", "hq", "-rc", "vbr", "-cq", "22", "-b:v", "0"],
+                dict(codec="hevc_nvenc", preset="p2", crf=None, quality_control="VBR CQ 22"),
+            ),
+            "standard": (
+                ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
+                 "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "20", "-b:v", "0"],
+                dict(codec="hevc_nvenc", preset="p5", crf=None, quality_control="VBR CQ 20"),
+            ),
+            "fine": (
+                ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
+                 "-preset", "p7", "-tune", "hq", "-multipass", "qres", "-rc", "vbr", "-cq", "18",
+                 "-b:v", "0", "-spatial-aq", "1"],
+                dict(codec="hevc_nvenc", preset="p7", crf=None, quality_control="VBR CQ 18 (multipass)"),
+            ),
+            "lossless": (
+                ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
+                 "-preset", "p4", "-tune", "lossless"],
+                dict(codec="hevc_nvenc", preset="p4", crf=None, quality_control="NVENC Lossless"),
+            ),
+        }
+        return configs[quality]
+    if encoder_key == "qsv":
+        if quality == "lossless":
+            raise ConversionError("Intel 显卡加速 (QSV) 不支持 10-bit HEVC 无损编码，画面无损档请改用“自动”或“CPU 软件编码”。")
+        configs = {
+            "fast": (
+                ["-c:v", "hevc_qsv", "-profile:v", "main10", "-pix_fmt", "p010le",
+                 "-preset", "faster", "-global_quality", "22"],
+                dict(codec="hevc_qsv", preset="faster", crf=None, quality_control="ICQ 22"),
+            ),
+            "standard": (
+                ["-c:v", "hevc_qsv", "-profile:v", "main10", "-pix_fmt", "p010le",
+                 "-preset", "medium", "-global_quality", "20"],
+                dict(codec="hevc_qsv", preset="medium", crf=None, quality_control="ICQ 20"),
+            ),
+            "fine": (
+                ["-c:v", "hevc_qsv", "-profile:v", "main10", "-pix_fmt", "p010le",
+                 "-preset", "slow", "-global_quality", "18"],
+                dict(codec="hevc_qsv", preset="slow", crf=None, quality_control="ICQ 18"),
+            ),
+        }
+        return configs[quality]
+    if encoder_key == "amf":
+        if quality == "lossless":
+            raise ConversionError("AMD 显卡加速 (AMF) 不支持 10-bit HEVC 无损编码，画面无损档请改用“自动”或“CPU 软件编码”。")
+        configs = {
+            "fast": (
+                ["-c:v", "hevc_amf", "-profile:v", "main10", "-bitdepth", "10", "-pix_fmt", "p010le",
+                 "-usage", "transcoding", "-quality", "speed", "-rc", "cqp", "-qp_i", "22", "-qp_p", "22",
+                 "-header_insertion_mode", "gop"],
+                dict(codec="hevc_amf", preset="speed", crf=None, quality_control="CQP 22"),
+            ),
+            "standard": (
+                ["-c:v", "hevc_amf", "-profile:v", "main10", "-bitdepth", "10", "-pix_fmt", "p010le",
+                 "-usage", "transcoding", "-quality", "balanced", "-rc", "cqp", "-qp_i", "20", "-qp_p", "20",
+                 "-header_insertion_mode", "gop"],
+                dict(codec="hevc_amf", preset="balanced", crf=None, quality_control="CQP 20"),
+            ),
+            "fine": (
+                ["-c:v", "hevc_amf", "-profile:v", "main10", "-bitdepth", "10", "-pix_fmt", "p010le",
+                 "-usage", "transcoding", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "18",
+                 "-header_insertion_mode", "gop"],
+                dict(codec="hevc_amf", preset="quality", crf=None, quality_control="CQP 18"),
+            ),
+        }
+        return configs[quality]
+    raise ConversionError("未知的硬件编码器。")
+
+
+def _hdr_probe_checks(path: Path) -> tuple[dict[str, bool], dict, dict, list]:
+    data = probe(path)
+    v = video_stream(data)
+    checks = {
+        "HEVC": v.get("codec_name") == "hevc",
+        "10-bit": v.get("pix_fmt") == "yuv420p10le",
+        "PQ": v.get("color_transfer") == "smpte2084",
+        "BT2020": v.get("color_primaries") == "bt2020",
+        "matrix": v.get("color_space") == "bt2020nc",
+        "limited_range": v.get("color_range") == "tv",
+        "hvc1_tag": v.get("codec_tag_string") == "hvc1",
+    }
+    frame = capture([find_tool("ffprobe"), "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+                     "-show_frames", "-of", "json", str(path)])
+    frame_data = json.loads(frame.stdout) if not frame.returncode else {}
+    side = [s for f in frame_data.get("frames", []) for s in f.get("side_data_list", [])]
+    checks["mastering_metadata"] = any("Mastering display" in s.get("side_data_type", "") for s in side)
+    checks["content_light_metadata"] = any("Content light" in s.get("side_data_type", "") for s in side)
+    return checks, data, v, side
+
+
+def _compiled_video_encoders(ffmpeg_path: str) -> set[str]:
+    try:
+        result = capture([ffmpeg_path, "-hide_banner", "-encoders"], timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return set()
+    if result.returncode:
+        return set()
+    encoders = set()
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\s*V[.\w]{5}\s+(\S+)", line)
+        if match:
+            encoders.add(match.group(1))
+    return encoders
+
+
+def _probe_hardware_encoder(ffmpeg_path: str, key: str, compiled: set[str]) -> dict:
+    spec = ENCODER_SPECS[key]
+    entry = {**spec, "key": key, "available": False, "lossless": False, "reason": ""}
+    if spec["codec"] not in compiled:
+        entry["reason"] = "当前 FFmpeg 未编译该硬件编码器"
+        return entry
+    enc_args, _ = _hardware_encoder_args(key, "standard")
+    with tempfile.TemporaryDirectory(prefix=f"sdr2hdr-probe-{key}-") as tmp:
+        probe_mp4 = Path(tmp) / "probe.mp4"
+        base_prefix = [
+            ffmpeg_path, "-hide_banner", "-nostdin", "-y", "-v", "error", "-f", "lavfi",
+            "-mastering_display:v", MASTERING_DISPLAY,
+            "-content_light:v", CONTENT_LIGHT,
+            "-i", "color=c=gray:s=256x144:r=25:d=0.08",
+            "-vf", "format=yuv420p10le,setparams=range=limited:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,format=p010le",
+        ]
+        hdr_suffix = [
+            "-color_primaries", "bt2020", "-color_trc", "smpte2084",
+            "-colorspace", "bt2020nc", "-color_range", "tv",
+            "-tag:v", "hvc1", "-movflags", "+faststart+write_colr",
+        ]
+        try:
+            result = capture([*base_prefix, *enc_args, *hdr_suffix, str(probe_mp4)], timeout=15)
+        except (subprocess.TimeoutExpired, OSError):
+            entry["reason"] = "硬件编码自检超时或无法启动"
+            return entry
+        if result.returncode:
+            stderr_lower = result.stderr.lower()
+            if ("mastering_display" in stderr_lower or "content_light" in stderr_lower) and any(
+                token in stderr_lower for token in ("unrecognized", "option not found", "invalid", "not supported")
+            ):
+                entry["reason"] = "当前 FFmpeg 版本不支持硬件编码写入 HDR10 静态元数据，请升级到较新的完整 FFmpeg"
+            else:
+                entry["reason"] = "未检测到可用的该显卡硬件编码器或驱动不支持 10-bit HEVC"
+            return entry
+        try:
+            checks, _, _, _ = _hdr_probe_checks(probe_mp4)
+        except (ConversionError, json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
+            entry["reason"] = "无法验证硬件编码输出文件"
+            return entry
+        missing = [name for name, ok in checks.items() if not ok]
+        if missing:
+            entry["reason"] = "硬件编码自检未通过完整 HDR10 元数据验证：" + "、".join(missing)
+            return entry
+        entry["available"] = True
+        if spec["supports_lossless"]:
+            ll_args, _ = _hardware_encoder_args(key, "lossless")
+            probe_ll = Path(tmp) / "probe_lossless.mp4"
+            try:
+                ll_result = capture([*base_prefix, *ll_args, *hdr_suffix, str(probe_ll)], timeout=15)
+                if ll_result.returncode == 0:
+                    ll_checks, _, _, _ = _hdr_probe_checks(probe_ll)
+                    entry["lossless"] = all(ll_checks.values())
+            except (ConversionError, json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
+                entry["lossless"] = False
+    return entry
+
+
+def detect_encoders(force: bool = False) -> dict[str, dict]:
+    """Probe CPU and GPU 10-bit HEVC HDR10 encoding capabilities at runtime."""
+    ffmpeg_path = find_tool("ffmpeg")
+    with _ENCODER_CACHE_LOCK:
+        if not force and ffmpeg_path in _ENCODER_CACHE:
+            return {k: dict(v) for k, v in _ENCODER_CACHE[ffmpeg_path].items()}
+    compiled = _compiled_video_encoders(ffmpeg_path)
+    cpu_ok = "libx265" in compiled
+    results: dict[str, dict] = {
+        "cpu": {
+            **ENCODER_SPECS["cpu"],
+            "key": "cpu",
+            "available": cpu_ok,
+            "lossless": cpu_ok,
+            "reason": "" if cpu_ok else "当前 FFmpeg 未包含 libx265 编码器",
+        }
+    }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(HARDWARE_PRIORITY)) as pool:
+        futures = {key: pool.submit(_probe_hardware_encoder, ffmpeg_path, key, compiled)
+                   for key in HARDWARE_PRIORITY}
+        for key in HARDWARE_PRIORITY:
+            results[key] = futures[key].result()
+    with _ENCODER_CACHE_LOCK:
+        _ENCODER_CACHE[ffmpeg_path] = {k: dict(v) for k, v in results.items()}
+    return {k: dict(v) for k, v in results.items()}
+
+
+def resolve_encoder(requested: str, quality: str, width: int, height: int,
+                    detected: dict | None = None) -> tuple[str, str]:
+    """Resolve the active encoder key and fallback/selection note for a job."""
+    if requested not in ("auto", "cpu", *HARDWARE_PRIORITY):
+        raise ConversionError("未知的编码器设置。")
+    detected = detected if detected is not None else detect_encoders()
+    cpu_info = detected.get("cpu", {})
+    hw_dims_ok = HW_MIN_WIDTH <= width <= HW_MAX_DIM and HW_MIN_HEIGHT <= height <= HW_MAX_DIM
+    if requested == "cpu":
+        if not cpu_info.get("available"):
+            raise ConversionError(f"CPU 软件编码不可用：{cpu_info.get('reason') or '缺少 libx265'}")
+        return "cpu", ""
+    if requested == "auto":
+        if not hw_dims_ok:
+            if not cpu_info.get("available"):
+                raise ConversionError(f"输出尺寸 {width}×{height} 不在显卡硬编支持范围内，且 CPU 编码器不可用。")
+            return "cpu", f"输出尺寸 {width}×{height} 不在显卡硬编范围内，已自动使用 CPU (x265)"
+        for key in HARDWARE_PRIORITY:
+            info = detected.get(key, {})
+            if info.get("available") and (quality != "lossless" or info.get("lossless")):
+                return key, f"已自动启用 {info['short_label']} 硬件加速"
+        if not cpu_info.get("available"):
+            raise ConversionError("未检测到可用的显卡硬编或 CPU (x265) 编码器。")
+        if quality == "lossless" and any(detected.get(k, {}).get("available") for k in HARDWARE_PRIORITY):
+            return "cpu", "当前可用显卡不支持 10-bit HEVC 无损编码，已自动使用 CPU (x265)"
+        return "cpu", "未检测到支持 10-bit HDR10 的显卡硬编，已自动使用 CPU (x265)"
+    info = detected.get(requested, {})
+    label = ENCODER_SPECS[requested]["label"]
+    if not info.get("available"):
+        raise ConversionError(f"{label} 当前不可用：{info.get('reason') or '未检测到兼容硬件'}。请改用“自动”或“CPU 软件编码”。")
+    if not hw_dims_ok:
+        raise ConversionError(
+            f"输出尺寸 {width}×{height} 不在显卡硬编支持范围（{HW_MIN_WIDTH}×{HW_MIN_HEIGHT} 至 {HW_MAX_DIM}×{HW_MAX_DIM}）内，请改用“自动”或“CPU 软件编码”。"
+        )
+    if quality == "lossless" and not info.get("lossless"):
+        raise ConversionError(f"{label} 不支持 10-bit HEVC 无损编码，画面无损档请改用“自动”或“CPU 软件编码”。")
+    return requested, ""
+
+
+def build_command(opts: Options, info: dict, destination: Path,
+                  detected_encoders: dict | None = None) -> tuple[list[str], dict]:
     p = hdr_copy_properties(info) if opts.copy_hdr_video else source_properties(info)
     if opts.copy_hdr_video and opts.resolution != "original":
         raise ConversionError("给已有 HDR 加音效时，请保持原尺寸，画面将直接复制。")
@@ -283,30 +565,64 @@ def build_command(opts: Options, info: dict, destination: Path) -> tuple[list[st
     w, h = (p["width"], p["height"]) if opts.copy_hdr_video else dimensions(p, opts.resolution)
     if opts.quality not in ("fast", "standard", "fine", "lossless"):
         raise ConversionError("未知的画面编码档位。")
-    preset, crf = {"fast": ("ultrafast", 17), "standard": ("fast", 17),
-                   "fine": ("medium", 16), "lossless": ("fast", None)}[opts.quality]
     lossless_video = opts.quality == "lossless" and not opts.copy_hdr_video
-    threads = min(8, os.cpu_count() or 4)
-    # Static metadata describes our synthetic encoding target, not a measured
-    # physical mastering display. 1000/1000 are conservative content upper bounds,
-    # enforced by the LUT's per-channel 1000-nit ceiling, not measured MaxFALL.
-    params = ("colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
-              "hdr10=1:hdr10-opt=0:repeat-headers=1:"
-              "master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1):"
-              f"max-cll=1000,1000:pools={threads}:frame-threads=3:log-level=warning")
-    if lossless_video:
-        params += ":lossless=1"
+    if opts.copy_hdr_video:
+        encoder_key, encoder_note = "copy", ""
+        is_hw = False
+        video_codec = "copy"
+        encoder_label = "HDR 画面直拷"
+        preset, crf = None, None
+        quality_control = "stream copy"
+    else:
+        encoder_key, encoder_note = resolve_encoder(opts.encoder, opts.quality, w, h, detected=detected_encoders)
+        is_hw = encoder_key in HARDWARE_PRIORITY
+        encoder_label = ENCODER_SPECS[encoder_key]["label"]
+    filter_threads = min(16, os.cpu_count() or 4) if is_hw else min(8, os.cpu_count() or 4)
+    codec_threads = min(8, os.cpu_count() or 4)
     args = [find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "warning", "-n",
-            "-filter_threads", str(threads), "-threads", str(threads)]
+            "-filter_threads", str(filter_threads), "-threads", str(codec_threads)]
     if opts.start:
         args += ["-ss", str(opts.start)]
+    if is_hw:
+        args += [
+            f"-mastering_display:{p['stream_index']}", MASTERING_DISPLAY,
+            f"-content_light:{p['stream_index']}", CONTENT_LIGHT,
+        ]
     args += ["-i", opts.source]
     if opts.duration is not None:
         args += ["-t", str(opts.duration)]
     args += ["-map", f"0:{p['stream_index']}", "-map", "0:a:0?", "-map_metadata", "-1", "-map_chapters", "-1"]
     if opts.copy_hdr_video:
         args += ["-c:v", "copy", "-tag:v", "hvc1"]
+    elif is_hw:
+        enc_args, enc_meta = _hardware_encoder_args(encoder_key, opts.quality)
+        video_codec = enc_meta["codec"]
+        preset = enc_meta["preset"]
+        crf = enc_meta["crf"]
+        quality_control = enc_meta["quality_control"]
+        # Append p010le after setsar=1 rather than replacing yuv420p10le so zscale's
+        # bit-exact 10-bit dithered plane layout is preserved before semi-planar packing.
+        args += [
+            "-vf", filter_chain(p, w, h) + ",format=p010le",
+            *enc_args,
+            "-g", str(max(1, round(p["fps"] * 2))), "-fps_mode", "passthrough", "-enc_time_base", "filter",
+            "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv",
+            "-tag:v", "hvc1",
+        ]
     else:
+        preset, crf = {"fast": ("ultrafast", 17), "standard": ("fast", 17),
+                       "fine": ("medium", 16), "lossless": ("fast", None)}[opts.quality]
+        video_codec = "libx265"
+        quality_control = "x265 lossless=1" if lossless_video else f"CRF {crf}"
+        # Static metadata describes our synthetic encoding target, not a measured
+        # physical mastering display. 1000/1000 are conservative content upper bounds,
+        # enforced by the LUT's per-channel 1000-nit ceiling, not measured MaxFALL.
+        params = ("colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
+                  "hdr10=1:hdr10-opt=0:repeat-headers=1:"
+                  f"master-display={MASTERING_DISPLAY}:"
+                  f"max-cll={CONTENT_LIGHT}:pools={codec_threads}:frame-threads=3:log-level=warning")
+        if lossless_video:
+            params += ":lossless=1"
         args += ["-vf", filter_chain(p, w, h), "-c:v", "libx265", "-preset", preset]
         if crf is not None:
             args += ["-crf", str(crf)]
@@ -332,6 +648,13 @@ def build_command(opts: Options, info: dict, destination: Path) -> tuple[list[st
     expected_duration = min(opts.duration or float("inf"), max(0, p["duration"] - opts.start))
     return args, dict(source=p, width=w, height=h, preset=preset, crf=crf,
                       lossless_video=lossless_video,
+                      encoder_requested="copy" if opts.copy_hdr_video else opts.encoder,
+                      encoder=encoder_key,
+                      video_codec=video_codec,
+                      encoder_label=encoder_label,
+                      hardware_accelerated=is_hw,
+                      encoder_note=encoder_note,
+                      quality_control=quality_control,
                       audio=args[args.index("-c:a") + 1],
                       audio_effect=opts.audio_effect,
                       audio_filter=SURROUND_FILTER if opts.audio_effect == "surround" else None,
@@ -341,13 +664,8 @@ def build_command(opts: Options, info: dict, destination: Path) -> tuple[list[st
 
 
 def validate_export(path: Path, expected: dict) -> dict:
-    data = probe(path)
-    v = video_stream(data)
-    checks = {"HEVC": v.get("codec_name") == "hevc", "10-bit": v.get("pix_fmt") == "yuv420p10le",
-              "PQ": v.get("color_transfer") == "smpte2084", "BT2020": v.get("color_primaries") == "bt2020",
-              "matrix": v.get("color_space") == "bt2020nc", "limited_range": v.get("color_range") == "tv",
-              "dimensions": (v.get("width"), v.get("height")) == (expected["width"], expected["height"]),
-              "hvc1_tag": v.get("codec_tag_string") == "hvc1"}
+    checks, data, v, side = _hdr_probe_checks(path)
+    checks["dimensions"] = (v.get("width"), v.get("height")) == (expected["width"], expected["height"])
     if expected.get("expected_video_duration"):
         checks["duration"] = abs(_known_duration(v.get("duration"), data.get("format", {}).get("duration")) - expected["expected_video_duration"]) < max(.15, 3 / expected["source"]["fps"])
     if expected.get("expect_audio"):
@@ -355,12 +673,6 @@ def validate_export(path: Path, expected: dict) -> dict:
     if expected.get("audio_effect") == "surround":
         a = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), {})
         checks["stereo_aac_48k"] = a.get("codec_name") == "aac" and a.get("channels") == 2 and a.get("sample_rate") == "48000"
-    frame = capture([find_tool("ffprobe"), "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
-                     "-show_frames", "-of", "json", str(path)])
-    frame_data = json.loads(frame.stdout) if not frame.returncode else {}
-    side = [s for f in frame_data.get("frames", []) for s in f.get("side_data_list", [])]
-    checks["mastering_metadata"] = any("Mastering display" in s.get("side_data_type", "") for s in side)
-    checks["content_light_metadata"] = any("Content light" in s.get("side_data_type", "") for s in side)
     if not all(checks.values()):
         raise ConversionError("输出验证未通过：" + "、".join(k for k, ok in checks.items() if not ok))
     return dict(checks=checks, stream=v, first_frame_side_data=side, format=data.get("format", {}))
@@ -497,9 +809,11 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
         total = min(opts.duration or float("inf"), max(0, plan["source"]["duration"] - opts.start))
         if not math.isfinite(total):
             total = 0
-        encoding_message = ("正在添加音效，HDR 画面直接保留…" if opts.copy_hdr_video else
-                            "正在转换 HDR 并处理音效…" if opts.audio_effect == "surround" else
-                            "正在转换画面并编码 HDR…")
+        encoding_message = (
+            "正在添加音效，HDR 画面直接保留…" if opts.copy_hdr_video else
+            f"正在使用 {plan['encoder_label']} 转换画面并处理音效…" if opts.audio_effect == "surround" else
+            f"正在使用 {plan['encoder_label']} 转换画面并编码 HDR…"
+        )
         callback(dict(stage="encoding", percent=0, plan=plan, message=encoding_message))
         try:
             with log_path.open("wb") as log:
@@ -555,8 +869,11 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
             result = dict(tool_version=VERSION, algorithm="preserved HDR video stream" if opts.copy_hdr_video else ALGORITHM_ID, source=str(source), output=str(output),
                           options=dataclasses.asdict(opts), plan=plan, validation=validation,
                           elapsed_seconds=round(time.monotonic() - started, 2),
-                          method="HDR video stream copy" if opts.copy_hdr_video else "float RGB matrix (UV x0.56 equivalent) + 65536-point log curve + 10-bit HEVC",
-                          video_encoding="HEVC true lossless" if plan["lossless_video"] else "preserved HDR stream" if opts.copy_hdr_video else "HEVC CRF lossy",
+                          encoder=plan["encoder"],
+                          video_codec=plan["video_codec"],
+                          hardware_accelerated=plan["hardware_accelerated"],
+                          method="HDR video stream copy" if opts.copy_hdr_video else f"float RGB matrix (UV x0.56 equivalent) + 65536-point log curve + 10-bit HEVC ({plan['video_codec']})",
+                          video_encoding="preserved HDR stream" if opts.copy_hdr_video else f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})",
                           audio_effect_description=("Stereo spatial enhancement through channel widening, short cross delay and peak limiting. AAC audio is re-encoded." if opts.audio_effect == "surround" else "Original audio retained where AAC stream copy is possible."),
                           nominal_mastering_target="preserved from input HDR stream" if opts.copy_hdr_video else "BT.2020 / D65 / 1000 nits; synthetic encoding target, not a measured display",
                           declared_light_bounds="preserved from input HDR stream" if opts.copy_hdr_video else "1000-nit conservative MaxCLL/MaxFALL upper bounds, enforced by RGB PQ ceiling; not measured MaxFALL",
@@ -584,17 +901,26 @@ def cli():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="离线 SDR 转 HDR 与双声道空间增强")
-    parser.add_argument("source")
-    parser.add_argument("output")
+    parser.add_argument("source", nargs="?")
+    parser.add_argument("output", nargs="?")
     parser.add_argument("--resolution", choices=["original", "1440", "2160"], default="original")
     parser.add_argument("--quality", choices=["fast", "standard", "fine", "lossless"], default="standard")
+    parser.add_argument("--encoder", choices=["auto", "cpu", "nvenc", "qsv", "amf"], default="auto")
+    parser.add_argument("--list-encoders", action="store_true", help="检测并列出当前环境可用的编码器")
     parser.add_argument("--start", type=float, default=0)
     parser.add_argument("--duration", type=float)
     parser.add_argument("--audio-effect", choices=["original", "surround"], default="original")
     parser.add_argument("--copy-hdr-video", action="store_true", help="仅给已有 HEVC HDR 加音效，不重复处理画面")
     args = parser.parse_args()
     try:
-        convert(Options(**vars(args)), lambda p: print(json.dumps(p, ensure_ascii=False), flush=True))
+        if args.list_encoders:
+            print(json.dumps(detect_encoders(), ensure_ascii=False, indent=2), flush=True)
+            return
+        if not args.source or not args.output:
+            parser.error("请提供输入视频和输出路径（或使用 --list-encoders 查看可用编码器）。")
+        option_fields = {f.name for f in dataclasses.fields(Options)}
+        opts = Options(**{k: v for k, v in vars(args).items() if k in option_fields})
+        convert(opts, lambda p: print(json.dumps(p, ensure_ascii=False), flush=True))
     except ConversionError as e:
         print(str(e), file=sys.stderr)
         raise SystemExit(1)

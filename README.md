@@ -1,12 +1,13 @@
 # SDR2HDR Desktop
 
-一个面向 Windows 的离线视频转换工具：将普通 SDR 视频处理为 HDR10，提供四档画面编码、双声道虚拟环绕，以及自动逐帧校验的画面无损编码。
+一个面向 Windows 的离线视频转换工具：将普通 SDR 视频处理为 HDR10，支持 NVIDIA / Intel / AMD 显卡硬件加速与 CPU 自动回退，提供四档画面编码、双声道虚拟环绕，以及自动逐帧校验的画面无损编码。
 
 ![SDR2HDR Desktop 界面](assets/app.png)
 
 ## 功能
 
 - 输出 HEVC Main 10、10-bit、PQ / BT.2020、MP4 / hvc1 视频。
+- 支持 **NVIDIA NVENC / Intel QSV / AMD AMF** 10-bit 显卡硬编加速；启动时自动进行实测与 HDR10 元数据自检，不可用时无缝回退至 **CPU (libx265)**。
 - 保持原尺寸和帧率，或选择短边 1440 / 2160 的输出尺寸。
 - 提供快速、标准、精细、画面无损四种编码方式。
 - 无损档自动比较编码前后每一帧的像素摘要，全部一致才保存最终文件。
@@ -17,8 +18,8 @@
 ## 开始使用
 
 1. 在仓库的 **Releases** 页面下载 Windows 压缩包，解压后运行 `SDR2HDR.exe`。
-2. 准备包含 `zscale`、`libx265`、`lut1d` 等组件的完整 FFmpeg。将其加入 `PATH`，或把 `ffmpeg.exe`、`ffprobe.exe` 放入程序旁的 `bin` 文件夹。
-3. 选择 SDR 视频、导出位置、转换档位和音效，先点击 **先试转 10 秒** 检查效果。
+2. 准备包含 `zscale`、`libx265`、`lut1d` 等组件的较新完整 FFmpeg（若使用显卡硬编并写入 HDR10 静态元数据，需 FFmpeg 支持 `-mastering_display` / `-content_light` 及对应 `hevc_nvenc` / `hevc_qsv` / `hevc_amf`）。将其加入 `PATH`，或把 `ffmpeg.exe`、`ffprobe.exe` 放入程序旁的 `bin` 文件夹。
+3. 选择 SDR 视频、导出位置、编码器（默认“自动（优先显卡加速）”）、转换方式和音效，先点击 **先试转 10 秒** 检查效果。
 4. 点击 **导出完整 HDR**，等待转换和文件检查完成。
 
 Windows 程序包已包含 Python 运行环境，无需另装 Python；FFmpeg 需要单独准备。
@@ -39,14 +40,16 @@ q = 0.65 × ln(1 + 5 × max(x, 0)) / ln(6)
 
 这是一种风格化 HDR 增强。它不会恢复原片已经丢失的高光或细节，也不保证与原始 SDR 制作意图严格一致。
 
-## 四档编码
+## 四档编码与硬件加速
 
-- **快速试转**：`ultrafast / CRF 17`，速度优先。
-- **标准画质**：`fast / CRF 17`，平衡速度、体积与画质。
-- **精细画质**：`medium / CRF 16`，进一步减少压缩损失。
-- **画面无损编码**：`lossless=1`，不以 CRF 限制码率，自动逐帧校验，适合保存母版。
+程序默认自动选择已通过自检的显卡硬件编码器（优先级：`NVIDIA NVENC` > `Intel QSV` > `AMD AMF` > `CPU x265`），也可手动指定编码器：
 
-四档采用相同的 HDR 处理规则。无损档的文件可能明显大于原片，编码和校验也需要更多时间。
+- **快速试转**：CPU `x265 ultrafast / CRF 17`；NVENC `p2 / VBR CQ 22`；QSV `faster / ICQ 22`；AMF `speed / CQP 22`。
+- **标准画质**：CPU `x265 fast / CRF 17`；NVENC `p5 / VBR CQ 20`；QSV `medium / ICQ 20`；AMF `balanced / CQP 20`。
+- **精细画质**：CPU `x265 medium / CRF 16`；NVENC `p7 / multipass qres / VBR CQ 18 / spatial-aq`；QSV `slow / ICQ 18`；AMF `quality / CQP 18`。
+- **画面无损编码**：CPU 使用 `x265 lossless=1`；经自检支持的 NVIDIA NVENC 使用 `-tune lossless`；QSV 与 AMF 不支持 10-bit HEVC 无损，在“自动”模式下会自动切换为 CPU (`x265`)。无损档都会在导出后自动逐帧核对像素摘要。
+
+四档采用相同的 HDR 像素处理规则。显卡硬编可显著缩短 2K / 4K 编码耗时；CPU `libx265` 在同体积下通常具有更高的压缩效率。无损档的文件可能明显大于原片，校验也需要更多时间。
 
 **无损的范围是：HDR 处理后、进入编码器前的 10-bit YUV 4:2:0 画面，与导出视频解码后的画面逐帧一致。**它不表示 SDR 到 HDR 的全部处理可逆，也不保证音频无损。
 
@@ -64,7 +67,9 @@ q = 0.65 × ln(1 + 5 × max(x, 0)) / ln(6)
 
 ```powershell
 python source/app.py
-python source/hdr_core.py "input.mp4" "output_HDR.mp4" --quality fine
+python source/hdr_core.py --list-encoders
+python source/hdr_core.py "input.mp4" "output_HDR.mp4" --encoder auto --quality fine
+python source/hdr_core.py "input.mp4" "output_HDR_cpu.mp4" --encoder cpu --quality fine
 python source/hdr_core.py "input.mp4" "output_lossless.mp4" --quality lossless
 python source/hdr_core.py "input.mp4" "output_HDR_surround.mp4" --audio-effect surround
 ```

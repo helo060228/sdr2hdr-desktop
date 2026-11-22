@@ -4,10 +4,10 @@
 
 - Windows 10 / 11，64 位。
 - Windows 发布包自带 Python 运行环境，解压后即可运行界面。
-- FFmpeg 和 ffprobe 单独安装。本项目的转换流程使用 CPU，不依赖特定显卡。
+- FFmpeg 和 ffprobe 单独安装。支持 **NVIDIA (NVENC) / Intel (QSV) / AMD (AMF)** 10-bit HEVC 显卡硬件加速，也可在无独显或硬编不可用时完全使用 CPU (`libx265`) 运行。
 - HDR 文件需要相应设备和播放器才能显示其完整亮度范围。
 
-FFmpeg 应包含 `zscale`、`colorchannelmixer`、`lut1d`、`libx265`、`framehash`；使用音效时还需 `extrastereo`、`stereowiden`、`volume`、`alimiter`。
+FFmpeg 应包含 `zscale`、`colorchannelmixer`、`lut1d`、`libx265`、`framehash`；使用音效时还需 `extrastereo`、`stereowiden`、`volume`、`alimiter`。若使用显卡硬件加速，建议使用支持 `-mastering_display`、`-content_light` 及对应 `hevc_nvenc` / `hevc_qsv` / `hevc_amf` 编码器的较新完整 FFmpeg 构建。
 
 可通过 [FFmpeg 下载页](https://ffmpeg.org/download.html)寻找 Windows 构建。程序依次查找自身 `bin` 文件夹、同目录、系统 `PATH` 和常见 WinGet 安装目录。
 
@@ -23,12 +23,27 @@ SDR2HDR/
 
 1. 选择视频和新的导出文件名。
 2. 选择输出尺寸。默认保持原尺寸，不插帧；调整尺寸不会恢复原片没有的细节。
-3. 选择编码档位和音效。
+3. 选择编码方式与编码器（默认“自动（优先显卡加速）”）以及音效。
 4. 先试转 10 秒，检查亮度、颜色和声音，再导出全片。
 
 程序支持常见容器中的逐行扫描 BT.709 / BT.601 SDR 视频。当前不直接处理隔行扫描、其他广色域 SDR 或未支持的 HDR 转换场景。
 
 输入缺失可选数值时，程序优先使用可用信息；进度暂时不可用时继续等待。颜色信息缺失时，会在输入信息中显示所采用的推定值。
+
+## 编码器与显卡加速
+
+启动或转换前，程序会自动进行 2 帧硬件编码自检，确认本地显卡、驱动和 FFmpeg 同时满足以下条件才启用对应显卡加速：
+
+- 支持 HEVC Main 10（`p010le` 10-bit）硬件编码；
+- 能够把 BT.2020、PQ（SMPTE ST 2084）、`hvc1` 与 `Mastering display` / `Content light` HDR10 静态元数据正确写入 MP4。
+
+可选编码器如下：
+
+- **自动（优先显卡加速）**：按 `NVIDIA NVENC > Intel QSV > AMD AMF > CPU (x265)` 的顺序自动启用可用编码器。若输出分辨率不在硬件支持范围（`160×128` 至 `8192×8192`），或所选“画面无损编码”不被当前显卡支持，会自动回退到 CPU (`x265`)。
+- **NVIDIA 显卡 (NVENC)** / **Intel 显卡 (QSV)** / **AMD 显卡 (AMF)**：强制使用指定显卡硬件加速；若本地环境不支持或规格不满足会明确提示原因。
+- **CPU 软件编码 (x265)**：始终使用 `libx265` 软件编码，速度较慢但兼容性最广，同体积下压缩率通常更高。
+
+注：画面色调变换、缩放与 10-bit 抖动仍在高精度浮点与 `zscale` 管线中完成，显卡主要加速耗时最多的 10-bit HEVC 编码阶段，在 2K / 4K 视频下可大幅缩短导出时间。
 
 ## 给已有 HDR 加音效
 
@@ -46,7 +61,7 @@ SDR2HDR/
 
 ## 无损档
 
-“画面无损编码”使用 HEVC 的无损编码模式，并核对每帧原始像素字节数和 SHA-256 摘要。
+“画面无损编码”使用 HEVC 的无损编码模式，并核对每帧原始像素字节数和 SHA-256 摘要。CPU (`libx265`) 与经自检支持的 NVIDIA NVENC 均可执行无损编码；Intel QSV 与 AMD AMF 不支持 10-bit HEVC 无损，选择“自动”时会自动改用 CPU (`x265`) 完成无损导出。
 
 - 校验基准是 HDR 处理完成后的 `yuv420p10le` 画面。
 - 颜色映射、尺寸变换、色度采样和 10-bit 量化仍属于转换过程。

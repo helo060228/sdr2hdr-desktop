@@ -58,9 +58,9 @@ class ConversionTests(unittest.TestCase):
         self.assertAlmostEqual(actual[1][0], .65, places=6)
         print(f"\nFFmpeg float filter vs analytical reference: max PQ error={error:.9g}")
 
-    def make_source(self):
-        source = self.dir / "输入 视频.mkv"
-        command = [core.find_tool("ffmpeg"), "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=128x72:r=25:d=1.2",
+    def make_source(self, width=128, height=72, name="输入 视频.mkv"):
+        source = self.dir / name
+        command = [core.find_tool("ffmpeg"), "-v", "error", "-f", "lavfi", "-i", f"testsrc2=s={width}x{height}:r=25:d=1.2",
                    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1.2", "-c:v", "ffv1",
                    "-pix_fmt", "yuv444p10le", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
                    "-color_range", "tv", "-c:a", "pcm_s16le", str(source)]
@@ -183,7 +183,7 @@ class ConversionTests(unittest.TestCase):
             return command, plan
         with self.unavailable_progress(), patch.object(core, "build_command", side_effect=broken_encoder):
             with self.assertRaisesRegex(core.ConversionError, "intentionally_missing_encoder"):
-                core.convert(core.Options(str(source), str(output), quality="fast"))
+                core.convert(core.Options(str(source), str(output), quality="fast", encoder="cpu"))
         self.assertFalse(output.exists())
         self.assertTrue(source.exists())
 
@@ -237,7 +237,7 @@ class ConversionTests(unittest.TestCase):
             return command, plan
         with patch.object(core, "build_command", side_effect=lossy_encoding):
             with self.assertRaisesRegex(core.ConversionError, "无损校验未通过"):
-                core.convert(core.Options(str(source), str(output), quality="lossless"))
+                core.convert(core.Options(str(source), str(output), quality="lossless", encoder="cpu"))
         self.assertFalse(output.exists())
         self.assertEqual(list(self.dir.glob("*.part.mp4")), [])
 
@@ -254,6 +254,157 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(source.read_bytes(), original)
         self.assertFalse(output.exists())
         self.assertEqual(list(self.dir.glob("*.part.mp4")), [])
+
+    def test_encoder_selection_and_hardware_command_construction(self):
+        fake_info = {
+            "streams": [
+                {
+                    "index": 1,
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "pix_fmt": "yuv420p",
+                    "color_space": "bt709",
+                    "color_primaries": "bt709",
+                    "color_transfer": "bt709",
+                    "color_range": "tv",
+                    "avg_frame_rate": "30/1",
+                    "duration": "10.0",
+                },
+                {
+                    "index": 0,
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "channels": 2,
+                    "sample_rate": "48000",
+                    "duration": "10.0",
+                },
+            ],
+            "format": {"duration": "10.0"},
+        }
+
+        def fake_detected(nvenc=False, nvenc_lossless=False, qsv=False, amf=False, cpu=True):
+            return {
+                "cpu": {**core.ENCODER_SPECS["cpu"], "key": "cpu", "available": cpu, "lossless": cpu, "reason": ""},
+                "nvenc": {**core.ENCODER_SPECS["nvenc"], "key": "nvenc", "available": nvenc, "lossless": nvenc_lossless, "reason": "" if nvenc else "no nvenc"},
+                "qsv": {**core.ENCODER_SPECS["qsv"], "key": "qsv", "available": qsv, "lossless": False, "reason": "" if qsv else "no qsv"},
+                "amf": {**core.ENCODER_SPECS["amf"], "key": "amf", "available": amf, "lossless": False, "reason": "" if amf else "no amf"},
+            }
+
+        dest = self.dir / "out.mp4"
+        all_hw = fake_detected(nvenc=True, nvenc_lossless=True, qsv=True, amf=True)
+        qsv_amf = fake_detected(nvenc=False, qsv=True, amf=True)
+        amf_only = fake_detected(amf=True)
+
+        # Priority order: auto prefers nvenc > qsv > amf > cpu.
+        cmd_nv, plan_nv = core.build_command(core.Options("in.mp4", str(dest), encoder="auto"), fake_info, dest, detected_encoders=all_hw)
+        self.assertEqual(plan_nv["encoder"], "nvenc")
+        self.assertEqual(plan_nv["video_codec"], "hevc_nvenc")
+        self.assertTrue(plan_nv["hardware_accelerated"])
+        cmd_qsv_auto, plan_qsv_auto = core.build_command(core.Options("in.mp4", str(dest), encoder="auto"), fake_info, dest, detected_encoders=qsv_amf)
+        self.assertEqual(plan_qsv_auto["encoder"], "qsv")
+        self.assertEqual(plan_qsv_auto["video_codec"], "hevc_qsv")
+        _, plan_amf_auto = core.build_command(core.Options("in.mp4", str(dest), encoder="auto"), fake_info, dest, detected_encoders=amf_only)
+        self.assertEqual(plan_amf_auto["encoder"], "amf")
+        self.assertEqual(plan_amf_auto["video_codec"], "hevc_amf")
+
+        # Verify metadata placement before -i, filter chain ending, and codec-specific flags.
+        for enc_key, expected_flags in [
+            ("nvenc", ["-c:v", "hevc_nvenc", "-rc", "vbr", "-cq"]),
+            ("qsv", ["-c:v", "hevc_qsv", "-global_quality"]),
+            ("amf", ["-c:v", "hevc_amf", "-bitdepth", "10", "-rc", "cqp"]),
+        ]:
+            cmd, plan = core.build_command(core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard"), fake_info, dest, detected_encoders=all_hw)
+            self.assertEqual(plan["encoder"], enc_key)
+            input_pos = cmd.index("-i")
+            md_pos = cmd.index("-mastering_display:1")
+            cl_pos = cmd.index("-content_light:1")
+            self.assertLess(md_pos, input_pos)
+            self.assertLess(cl_pos, input_pos)
+            vf = cmd[cmd.index("-vf") + 1]
+            self.assertTrue(vf.endswith("format=yuv420p10le,setsar=1,format=p010le"))
+            for flag in expected_flags:
+                self.assertIn(flag, cmd)
+
+        cmd_cpu, plan_cpu = core.build_command(core.Options("in.mp4", str(dest), encoder="cpu"), fake_info, dest, detected_encoders=all_hw)
+        self.assertEqual(plan_cpu["encoder"], "cpu")
+        self.assertEqual(plan_cpu["video_codec"], "libx265")
+        self.assertFalse(plan_cpu["hardware_accelerated"])
+        self.assertTrue(cmd_cpu[cmd_cpu.index("-vf") + 1].endswith("format=yuv420p10le,setsar=1"))
+
+        # auto falls back to CPU when QSV/AMF only and quality is lossless.
+        _, plan_ll_fallback = core.build_command(core.Options("in.mp4", str(dest), encoder="auto", quality="lossless"), fake_info, dest, detected_encoders=qsv_amf)
+        self.assertEqual(plan_ll_fallback["encoder"], "cpu")
+        self.assertTrue(plan_ll_fallback["lossless_video"])
+
+        # auto falls back to CPU when dimensions are below hardware minimum.
+        small_info = {**fake_info, "streams": [{**fake_info["streams"][0], "width": 128, "height": 72}, fake_info["streams"][1]]}
+        _, plan_small_fallback = core.build_command(core.Options("in.mp4", str(dest), encoder="auto"), small_info, dest, detected_encoders=all_hw)
+        self.assertEqual(plan_small_fallback["encoder"], "cpu")
+        self.assertIn("尺寸", plan_small_fallback["encoder_note"])
+
+        # Explicit requests validate availability, dimensions, and lossless support.
+        with self.assertRaisesRegex(core.ConversionError, "不可用"):
+            core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc"), fake_info, dest, detected_encoders=qsv_amf)
+        with self.assertRaisesRegex(core.ConversionError, "支持范围"):
+            core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc"), small_info, dest, detected_encoders=all_hw)
+        with self.assertRaisesRegex(core.ConversionError, "无损"):
+            core.build_command(core.Options("in.mp4", str(dest), encoder="qsv", quality="lossless"), fake_info, dest, detected_encoders=all_hw)
+        with self.assertRaisesRegex(core.ConversionError, "无损"):
+            core.build_command(core.Options("in.mp4", str(dest), encoder="amf", quality="lossless"), fake_info, dest, detected_encoders=all_hw)
+
+    def test_real_hardware_encoder_conversion_and_lossless(self):
+        core.clear_encoder_cache()
+        detected = core.detect_encoders(force=True)
+        self.assertEqual(set(detected.keys()), {"cpu", "nvenc", "qsv", "amf"})
+        for key, item in detected.items():
+            self.assertIn("available", item)
+            self.assertIn("lossless", item)
+            self.assertIn("reason", item)
+            self.assertEqual(item["key"], key)
+        self.assertTrue(detected["cpu"]["available"])
+
+        available_hw = [key for key in core.HARDWARE_PRIORITY if detected[key]["available"]]
+        if not available_hw:
+            self.skipTest("No supported 10-bit HEVC HDR10 hardware encoder available on this host")
+        hw_key = available_hw[0]
+        source = self.make_source(width=256, height=144, name="硬件 测试.mkv")
+
+        auto_out = self.dir / "硬件自动标准.mp4"
+        res_auto = core.convert(core.Options(str(source), str(auto_out), quality="standard", encoder="auto"))
+        self.assertTrue(res_auto["plan"]["hardware_accelerated"])
+        self.assertEqual(res_auto["plan"]["encoder"], hw_key)
+        self.assertTrue(all(res_auto["validation"]["checks"].values()))
+        report = json.loads(auto_out.with_suffix(".hdr.json").read_text(encoding="utf-8"))
+        self.assertTrue(report["hardware_accelerated"])
+        self.assertEqual(report["video_codec"], detected[hw_key]["codec"])
+
+        fine_out = self.dir / "硬件精细环绕.mp4"
+        res_fine = core.convert(core.Options(str(source), str(fine_out), quality="fine", audio_effect="surround", encoder=hw_key))
+        self.assertEqual(res_fine["plan"]["encoder"], hw_key)
+        self.assertTrue(all(res_fine["validation"]["checks"].values()))
+
+        # Copy HDR video stream generated by hardware encoder and verify video packets stay identical.
+        copy_out = self.dir / "硬件直拷环绕.mp4"
+        res_copy = core.convert(core.Options(str(auto_out), str(copy_out), audio_effect="surround", copy_hdr_video=True))
+        self.assertEqual(res_copy["plan"]["video_operation"], "copy_hdr")
+        self.assertTrue(all(res_copy["validation"]["checks"].values()))
+
+        def video_packet_hash(path):
+            r = core.capture([core.find_tool("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:v:0",
+                              "-c", "copy", "-f", "hash", "-hash", "sha256", "-"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout.strip()
+
+        self.assertEqual(video_packet_hash(auto_out), video_packet_hash(copy_out))
+
+        if detected[hw_key]["lossless"]:
+            ll_out = self.dir / "硬件无损.mp4"
+            res_ll = core.convert(core.Options(str(source), str(ll_out), quality="lossless", encoder=hw_key))
+            self.assertTrue(res_ll["plan"]["lossless_video"])
+            self.assertEqual(res_ll["plan"]["encoder"], hw_key)
+            self.assertTrue(res_ll["validation"]["lossless_pixels"]["all_frames_equal"])
+            self.assertEqual(res_ll["validation"]["lossless_pixels"]["frames_compared"], 30)
 
 
 if __name__ == "__main__":
