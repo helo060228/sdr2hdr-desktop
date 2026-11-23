@@ -2,12 +2,13 @@
 
 ## 处理流程
 
-SDR 转 HDR10 提供两种独立管线：
+SDR 转 HDR10 提供三种独立管线（显卡有损编码默认经 Vulkan + `libplacebo` GLSL GPU 着色器执行；CPU / 无损编码经 `zscale` + LUT 浮点管线执行）：
 
-- **自然高光保护（`natural`，默认）**：解析输入颜色信息 → `zscale (spline36)` 浮点 BT.709 RGB → `49³` 四面体 3D LUT（BT.1886 线性解码 → `BT.709→BT.2020` 线性色域变换 → 等色度高光保护曲线 → PQ 编码）→ `zscale (spline36 + error_diffusion)` 10-bit BT.2020 YUV 4:2:0 → HEVC / MP4（`MaxCLL = 450 / MaxFALL = 200`）。
-- **高对比风格（`vivid`，原版）**：解析输入颜色信息 → 浮点非线性 RGB → 色差增益（`U/V × 0.56`）→ 65,536 点一维对数曲线 → PQ / BT.2020 → 10-bit YUV 4:2:0 → HEVC / MP4（`MaxCLL = 1000 / MaxFALL = 1000`）。
+- **影院均衡高光（`balanced`，750 nit，默认）**：解析输入颜色信息 → `BT.1886` 线性解码 → `BT.709→BT.2020` 线性色域变换 → 深黑位 + 中间调平滑抬升 + 高光余量曲线（峰值 `750 nits`）→ PQ / BT.2020 → 10-bit YUV 4:2:0 → HEVC / MP4（`MaxCLL = 750 / MaxFALL = 260`）。
+- **柔和暗室保护（`natural`，450 nit）**：解析输入颜色信息 → `BT.1886` 线性解码 → `BT.709→BT.2020` 线性色域变换 → 保守等色度高光保护曲线（峰值 `450 nits`）→ PQ / BT.2020 → 10-bit YUV 4:2:0 → HEVC / MP4（`MaxCLL = 450 / MaxFALL = 200`）。
+- **高对比风格（`vivid`，原版）**：解析输入颜色信息 → 浮点非线性 RGB → 色差增益（`U/V × 0.56`）→ 65,536 点一维对数曲线 / 等价着色器 → PQ / BT.2020 → 10-bit YUV 4:2:0 → HEVC / MP4（`MaxCLL = 1000 / MaxFALL = 1000`）。
 
-两者均为确定性数学规则，不包含场景识别或凭空生成原片已丢失的高光细节。
+三者均为确定性数学规则，不包含场景识别或凭空生成原片已丢失的高光细节。
 
 ## 颜色与亮度
 
@@ -15,25 +16,38 @@ SDR 转 HDR10 提供两种独立管线：
 
 读取输入视频的颜色矩阵、传递函数、原色和量化范围，按输入信息显式完成 YUV / RGB 转换。当前接受逐行扫描 BT.709 / BT.601 SDR；缺失颜色标记时会使用推定值并记录在 `.hdr.json` 转换计划中。
 
-### 风格一：自然高光保护（`natural`，默认，推荐电影实拍）
+### 风格一：影院均衡高光（`balanced`，默认，推荐电影·750 nit）
 
-针对实拍电影中人脸额头、浅色皮肤与高光衣物容易在强对数映射下过曝发白的问题，自然模式在线性光下执行等色度映射：
+兼顾深邃暗部黑位、饱满中间调亮度、肤色纹理不发白过曝与 750 nits 极亮高光冲击力：
 
-1. **输入标准化与线性解码**：通过 `zscale` 使用 `spline36` 插值将输入统一到全范围浮点 BT.709 RGB（`gbrpf32le`），按 **BT.1886（Gamma 2.4）** 解码至相对线性光：
+1. **线性解码与色域矩阵**：按 **BT.1886（Gamma 2.4）** 解码至相对线性光并使用对应原色矩阵变换到线性 BT.2020 `(R_2020, G_2020, B_2020)`，保持零色度偏移。
+2. **深黑锚定 + 中间调恢复 + 750 nit 高光余量曲线**：按 BT.2020 相对亮度 `Y = 0.2627·R_2020 + 0.6780·G_2020 + 0.0593·B_2020` 计算目标尼特亮度（暗部斜坡 `0.08`、漫反射基准 `255 nits`、中间调平滑增益 `0.22`、拐点 `Y_k = 0.68`）：
+   ```text
+   s        = clamp(Y / 0.08, 0, 1)
+   smooth_s = s^2 · (3 - 2s)
+   L_diff(Y)= 255 · Y · (1 + 0.88 · Y · (1 - Y) · smooth_s)
+   L(Y)     = L_diff(Y)                                       ,  0 ≤ Y ≤ 0.68
+   L(Y)     = L_diff(Y) + 495 · ((Y - 0.68) / 0.32)^2.3       ,  0.68 < Y < 1.0
+   ```
+   对三通道施加**同一亮度增益** `gain = L(Y) / Y`（峰值按 `750 / max(R, G, B)` 等比例限幅）。极暗部受 `smooth_s` 锚定停在约 `1.3 nits`，灰衬衫中间调回升至约 `71 nits`，受光额头稳在约 `220 / 750 nits`（PQ 余量大于旧版 3 倍），极亮灯光平滑冲至 `750 nits`。
+3. **执行路径与元数据**：GPU 路径由 `//!HOOK MAIN` GLSL 着色器直接解析计算；CPU / 无损路径烘焙为缓存的 `49³` `.cube` 3D LUT 并经 `lut3d=interp=tetrahedral` 与 `spline36 + error_diffusion` 输出有限范围 `yuv420p10le`，写入 **`MaxCLL = 750 / MaxFALL = 260`**。
+
+### 风格二：柔和暗室保护（`natural`，450 nit）
+
+为全黑暗室观影提供更保守的高光保护，漫反射基准 `190 nits`，拐点 `Y_k = 0.62`：
+
+1. **输入标准化与线性解码**：按 **BT.1886（Gamma 2.4）** 解码至线性光并映射至 BT.2020 `(R_2020, G_2020, B_2020)`：
    ```text
    R_lin, G_lin, B_lin = clamp(R, 0, 1)^2.4, clamp(G, 0, 1)^2.4, clamp(B, 0, 1)^2.4
    ```
-2. **标准线性色域变换（BT.709 → BT.2020）**：使用 ITU-R BT.2087 标准 3×3 矩阵把 BT.709 线性原色准确映射到 BT.2020 线性空间 `(R_2020, G_2020, B_2020)`，避免高饱和与暖色调肤色偏橙或过饱和。
-3. **等色度亮度高光保护曲线**：按 BT.2020 相对亮度 `Y = 0.2627·R_2020 + 0.6780·G_2020 + 0.0593·B_2020` 计算目标尼特亮度（拐点 `Y_k = 0.62`，漫反射基准 `190 nits`，高光平滑抬升上限 `450 nits`）：
+2. **等色度亮度高光保护曲线**：按 BT.2020 相对亮度 `Y` 计算目标尼特亮度（峰值上限 `450 nits`）：
    ```text
    L(Y) = 190 · Y                                       ,  0 ≤ Y ≤ 0.62
    L(Y) = 190 · Y + 260 · ((Y - 0.62) / 0.38)^2         ,  0.62 < Y ≤ 1.0
    ```
-   对三个线性通道施加**同一亮度增益** `gain = L(Y) / Y`（超峰值按 `450 / max(R, G, B)` 等比例限幅），因此三通道色度比例 `G/R`、`B/R` 保持零偏移；暗部自然下沉保持黑位深度，受光额头与高光皮肤稳定留在约 `110～200 nits` 区间而不发白，金属/天空/白衣等极亮区平滑过渡至 `450 nits`。
-4. **PQ 编码与 `49³` 3D LUT 执行**：上述步骤整体烘焙为内存缓存的 `49 × 49 × 49` `.cube` 3D LUT，由 FFmpeg `lut3d=interp=tetrahedral` 四面体插值在 `gbrpf32le` 浮点管线执行，随后由 `zscale` 以 `spline36` 与 `error_diffusion` 抖动输出有限范围 10-bit `yuv420p10le`。
-5. **精准静态元数据**：写入 BT.2020 / D65 / 1000 尼特母版容器标记与 **`MaxCLL = 450 / MaxFALL = 200`** 内容光级别，与曲线实际峰值 `450 nits` 一致，降低电视与显示器色调映射误压暗或二次剪切的风险。
+3. **执行路径与元数据**：CPU / 无损路径采用 `49³` 四面体 `lut3d` 与 `spline36 + error_diffusion`；GPU 路径由 `//!HOOK MAIN` 着色器直接计算。写入 **`MaxCLL = 450 / MaxFALL = 200`**。
 
-### 风格二：高对比风格（`vivid`，原版，适合动漫与暗景）
+### 风格三：高对比风格（`vivid`，原版，适合动漫与暗景）
 
 保留 v1.4 及以前版本的非线性风格化管线：
 
@@ -83,8 +97,8 @@ SDR 转 HDR10 提供两种独立管线：
 
 ### 滤镜衔接、GPU 色彩加速与元数据传播
 
-- **GPU 色彩加速路径（默认自动启用）**：在显卡有损编码（`NVENC` / `QSV` / `AMF`）且通过运行时 Vulkan / `libplacebo` 自检时，SDR 转 HDR 的两种风格均通过自包含 `//!HOOK MAIN` GLSL 着色器在 GPU 执行（关闭 `libplacebo` 内置色调映射与传递转换 `color_primaries=auto:color_trc=auto:disable_linear=true`，由着色器直接执行精确的 BT.1886→BT.2020→PQ 高光保护公式或 `vivid` 色差+对数公式，随后在 GPU 内完成 BT.2020nc 转换与 10-bit 抖动）；输入为 H.264 8-bit 或 HEVC / AV1 8/10-bit 且支持 Vulkan Video 时自动启用 `-hwaccel vulkan -hwaccel_output_format vulkan` 零拷贝硬解，实测与 CPU 管线在平场色块误差 `≤ 1 / 1023`。
-- **CPU 浮点滤镜回退路径**：当使用 `libx265` 软件编码、选择“画面无损编码”、使用 `--gpu-filter off` 或本地环境无 Vulkan / `libplacebo` 支持时，自动使用 `zscale` + `natural.cube` / `tone.cube` 浮点管线，末尾输出 `yuv420p10le`、`setsar=1`（显卡路径追加 `,format=p010le`）。
+- **GPU 色彩加速路径（默认自动启用）**：在显卡有损编码（`NVENC` / `QSV` / `AMF`）且通过运行时 Vulkan / `libplacebo` 自检时，SDR 转 HDR 的三种风格均通过自包含 `//!HOOK MAIN` GLSL 着色器在 GPU 执行（关闭 `libplacebo` 内置色调映射与传递转换 `color_primaries=auto:color_trc=auto:disable_linear=true`，由着色器直接执行精确的 `balanced` / `natural` BT.1886→BT.2020→PQ 公式或 `vivid` 色差+对数公式，随后在 GPU 内完成 BT.2020nc 转换与 10-bit 抖动）；输入为 H.264 8-bit 或 HEVC / AV1 8/10-bit 且支持 Vulkan Video 时自动启用 `-hwaccel vulkan -hwaccel_output_format vulkan` 零拷贝硬解，实测与 CPU 管线在平场色块误差 `≤ 1 / 1023`。
+- **CPU 浮点滤镜回退路径**：当使用 `libx265` 软件编码、选择“画面无损编码”、使用 `--gpu-filter off` 或本地环境无 Vulkan / `libplacebo` 支持时，自动使用 `zscale` + `balanced.cube` / `natural.cube` / `tone.cube` 浮点管线，末尾输出 `yuv420p10le`、`setsar=1`（显卡路径追加 `,format=p010le`）。
 - 硬件编码通过输入流选项 `-mastering_display:<stream>` 与 `-content_light:<stream>` 传入 HDR10 静态元数据（放在 `-i` 之前），并配合输出 VUI 标记（`bt2020` / `smpte2084` / `bt2020nc` / `tv`）和 `hvc1` 标签。
 - 硬件编码限用于 `160×128` 至 `8192×8192` 的输出分辨率；超出范围或显卡不支持无损时，“自动”模式会回退到 `libx265`。
 

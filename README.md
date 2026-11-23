@@ -6,9 +6,10 @@
 
 ## 功能
 
-- **SDR 转 HDR10（双风格可选）**：输出 HEVC Main 10、10-bit、PQ / BT.2020、MP4 / hvc1 视频——
-  - **自然高光保护（默认，推荐电影实拍）**：在线性光下完成标准 `BT.709 → BT.2020` 色域映射与等色度高光保护曲线（峰值 `450 nits`、`MaxCLL/MaxFALL = 450/200`、`spline36` 色度采样），稳住肤色、额头与白衣高光细节，同时保持深邃黑位；
-  - **高对比风格（原版，适合动漫与暗景）**：保留 v1.4 及以前的对数高对比曲线（`UV × 0.56`，暗部更沉、亮部更艳丽）。
+- **SDR 转 HDR10（三档风格可选）**：输出 HEVC Main 10、10-bit、PQ / BT.2020、MP4 / hvc1 视频——
+  - **影院均衡高光（推荐电影·750 nit，默认）**：在线性光下完成标准 `BT.709 → BT.2020` 色域映射与等色度均衡高光保护曲线，暗部保持深邃黑位（~1.3 nits），中间调平滑恢复自然观感亮度，受光额头与肤色留足动态余量（~220 / 750 nits），同时在极亮高光区平滑爆发至 `750 nits`（`MaxCLL/MaxFALL = 750/260`）；
+  - **柔和暗室保护（450 nit）**：更克制的 `190 nits` 漫反射基准与 `450 nits` 峰值（`MaxCLL/MaxFALL = 450/200`），适合全黑暗室观影；
+  - **高对比风格（原版·动漫）**：保留 v1.4 及以前的对数高对比曲线（`UV × 0.56`，暗部更沉、亮部更艳丽）。
 - **杜比视界（DV）转 HDR10**：自动识别 Profile 5 / 7 / 8.1 / 8.4——
   - **Profile 8.1 / Profile 7（含 HDR10 兼容层）**：秒级无损直剥（不重编码，保留原生 10-bit HDR10 基础层并剥离 RPU／增强层，零画质损失，并兼容未标注容器矩阵的蓝光 Remux）；
   - **Profile 5（IPTPQc2，普通屏幕偏绿偏紫）与 Profile 8.4（HLG 杜比视界）**：通过 **Vulkan 硬解 + `libplacebo`** 进行杜比视界色彩还原，再由显卡硬编或 CPU 导出标准 HDR10。
@@ -24,7 +25,7 @@
 
 1. 在仓库的 **Releases** 页面下载 Windows 压缩包，解压后运行 `SDR2HDR.exe`。
 2. 准备包含 `zscale`、`libx265`、`lut1d`、`lut3d`、`dovi_rpu`、`libplacebo` 等组件的较新完整 FFmpeg（若使用显卡硬编并写入 HDR10 静态元数据，需 FFmpeg 支持 `-mastering_display` / `-content_light` 及对应 `hevc_nvenc` / `hevc_qsv` / `hevc_amf`）。将其加入 `PATH`，或把 `ffmpeg.exe`、`ffprobe.exe` 放入程序旁的 `bin` 文件夹。
-3. 选择 SDR 或杜比视界视频、导出位置、HDR 风格（默认“自然高光保护（推荐电影）”）、编码器（默认“自动（优先显卡加速）”）、转换方式和音效，先点击 **先试转 10 秒** 检查效果。
+3. 选择 SDR 或杜比视界视频、导出位置、HDR 风格（默认“影院均衡高光（推荐电影·750 nit）”）、编码器（默认“自动（优先显卡加速）”）、转换方式和音效，先点击 **先试转 10 秒** 检查效果。
 4. 点击 **导出完整 HDR**（或 **无损导出 HDR10**），等待转换和文件检查完成。
 
 Windows 程序包已包含 Python 运行环境，无需另装 Python；FFmpeg 需要单独准备。
@@ -33,10 +34,11 @@ Windows 程序包已包含 Python 运行环境，无需另装 Python；FFmpeg �
 
 ## 转换原理
 
-SDR 转 HDR10 提供两种独立处理风格：
+SDR 转 HDR10 提供三种独立处理风格：
 
-1. **自然高光保护（`natural`，默认）**：按 `BT.1886 (Gamma 2.4)` 解码至线性光并做标准 `BT.709 → BT.2020` 色域矩阵变换，依据 BT.2020 相对亮度 `Y` 施加同比例增益（`Y ≤ 0.62` 保持 `190·Y` 漫反射比例，`Y > 0.62` 按二次平滑曲线抬升至 `450 nits` 峰值），通过 `49³` 四面体插值 3D LUT（`lut3d`）与 `spline36` 色度处理输出 10-bit PQ / BT.2020，并写入与实际峰值匹配的 `MaxCLL = 450 / MaxFALL = 200` 元数据。三通道色度比例保持零偏移，在维持深黑位的同时避免实拍人脸额头、浅色皮肤与高光衣物过曝发白。
-2. **高对比风格（`vivid`，原版）**：在非线性浮点 RGB 中施加 `U/V × 0.56` 色差增益与逐通道固定对数曲线 `q = 0.65 × ln(1 + 5 × max(x, 0)) / ln(6)`（上限 1000 尼特，中性白约 390.5 尼特），适合动漫与偏暗的高对比风格化呈现。
+1. **影院均衡高光（`balanced`，750 nit，默认）**：按 `BT.1886 (Gamma 2.4)` 解码至线性光并做标准 `BT.709 → BT.2020` 色域矩阵变换，依据 BT.2020 相对亮度 `Y` 计算等色度亮度目标曲线——极暗部贴合 Gamma 2.4 保持深黑位，中间调施加最高 +22% 的平滑亮度补偿（`255·Y` 漫反射基准），在维持肤色与额头纹理不发白过曝的前提下，高于拐点 `Y = 0.68` 平滑抬升至 `750 nits` 峰值，并写入匹配的 `MaxCLL = 750 / MaxFALL = 260` 静态元数据。显卡路径直接由 `libplacebo` GLSL 着色器在 GPU 执行，CPU/无损路径使用 `49³` 四面体 3D LUT（`lut3d`）+ `spline36`。
+2. **柔和暗室保护（`natural`，450 nit）**：同样采用线性光 BT.709→BT.2020 等色度映射，漫反射基准 `190 nits`（拐点 `Y = 0.62` 以上平滑抬升至 `450 nits` 峰值，`MaxCLL = 450 / MaxFALL = 200`），观感更柔和，适合全黑暗室。
+3. **高对比风格（`vivid`，原版）**：在非线性浮点 RGB 中施加 `U/V × 0.56` 色差增益与逐通道固定对数曲线 `q = 0.65 × ln(1 + 5 × max(x, 0)) / ln(6)`（上限 1000 尼特，中性白约 390.5 尼特），适合动漫与偏暗的高对比风格化呈现。
 
 无论哪种风格，都不会凭空恢复原 SDR 片源已经剪裁或丢失的高光细节。
 
@@ -70,8 +72,9 @@ python source/app.py
 python source/hdr_core.py --list-encoders
 python source/hdr_core.py --list-gpu-filter
 python source/hdr_core.py --list-dv-tools
-python source/hdr_core.py "input.mp4" "output_HDR.mp4" --style natural --encoder auto --quality standard
-python source/hdr_core.py "input.mp4" "output_HDR_mp.mp4" --style natural --encoder nvenc --quality fine --multipass
+python source/hdr_core.py "input.mp4" "output_HDR.mp4" --style balanced --encoder auto --quality standard
+python source/hdr_core.py "input.mp4" "output_HDR_soft.mp4" --style natural --encoder auto --quality standard
+python source/hdr_core.py "input.mp4" "output_HDR_mp.mp4" --style balanced --encoder nvenc --quality fine --multipass
 python source/hdr_core.py "anime.mp4" "output_HDR_vivid.mp4" --style vivid --encoder auto --quality fine
 python source/hdr_core.py "dolby_vision.mkv" "output_HDR10.mp4" --dv-mode auto
 python source/hdr_core.py "input.mp4" "output_HDR_cpu.mp4" --encoder cpu --quality fine

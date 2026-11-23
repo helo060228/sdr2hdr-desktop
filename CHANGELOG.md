@@ -1,5 +1,14 @@
 # 更新记录
 
+## 1.5.2 — 2026-11-23
+
+- 将 SDR 转 HDR10 的“HDR 风格”细分为 **三档独立预设**，并把全新 **影院均衡高光（推荐电影·750 nit）** 设为默认：
+  - **影院均衡高光（推荐电影·750 nit，`balanced`，默认）**：在保持与原版同等深邃暗部黑位（约 `1.3 nits`）的同时，对中间调施加最高 `+22%` 的平滑亮度恢复（灰衬衫等中间调回升至约 `71 nits`，消除 v1.5.0/1.5.1 偏暗感），受光额头稳在约 `220 / 750 nits`（PQ 动态余量达原版 `vivid` 3 倍以上，不发白过曝），极亮灯光与反光平滑爆发至 `750 nits` 峰值，静态元数据标记 `MaxCLL = 750 / MaxFALL = 260`。同时支持 GPU GLSL 着色器 (`balanced.hook`) 与 CPU `49³` 四面体 3D LUT (`balanced.cube`)。
+  - **柔和暗室保护（450 nit，`natural`）**：完整保留 v1.5.0/1.5.1 的 `450 nits` 柔和暗室高光保护曲线（`MaxCLL = 450 / MaxFALL = 200`）。
+  - **高对比风格（原版·动漫，`vivid`）**：完整保留 v1.4 及以前版本的非线性对数曲线（`MaxCLL/MaxFALL = 1000/1000`）。
+- 命令行 `--style` 扩展为 `{balanced,natural,vivid}`（默认 `balanced`）。
+- 集成测试扩展至 **20 项**：新增 `test_balanced_style_lut_accuracy_midtone_and_headroom`，并将 `libplacebo` GPU 着色器与 CPU 像素一致性测试扩展至全部三种风格。
+
 ## 1.5.1 — 2026-11-23
 
 - **Intel QSV（`hevc_qsv`）10-bit HDR10 画质与码率校准**：将快速 / 标准 / 精细三档 `ICQ` 从 `22 / 20 / 18` 校准为 `19 / 16 / 14`，并在驱动自检支持时自动开启 `-extbrc 1 -mbbrc 1 -adaptive_i 1 -adaptive_b 1`，解决同等档位下 Intel 核显导出体积偏小、细节发糊的问题（旧驱动不支持 ExtBRC 时自动回退纯 ICQ）。

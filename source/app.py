@@ -32,8 +32,9 @@ ENCODER_LABELS = {
 }
 
 STYLE_LABELS = {
-    "自然高光保护（推荐电影）": "natural",
-    "高对比风格（原版·适合动漫）": "vivid",
+    "影院均衡高光（推荐电影·750 nit）": "balanced",
+    "柔和暗室保护（450 nit）": "natural",
+    "高对比风格（原版·动漫）": "vivid",
 }
 
 
@@ -51,7 +52,7 @@ class App:
         self.input = tk.StringVar()
         self.output = tk.StringVar()
         self.resolution = tk.StringVar(value="保持原尺寸")
-        self.hdr_style = tk.StringVar(value="自然高光保护（推荐电影）")
+        self.hdr_style = tk.StringVar(value="影院均衡高光（推荐电影·750 nit）")
         self.quality = tk.StringVar(value="标准画质")
         self.encoder = tk.StringVar(value="自动（优先显卡加速）")
         self.audio_effect = tk.StringVar(value="原声（保留）")
@@ -103,7 +104,7 @@ class App:
         c1 = ttk.Combobox(row, textvariable=self.resolution, values=["保持原尺寸", "2K · 短边 1440", "4K · 短边 2160"], state="readonly", width=28)
         c1.grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Label(row, text="HDR 风格").grid(row=0, column=1, sticky="w", padx=(28, 0))
-        c_style = ttk.Combobox(row, textvariable=self.hdr_style, values=list(STYLE_LABELS.keys()), state="readonly", width=28)
+        c_style = ttk.Combobox(row, textvariable=self.hdr_style, values=list(STYLE_LABELS.keys()), state="readonly", width=31)
         c_style.grid(row=1, column=1, sticky="w", padx=(28, 0), pady=(6, 0))
         ttk.Label(row, text="转换方式").grid(row=2, column=0, sticky="w", pady=(12, 0))
         c2 = ttk.Combobox(row, textvariable=self.quality, values=["快速试转", "标准画质", "精细画质", "画面无损编码"], state="readonly", width=28)
@@ -194,8 +195,10 @@ class App:
             notes.append("提示：" + (self.dv_tools.get("libplacebo_reason") or "当前环境不支持 libplacebo／Vulkan。"))
         if self.input_kind == "sdr":
             style_key = STYLE_LABELS[self.hdr_style.get()]
-            if style_key == "natural":
-                notes.append("自然高光保护：线性光 BT.709→BT.2020 色域映射，稳住肤色与额头／白衣高光细节，同时保持深邃黑位（峰值 450 nits）。")
+            if style_key == "balanced":
+                notes.append("影院均衡高光：深黑位 + 明亮中间调 + 等色度高光保护，稳住额头与肤色细节的同时释放 750 nits 极亮冲击力。")
+            elif style_key == "natural":
+                notes.append("柔和暗室保护：更克制的 190 nits 漫反射基准与 450 nits 峰值，适合全黑暗室观影与保守高光控制。")
             else:
                 notes.append("高对比风格：原版对数曲线，暗部更沉、色彩更艳丽，适合动漫与暗景；明亮实拍人脸可能偏亮。")
         enc_key = ENCODER_LABELS[self.encoder.get()]

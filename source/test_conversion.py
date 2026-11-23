@@ -339,7 +339,13 @@ class ConversionTests(unittest.TestCase):
             self.assertIn("-hwaccel", cmd_g)
             self.assertIn("vulkan", cmd_g)
             self.assertLess(cmd_g.index("-mastering_display:1"), cmd_g.index("-i"))
-            self.assertIn("custom_shader_path=natural.hook", cmd_g[cmd_g.index("-vf") + 1])
+            self.assertIn("custom_shader_path=balanced.hook", cmd_g[cmd_g.index("-vf") + 1])
+
+        for style, shader in (("balanced", "balanced.hook"), ("natural", "natural.hook"), ("vivid", "vivid.hook")):
+            cmd_st, plan_st = core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc", hdr_style=style),
+                                                 fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
+            self.assertEqual(plan_st["hdr_style"], style)
+            self.assertIn(f"custom_shader_path={shader}", cmd_st[cmd_st.index("-vf") + 1])
 
         # NVENC fine defaults to single-pass (p6, no -multipass); multipass=True enables p7 + qres.
         cmd_nv_fine, plan_nv_fine = core.build_command(
@@ -918,7 +924,7 @@ class ConversionTests(unittest.TestCase):
             v = struct.unpack(f"<{128 * 72}H", raw.stdout[256 * 144 * 2 + 128 * 72 * 2:])[128 * 36 + 64]
             return (y, u, v)
 
-        for style, expected_cll in (("natural", (450, 200)), ("vivid", (1000, 1000))):
+        for style, expected_cll in (("balanced", (750, 260)), ("natural", (450, 200)), ("vivid", (1000, 1000))):
             gpu_out = self.dir / f"gpu_{style}.mp4"
             cpu_out = self.dir / f"cpu_{style}.mp4"
             res_gpu = core.convert(core.Options(str(skin_src), str(gpu_out), quality="standard", encoder="auto",
@@ -943,12 +949,94 @@ class ConversionTests(unittest.TestCase):
         self.assertTrue(res_clip["plan"]["gpu_filter"])
         self.assertTrue(all(res_clip["validation"]["checks"].values()))
 
+    def test_balanced_style_lut_accuracy_midtone_and_headroom(self):
+        # Verify strict monotonicity over [0, 1].
+        ys = [i / 1000.0 for i in range(1001)]
+        ls = [core.balanced_target_nits(y) for y in ys]
+        min_slope = min((ls[i + 1] - ls[i]) * 1000.0 for i in range(1000))
+        self.assertGreater(min_slope, 200.0)
+
+        def expected_bt2020_linear(rgb):
+            lin = [v ** 2.4 for v in rgb]
+            return tuple(sum(row[j] * lin[j] for j in range(3)) for row in core.M_BT709_TO_BT2020)
+
+        def decoded_nits(rgb):
+            return tuple(core.pq_decode(v) for v in core.balanced_reference_rgb(rgb))
+
+        # Zero skin chromaticity shift across all brightness tiers.
+        for skin in ((0.78, 0.62, 0.50), (0.92, 0.78, 0.65), (0.96, 0.88, 0.78)):
+            lin20 = expected_bt2020_linear(skin)
+            nits = decoded_nits(skin)
+            self.assertAlmostEqual(nits[1] / nits[0], lin20[1] / lin20[0], delta=1e-5)
+            self.assertAlmostEqual(nits[2] / nits[0], lin20[2] / lin20[0], delta=1e-5)
+
+        # Deep shadow anchor, bright midtone recovery, wide skin headroom, and 750-nit specular punch.
+        self.assertLess(max(decoded_nits((0.12, 0.10, 0.08))), 2.0)
+        self.assertGreater(max(decoded_nits((0.50, 0.52, 0.56))), 65.0)
+        forehead_peak = max(decoded_nits((0.92, 0.78, 0.65)))
+        self.assertGreater(forehead_peak, 200.0)
+        self.assertLess(forehead_peak, 235.0)
+        self.assertGreater(max(decoded_nits((0.99, 0.99, 0.98))), 600.0)
+        for ch in decoded_nits((1.0, 1.0, 1.0)):
+            self.assertAlmostEqual(ch, core.BALANCED_PEAK_NITS, delta=0.5)
+
+        # Verify real FFmpeg 49^3 tetrahedral balanced.cube accuracy across 256 samples.
+        rng = random.Random(2027)
+        samples = [
+            (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0),
+            (0.12, 0.10, 0.08), (0.50, 0.52, 0.56), (0.78, 0.62, 0.50), (0.92, 0.78, 0.65),
+            (0.96, 0.88, 0.78), (0.99, 0.99, 0.98), (-0.05, -0.05, -0.05), (1.15, 1.15, 1.15),
+        ]
+        samples += [tuple(rng.uniform(0.0, 1.0) for _ in range(3)) for _ in range(256 - len(samples))]
+        raw = b"".join(struct.pack("<f", rgb[channel]) for channel in (1, 2, 0) for rgb in samples)
+        p = dict(primaries="bt709", transfer="bt709", matrix="bt709", range="full")
+        chain = core.filter_chain(p, 16, 16, lut_name="balanced.cube", style="balanced")
+        lut_filter = [f for f in chain.split(",") if f.startswith("lut3d=")][0]
+        core.write_balanced_lut(self.dir / "balanced.cube")
+        r = subprocess.run(
+            [core.find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-f", "rawvideo",
+             "-pix_fmt", "gbrpf32le", "-s", "16x16", "-r", "1", "-i", "pipe:0",
+             "-vf", lut_filter, "-frames:v", "1", "-pix_fmt", "gbrpf32le", "-f", "rawvideo", "pipe:1"],
+            input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=self.dir, creationflags=core.CREATE_NO_WINDOW,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        floats = struct.unpack("<768f", r.stdout)
+        actual = [(floats[512 + i], floats[i], floats[256 + i]) for i in range(256)]
+        max_err = max(abs(a - b) for rgb, out in zip(samples, actual)
+                      for a, b in zip(core.balanced_reference_rgb(rgb), out))
+        max_nits_err = max(abs(core.pq_decode(a) - core.pq_decode(b)) for rgb, out in zip(samples, actual)
+                           for a, b in zip(core.balanced_reference_rgb(rgb), out))
+        visible_err = max(abs(a - b) for rgb, out in zip(samples, actual)
+                          for a, b in zip(core.balanced_reference_rgb(rgb), out) if a >= 0.08)
+        self.assertLess(max_err, 4e-3)
+        self.assertLess(visible_err, 1e-3)
+        self.assertLess(max_nits_err, 2.0)
+        print(f"\nFFmpeg balanced 49^3 lut3d vs analytical reference: visible PQ err={visible_err:.6f}, full PQ err={max_err:.6f}, max nits err={max_nits_err:.3f}")
+
+        # Verify real standard and lossless conversion in balanced mode.
+        source = self.make_source(width=256, height=144, name="均衡风格.mkv")
+        out_bal = self.dir / "均衡风格_标准.mp4"
+        res_bal = core.convert(core.Options(str(source), str(out_bal), quality="standard", encoder="auto", hdr_style="balanced"))
+        self.assertEqual(res_bal["plan"]["hdr_style"], "balanced")
+        self.assertEqual(res_bal["plan"]["content_light"], "750,260")
+        self.assertTrue(all(res_bal["validation"]["checks"].values()))
+        cll_bal = next(s for s in res_bal["validation"]["first_frame_side_data"]
+                       if s.get("side_data_type") == "Content light level metadata")
+        self.assertEqual((cll_bal["max_content"], cll_bal["max_average"]), (750, 260))
+
+        out_bal_ll = self.dir / "均衡风格_无损.mp4"
+        res_bal_ll = core.convert(core.Options(str(source), str(out_bal_ll), quality="lossless", encoder="auto", hdr_style="balanced"))
+        self.assertEqual(res_bal_ll["plan"]["hdr_style"], "balanced")
+        self.assertTrue(res_bal_ll["validation"]["lossless_pixels"]["all_frames_equal"])
+        self.assertEqual(res_bal_ll["validation"]["lossless_pixels"]["frames_compared"], 30)
+
     def test_graceful_stop_keeps_playable_hdr_partial_mp4(self):
         ffmpeg = core.find_tool("ffmpeg")
         source = self.dir / "长片 源.mp4"
         r = core.capture([
-            ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=10",
-            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=10",
+            ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=30",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=30",
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
             "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
             "-c:a", "aac", "-ar", "48000", "-ac", "2", str(source),
@@ -983,7 +1071,7 @@ class ConversionTests(unittest.TestCase):
             result["validation"]["format"].get("duration"),
         )
         self.assertGreater(actual_dur, 0.2)
-        self.assertLess(actual_dur, 9.5)
+        self.assertLess(actual_dur, 25.0)
         report = json.loads(partial_path.with_suffix(".hdr.json").read_text(encoding="utf-8"))
         self.assertTrue(report["partial"])
         self.assertEqual(report["output"], str(partial_path))
