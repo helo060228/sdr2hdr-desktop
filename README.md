@@ -10,8 +10,8 @@
   - **自然高光保护（默认，推荐电影实拍）**：在线性光下完成标准 `BT.709 → BT.2020` 色域映射与等色度高光保护曲线（峰值 `450 nits`、`MaxCLL/MaxFALL = 450/200`、`spline36` 色度采样），稳住肤色、额头与白衣高光细节，同时保持深邃黑位；
   - **高对比风格（原版，适合动漫与暗景）**：保留 v1.4 及以前的对数高对比曲线（`UV × 0.56`，暗部更沉、亮部更艳丽）。
 - **杜比视界（DV）转 HDR10**：自动识别 Profile 5 / 7 / 8.1 / 8.4——
-  - **Profile 8.1 / Profile 7（含 HDR10 兼容层）**：秒级无损直剥（不重编码，保留原生 10-bit HDR10 基础层并剥离 RPU／增强层，零画质损失）；
-  - **Profile 5（IPTPQc2，普通屏幕偏绿偏紫）与 Profile 8.4（HLG 杜比视界）**：通过 `libplacebo` 进行杜比视界色彩还原，再由显卡硬编或 CPU 导出标准 HDR10。
+  - **Profile 8.1 / Profile 7（含 HDR10 兼容层）**：秒级无损直剥（不重编码，保留原生 10-bit HDR10 基础层并剥离 RPU／增强层，零画质损失，并兼容未标注容器矩阵的蓝光 Remux）；
+  - **Profile 5（IPTPQc2，普通屏幕偏绿偏紫）与 Profile 8.4（HLG 杜比视界）**：通过 **Vulkan 硬解 + `libplacebo`** 进行杜比视界色彩还原，再由显卡硬编或 CPU 导出标准 HDR10。
 - 支持 **NVIDIA NVENC / Intel QSV / AMD AMF** 10-bit 显卡硬编加速，并在显卡有损编码时自动启用 **Vulkan 硬解 + `libplacebo` GPU 色彩管线**（将色域转换、高光保护曲线与 10-bit 抖动移入 GPU 执行，不支持或无损/CPU 编码时无缝回退至 CPU 浮点滤镜）。
 - 保持原尺寸和帧率，或选择短边 1440 / 2160 的输出尺寸。
 - 提供快速、标准、精细、画面无损四种编码方式。
@@ -44,9 +44,9 @@ SDR 转 HDR10 提供两种独立处理风格：
 
 程序默认自动选择已通过自检的显卡硬件编码器（优先级：`NVIDIA NVENC` > `Intel QSV` > `AMD AMF` > `CPU x265`），也可手动指定编码器：
 
-- **快速试转**：CPU `x265 ultrafast / CRF 17`；NVENC `p2 / VBR CQ 22`；QSV `faster / ICQ 22`；AMF `speed / CQP 22`。
-- **标准画质**：CPU `x265 fast / CRF 17`；NVENC `p5 / VBR CQ 20`；QSV `medium / ICQ 20`；AMF `balanced / CQP 20`。
-- **精细画质**：CPU `x265 medium / CRF 16`；NVENC `p7 / multipass qres / VBR CQ 18 / spatial-aq`；QSV `slow / ICQ 18`；AMF `quality / CQP 18`。
+- **快速试转**：CPU `x265 ultrafast / CRF 17`；NVENC `p2 / VBR CQ 22`；QSV `faster / ICQ 19`（支持时自动开启 `extbrc/mbbrc`）；AMF `speed / CQP 22`。
+- **标准画质**：CPU `x265 fast / CRF 17`；NVENC `p5 / VBR CQ 20`；QSV `medium / ICQ 16`（支持时自动开启 `extbrc/mbbrc`）；AMF `balanced / CQP 20`。
+- **精细画质**：CPU `x265 medium / CRF 16`；NVENC 默认高速单遍 `p6 / VBR CQ 18 / spatial-aq`（勾选“NVENC 双遍分析”或传 `--multipass` 时启用 `p7 + multipass qres`）；QSV `slow / ICQ 14`（支持时自动开启 `extbrc/mbbrc`）；AMF `quality / CQP 18`。
 - **画面无损编码**：CPU 使用 `x265 lossless=1`；经自检支持的 NVIDIA NVENC 使用 `-tune lossless`；QSV 与 AMF 不支持 10-bit HEVC 无损，在“自动”模式下会自动切换为 CPU (`x265`)。无损档都会在导出后自动逐帧核对像素摘要。
 
 四档采用相同的 HDR 像素处理规则。显卡硬编可显著缩短 2K / 4K 编码耗时；CPU `libx265` 在同体积下通常具有更高的压缩效率。无损档的文件可能明显大于原片，校验也需要更多时间。
@@ -71,6 +71,7 @@ python source/hdr_core.py --list-encoders
 python source/hdr_core.py --list-gpu-filter
 python source/hdr_core.py --list-dv-tools
 python source/hdr_core.py "input.mp4" "output_HDR.mp4" --style natural --encoder auto --quality standard
+python source/hdr_core.py "input.mp4" "output_HDR_mp.mp4" --style natural --encoder nvenc --quality fine --multipass
 python source/hdr_core.py "anime.mp4" "output_HDR_vivid.mp4" --style vivid --encoder auto --quality fine
 python source/hdr_core.py "dolby_vision.mkv" "output_HDR10.mp4" --dv-mode auto
 python source/hdr_core.py "input.mp4" "output_HDR_cpu.mp4" --encoder cpu --quality fine

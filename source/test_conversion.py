@@ -284,12 +284,12 @@ class ConversionTests(unittest.TestCase):
             "format": {"duration": "10.0"},
         }
 
-        def fake_detected(nvenc=False, nvenc_lossless=False, qsv=False, amf=False, cpu=True):
+        def fake_detected(nvenc=False, nvenc_lossless=False, qsv=False, qsv_extbrc=False, amf=False, cpu=True):
             return {
-                "cpu": {**core.ENCODER_SPECS["cpu"], "key": "cpu", "available": cpu, "lossless": cpu, "reason": ""},
-                "nvenc": {**core.ENCODER_SPECS["nvenc"], "key": "nvenc", "available": nvenc, "lossless": nvenc_lossless, "reason": "" if nvenc else "no nvenc"},
-                "qsv": {**core.ENCODER_SPECS["qsv"], "key": "qsv", "available": qsv, "lossless": False, "reason": "" if qsv else "no qsv"},
-                "amf": {**core.ENCODER_SPECS["amf"], "key": "amf", "available": amf, "lossless": False, "reason": "" if amf else "no amf"},
+                "cpu": {**core.ENCODER_SPECS["cpu"], "key": "cpu", "available": cpu, "lossless": cpu, "extbrc": False, "reason": ""},
+                "nvenc": {**core.ENCODER_SPECS["nvenc"], "key": "nvenc", "available": nvenc, "lossless": nvenc_lossless, "extbrc": False, "reason": "" if nvenc else "no nvenc"},
+                "qsv": {**core.ENCODER_SPECS["qsv"], "key": "qsv", "available": qsv, "lossless": False, "extbrc": qsv_extbrc, "reason": "" if qsv else "no qsv"},
+                "amf": {**core.ENCODER_SPECS["amf"], "key": "amf", "available": amf, "lossless": False, "extbrc": False, "reason": "" if amf else "no amf"},
             }
 
         dest = self.dir / "out.mp4"
@@ -340,6 +340,43 @@ class ConversionTests(unittest.TestCase):
             self.assertIn("vulkan", cmd_g)
             self.assertLess(cmd_g.index("-mastering_display:1"), cmd_g.index("-i"))
             self.assertIn("custom_shader_path=natural.hook", cmd_g[cmd_g.index("-vf") + 1])
+
+        # NVENC fine defaults to single-pass (p6, no -multipass); multipass=True enables p7 + qres.
+        cmd_nv_fine, plan_nv_fine = core.build_command(
+            core.Options("in.mp4", str(dest), encoder="nvenc", quality="fine"),
+            fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=no_gpu_filter,
+        )
+        self.assertFalse(plan_nv_fine["multipass"])
+        self.assertEqual(plan_nv_fine["preset"], "p6")
+        self.assertNotIn("-multipass", cmd_nv_fine)
+
+        cmd_nv_mp, plan_nv_mp = core.build_command(
+            core.Options("in.mp4", str(dest), encoder="nvenc", quality="fine", multipass=True),
+            fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=no_gpu_filter,
+        )
+        self.assertTrue(plan_nv_mp["multipass"])
+        self.assertEqual(plan_nv_mp["preset"], "p7")
+        self.assertEqual(cmd_nv_mp[cmd_nv_mp.index("-multipass") + 1], "qres")
+
+        # QSV uses calibrated ICQ (19/16/14) and enables ExtBRC/MBBRC only when probed supported.
+        for q_tier, expected_icq in (("fast", "19"), ("standard", "16"), ("fine", "14")):
+            cmd_qsv_no_ext, plan_qsv_no_ext = core.build_command(
+                core.Options("in.mp4", str(dest), encoder="qsv", quality=q_tier),
+                fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=no_gpu_filter,
+            )
+            self.assertEqual(cmd_qsv_no_ext[cmd_qsv_no_ext.index("-global_quality") + 1], expected_icq)
+            self.assertFalse(plan_qsv_no_ext["qsv_extbrc"])
+            self.assertNotIn("-extbrc", cmd_qsv_no_ext)
+
+            all_hw_ext = fake_detected(nvenc=True, nvenc_lossless=True, qsv=True, qsv_extbrc=True, amf=True)
+            cmd_qsv_ext, plan_qsv_ext = core.build_command(
+                core.Options("in.mp4", str(dest), encoder="qsv", quality=q_tier),
+                fake_info, dest, detected_encoders=all_hw_ext, gpu_filter_caps=no_gpu_filter,
+            )
+            self.assertEqual(cmd_qsv_ext[cmd_qsv_ext.index("-global_quality") + 1], expected_icq)
+            self.assertTrue(plan_qsv_ext["qsv_extbrc"])
+            for flag in ("-extbrc", "-mbbrc", "-adaptive_i", "-adaptive_b"):
+                self.assertEqual(cmd_qsv_ext[cmd_qsv_ext.index(flag) + 1], "1")
 
         # Unsupported codec for Vulkan Video (e.g. ffv1) keeps GPU shader but skips -hwaccel vulkan.
         ffv1_info = {**fake_info, "streams": [{**fake_info["streams"][0], "codec_name": "ffv1", "pix_fmt": "yuv444p10le"}, fake_info["streams"][1]]}
@@ -415,7 +452,15 @@ class ConversionTests(unittest.TestCase):
         fine_out = self.dir / "硬件精细环绕.mp4"
         res_fine = core.convert(core.Options(str(source), str(fine_out), quality="fine", audio_effect="surround", encoder=hw_key))
         self.assertEqual(res_fine["plan"]["encoder"], hw_key)
+        self.assertFalse(res_fine["plan"]["multipass"])
         self.assertTrue(all(res_fine["validation"]["checks"].values()))
+
+        if hw_key == "nvenc":
+            mp_out = self.dir / "硬件精细双遍.mp4"
+            res_mp = core.convert(core.Options(str(source), str(mp_out), quality="fine", encoder="nvenc", multipass=True))
+            self.assertTrue(res_mp["plan"]["multipass"])
+            self.assertEqual(res_mp["plan"]["preset"], "p7")
+            self.assertTrue(all(res_mp["validation"]["checks"].values()))
 
         # Copy HDR video stream generated by hardware encoder and verify video packets stay identical.
         copy_out = self.dir / "硬件直拷环绕.mp4"
@@ -613,6 +658,63 @@ class ConversionTests(unittest.TestCase):
         self.assertTrue(dv7_dual["dual_track"])
         self.assertTrue(dv7_dual["strip_supported"])
 
+        # Tolerant matrix check: MKV Remuxes omitting color_space still strip losslessly.
+        no_matrix_p81 = {
+            "streams": [
+                {
+                    **fake_p7_info["streams"][0],
+                    "color_space": "unknown",
+                    "side_data_list": [{
+                        "side_data_type": "DOVI configuration record",
+                        "dv_profile": 8, "dv_bl_signal_compatibility_id": 1,
+                        "el_present_flag": 0, "rpu_present_flag": 1, "bl_present_flag": 1,
+                    }],
+                },
+                fake_p7_info["streams"][1],
+            ],
+            "format": {"duration": "120.0"},
+        }
+        dv81_nomat = core.detect_dolby_vision(no_matrix_p81)
+        self.assertTrue(dv81_nomat["strip_supported"])
+        _, plan81_nomat = core.build_command(core.Options("p81.mkv", str(dest)), no_matrix_p81, dest, dv_info=dv81_nomat, dv_tools=tools_all)
+        self.assertEqual(plan81_nomat["video_operation"], "dv_strip")
+        self.assertFalse(plan81_nomat["require_matrix_metadata"])
+
+        # DV Profile 5 re-encode enables Vulkan hwdec when supported, but omits it for lossless / gpu_filter=off.
+        p5_info = {
+            "streams": [
+                {
+                    "index": 0, "codec_type": "video", "codec_name": "hevc",
+                    "width": 3840, "height": 2160, "pix_fmt": "yuv420p10le",
+                    "color_range": "pc", "avg_frame_rate": "24000/1001", "duration": "120.0",
+                    "side_data_list": [{
+                        "side_data_type": "DOVI configuration record",
+                        "dv_profile": 5, "dv_bl_signal_compatibility_id": 0,
+                        "el_present_flag": 0, "rpu_present_flag": 1, "bl_present_flag": 1,
+                    }],
+                },
+                fake_p7_info["streams"][1],
+            ],
+            "format": {"duration": "120.0"},
+        }
+        dv5_meta = core.detect_dolby_vision(p5_info)
+        yes_vk = dict(libplacebo_shader=True, vulkan_hwdec=True, reason="")
+        cmd5_vk, plan5_vk = core.build_command(core.Options("p5.mp4", str(dest), encoder="cpu"), p5_info, dest,
+                                               dv_info=dv5_meta, dv_tools=tools_all, gpu_filter_caps=yes_vk)
+        self.assertTrue(plan5_vk["vulkan_hwdec"])
+        self.assertIn("-hwaccel", cmd5_vk)
+        self.assertIn("vulkan", cmd5_vk)
+
+        cmd5_ll, plan5_ll = core.build_command(core.Options("p5.mp4", str(dest), encoder="cpu", quality="lossless"), p5_info, dest,
+                                               dv_info=dv5_meta, dv_tools=tools_all, gpu_filter_caps=yes_vk)
+        self.assertFalse(plan5_ll["vulkan_hwdec"])
+        self.assertNotIn("-hwaccel", cmd5_ll)
+
+        cmd5_off, plan5_off = core.build_command(core.Options("p5.mp4", str(dest), encoder="cpu", gpu_filter="off"), p5_info, dest,
+                                                 dv_info=dv5_meta, dv_tools=tools_all, gpu_filter_caps=yes_vk)
+        self.assertFalse(plan5_off["vulkan_hwdec"])
+        self.assertNotIn("-hwaccel", cmd5_off)
+
     def test_real_dolby_vision_conversions(self):
         core.clear_dv_tools_cache()
         tools = core.detect_dv_tools(force=True)
@@ -656,7 +758,9 @@ class ConversionTests(unittest.TestCase):
         if not tools["libplacebo"]:
             self.skipTest("libplacebo/Vulkan not available on this host")
 
-        # 4. DV Profile 5 (IPTPQc2) -> libplacebo + encoder (and reject dv_mode='strip')
+        gpu_caps = core.detect_gpu_filter()
+
+        # 4. DV Profile 5 (IPTPQc2) -> Vulkan hwdec + libplacebo + encoder (and reject dv_mode='strip')
         dv5 = self.make_dolby_vision_source("5", name="dv5.mp4")
         insp5 = core.inspect_input(dv5)
         self.assertEqual(insp5["kind"], "dv_reencode")
@@ -668,6 +772,7 @@ class ConversionTests(unittest.TestCase):
         out5 = self.dir / "dv5_HDR10.mp4"
         res5 = core.convert(core.Options(str(dv5), str(out5), quality="standard", encoder="auto"))
         self.assertEqual(res5["plan"]["video_operation"], "dv_reencode")
+        self.assertEqual(res5["plan"]["vulkan_hwdec"], gpu_caps["vulkan_hwdec"])
         self.assertTrue(res5["validation"]["checks"]["no_dovi"])
         self.assertTrue(all(res5["validation"]["checks"].values()))
 
@@ -675,10 +780,11 @@ class ConversionTests(unittest.TestCase):
         out5_ll = self.dir / "dv5_HDR10_lossless.mp4"
         res5_ll = core.convert(core.Options(str(dv5), str(out5_ll), quality="lossless", encoder="auto"))
         self.assertTrue(res5_ll["plan"]["lossless_video"])
+        self.assertFalse(res5_ll["plan"]["vulkan_hwdec"])
         self.assertTrue(res5_ll["validation"]["lossless_pixels"]["all_frames_equal"])
         self.assertEqual(res5_ll["validation"]["lossless_pixels"]["frames_compared"], 10)
 
-        # 5. DV Profile 8.4 (HLG Dolby Vision) -> libplacebo + PQ HDR10
+        # 5. DV Profile 8.4 (HLG Dolby Vision) -> Vulkan hwdec + libplacebo + PQ HDR10
         dv84 = self.make_dolby_vision_source("8.4", name="dv84.mp4")
         insp84 = core.inspect_input(dv84)
         self.assertEqual(insp84["kind"], "dv_reencode")
@@ -687,6 +793,7 @@ class ConversionTests(unittest.TestCase):
         out84 = self.dir / "dv84_HDR10.mp4"
         res84 = core.convert(core.Options(str(dv84), str(out84), quality="fast", encoder="auto"))
         self.assertEqual(res84["plan"]["video_operation"], "dv_reencode")
+        self.assertEqual(res84["plan"]["vulkan_hwdec"], gpu_caps["vulkan_hwdec"])
         self.assertTrue(res84["validation"]["checks"]["PQ"])
         self.assertTrue(res84["validation"]["checks"]["no_dovi"])
         self.assertTrue(all(res84["validation"]["checks"].values()))

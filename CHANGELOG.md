@@ -1,5 +1,12 @@
 # 更新记录
 
+## 1.5.1 — 2026-11-23
+
+- **Intel QSV（`hevc_qsv`）10-bit HDR10 画质与码率校准**：将快速 / 标准 / 精细三档 `ICQ` 从 `22 / 20 / 18` 校准为 `19 / 16 / 14`，并在驱动自检支持时自动开启 `-extbrc 1 -mbbrc 1 -adaptive_i 1 -adaptive_b 1`，解决同等档位下 Intel 核显导出体积偏小、细节发糊的问题（旧驱动不支持 ExtBRC 时自动回退纯 ICQ）。
+- **NVENC“双遍分析 (Multipass)”改为可选开关**：桌面端新增“NVENC 双遍分析 (Multipass，更慢)”复选框、命令行新增 `--multipass`；默认关闭，使“精细画质”默认使用高速单遍 `p6 / VBR CQ 18 / spatial-aq`，仅在需要时开启 `p7 + multipass qres`。
+- **杜比视界 Profile 5 / 8.4 重编码新增 Vulkan 硬件解码加速**：有损模式下自动开启 `-hwaccel vulkan -hwaccel_output_format vulkan` 零拷贝直入 `libplacebo`（实测与 CPU 软解逐像素一致），减少 4K 10-bit HEVC CPU 软解瓶颈。
+- **放宽杜比视界 Profile 7 / 8.1 无损直剥矩阵判定**：对于部分省略容器层 `color_space` 标记但具备标准 10-bit `bt2020 / smpte2084` 基础层的 MKV 蓝光 Remux，不再误降级为重编码，确保直接走秒级无损直剥。
+
 ## 1.5.0 — 2026-11-23
 
 - 新增 SDR 转 HDR10 双风格选择，并在桌面端提供 **HDR 风格** 下拉选项与实时说明（命令行新增 `--style {natural,vivid}`）：

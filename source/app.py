@@ -55,6 +55,7 @@ class App:
         self.quality = tk.StringVar(value="标准画质")
         self.encoder = tk.StringVar(value="自动（优先显卡加速）")
         self.audio_effect = tk.StringVar(value="原声（保留）")
+        self.multipass = tk.BooleanVar(value=False)
         self.detected_encoders = None
         self.dv_tools = None
         self.gpu_filter_caps = None
@@ -76,6 +77,7 @@ class App:
         style.configure("Main.TButton", font=("Microsoft YaHei UI", 12, "bold"), padding=(20, 11))
         style.configure("TEntry", padding=7)
         style.configure("TCombobox", padding=5)
+        style.configure("TCheckbutton", background="#f4f5f7", font=("Microsoft YaHei UI", 10))
         viewport = tk.Canvas(root, bg="#f4f5f7", highlightthickness=0)
         scrollbar = ttk.Scrollbar(root, orient="vertical", command=viewport.yview)
         scrollbar.pack(side="right", fill="y")
@@ -112,8 +114,12 @@ class App:
         ttk.Label(row, text="音效").grid(row=4, column=0, sticky="w", pady=(12, 0))
         c4 = ttk.Combobox(row, textvariable=self.audio_effect, values=["原声（保留）", "虚拟环绕（双声道）"], state="readonly", width=28)
         c4.grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(row, text="高级选项").grid(row=4, column=1, sticky="w", padx=(28, 0), pady=(12, 0))
+        c_mp = ttk.Checkbutton(row, text="NVENC 双遍分析 (Multipass，更慢)", variable=self.multipass, command=self.update_encoding_note)
+        c_mp.grid(row=5, column=1, sticky="w", padx=(28, 0), pady=(6, 0))
         self.resolution_combo, self.style_combo, self.quality_combo, self.encoder_combo, self.audio_combo = c1, c_style, c2, c3, c4
-        self.controls += [c1, c_style, c2, c3, c4]
+        self.multipass_check = c_mp
+        self.controls += [c1, c_style, c2, c3, c4, c_mp]
         self.encoding_note = tk.StringVar()
         ttk.Label(box, textvariable=self.encoder_status, style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(0, 4))
         ttk.Label(box, textvariable=self.encoding_note, style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(0, 6))
@@ -159,6 +165,16 @@ class App:
                 self.queue.put(dict(stage="encoders", error=str(e)))
         threading.Thread(target=probe_worker, daemon=True).start()
 
+    def update_multipass_state(self):
+        enc_key = ENCODER_LABELS[self.encoder.get()]
+        allowed = (
+            not self.running
+            and self.input_kind not in ("hdr10", "dv_strip")
+            and self.quality.get() != "画面无损编码"
+            and enc_key in ("auto", "nvenc")
+        )
+        self.multipass_check.configure(state="normal" if allowed else "disabled")
+
     def update_encoding_note(self):
         notes = []
         if self.input_kind == "dv_strip":
@@ -167,10 +183,12 @@ class App:
             else:
                 notes.append("杜比视界无损直剥：画面直接复制不重编码，输出尺寸／HDR 风格／画质／编码器已自动锁定；仍可选音效。")
             self.encoding_note.set("\n".join(notes))
+            self.update_multipass_state()
             return
         if self.input_kind == "hdr10":
             notes.append("已有标准 HDR10：将直接保留原视频轨道，仅按音效设置处理音频。")
             self.encoding_note.set("\n".join(notes))
+            self.update_multipass_state()
             return
         if self.input_kind == "dv_reencode" and self.dv_tools is not None and not self.dv_tools.get("libplacebo"):
             notes.append("提示：" + (self.dv_tools.get("libplacebo_reason") or "当前环境不支持 libplacebo／Vulkan。"))
@@ -190,7 +208,10 @@ class App:
                 notes.append(f"提示：{info.get('label', enc_key)} 不支持 10-bit HEVC 无损编码，画面无损档请改用“自动”或“CPU 软件编码”。")
         if is_lossless:
             notes.append("画面无损：文件较大，导出后逐帧核对；声音按音效设置处理。")
+        elif self.multipass.get() and enc_key in ("auto", "nvenc"):
+            notes.append("NVENC 双遍分析已启用：码率分配更精细，耗时约增加 30%～80%。")
         self.encoding_note.set("\n".join(notes))
+        self.update_multipass_state()
 
     def path_row(self, parent, title, var, command, label):
         ttk.Label(parent, text=title).pack(anchor="w", pady=(0, 6))
@@ -276,7 +297,8 @@ class App:
         encoder = ENCODER_LABELS[self.encoder.get()]
         audio_effect = {"原声（保留）": "original", "虚拟环绕（双声道）": "surround"}[self.audio_effect.get()]
         opts = Options(source, output, resolution=resolution, quality=quality, duration=10 if preview else None,
-                       audio_effect=audio_effect, encoder=encoder, hdr_style=hdr_style)
+                       audio_effect=audio_effect, encoder=encoder, hdr_style=hdr_style,
+                       multipass=bool(self.multipass.get()))
         self.running = True
         self.cancel.clear()
         self.keep_partial.clear()
@@ -328,6 +350,7 @@ class App:
                 self.encoder_combo.configure(state="disabled")
             if self.input_kind != "sdr":
                 self.style_combo.configure(state="disabled")
+        self.update_multipass_state()
 
     def stop(self):
         self.cancel.set()

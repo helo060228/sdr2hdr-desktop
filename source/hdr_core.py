@@ -26,7 +26,7 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128
@@ -336,7 +336,7 @@ def detect_dolby_vision(info: dict, path: Path | None = None) -> dict | None:
         and pix_fmt == "yuv420p10le"
         and trc == "smpte2084"
         and v.get("color_primaries") == "bt2020"
-        and v.get("color_space") == "bt2020nc"
+        and v.get("color_space") in ("bt2020nc", "unknown", "unspecified", None)
     )
     strip_supported = has_hdr10_bl and ((dv_profile == 8 and bl_compat == 1) or dv_profile == 7)
 
@@ -426,7 +426,7 @@ def dv_properties(info: dict, dv: dict, strip: bool) -> dict:
         transfer=v.get("color_transfer") or "unknown",
         primaries=v.get("color_primaries") or "unknown",
         range=color_range, guessed=[], stream_index=v["index"],
-        pixel_format=v.get("pix_fmt") or "", dv=dv,
+        pixel_format=v.get("pix_fmt") or "", codec_name=v.get("codec_name", ""), dv=dv,
     )
 
 
@@ -765,6 +765,7 @@ class Options:
     dv_mode: str = "auto"
     hdr_style: str = "natural"
     gpu_filter: str = "auto"
+    multipass: bool = False
 
 
 def clear_encoder_cache() -> None:
@@ -785,24 +786,30 @@ def clear_gpu_filter_cache() -> None:
         _GPU_FILTER_CACHE.clear()
 
 
-def _hardware_encoder_args(encoder_key: str, quality: str) -> tuple[list[str], dict]:
+def _hardware_encoder_args(encoder_key: str, quality: str, multipass: bool = False,
+                           qsv_extbrc: bool = False) -> tuple[list[str], dict]:
     if encoder_key == "nvenc":
+        mp_args = ["-multipass", "qres"] if multipass else []
+        mp_suffix = " (multipass)" if multipass else ""
+        if quality == "fine":
+            fine_preset = "p7" if multipass else "p6"
+            fine_qc = "VBR CQ 18 (multipass)" if multipass else "VBR CQ 18 (1-pass)"
+            return (
+                ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
+                 "-preset", fine_preset, "-tune", "hq", *mp_args, "-rc", "vbr", "-cq", "18",
+                 "-b:v", "0", "-spatial-aq", "1"],
+                dict(codec="hevc_nvenc", preset=fine_preset, crf=None, quality_control=fine_qc),
+            )
         configs = {
             "fast": (
                 ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "p2", "-tune", "hq", "-rc", "vbr", "-cq", "22", "-b:v", "0"],
-                dict(codec="hevc_nvenc", preset="p2", crf=None, quality_control="VBR CQ 22"),
+                 "-preset", "p2", "-tune", "hq", *mp_args, "-rc", "vbr", "-cq", "22", "-b:v", "0"],
+                dict(codec="hevc_nvenc", preset="p2", crf=None, quality_control="VBR CQ 22" + mp_suffix),
             ),
             "standard": (
                 ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "20", "-b:v", "0"],
-                dict(codec="hevc_nvenc", preset="p5", crf=None, quality_control="VBR CQ 20"),
-            ),
-            "fine": (
-                ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "p7", "-tune", "hq", "-multipass", "qres", "-rc", "vbr", "-cq", "18",
-                 "-b:v", "0", "-spatial-aq", "1"],
-                dict(codec="hevc_nvenc", preset="p7", crf=None, quality_control="VBR CQ 18 (multipass)"),
+                 "-preset", "p5", "-tune", "hq", *mp_args, "-rc", "vbr", "-cq", "20", "-b:v", "0"],
+                dict(codec="hevc_nvenc", preset="p5", crf=None, quality_control="VBR CQ 20" + mp_suffix),
             ),
             "lossless": (
                 ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
@@ -814,21 +821,23 @@ def _hardware_encoder_args(encoder_key: str, quality: str) -> tuple[list[str], d
     if encoder_key == "qsv":
         if quality == "lossless":
             raise ConversionError("Intel 显卡加速 (QSV) 不支持 10-bit HEVC 无损编码，画面无损档请改用“自动”或“CPU 软件编码”。")
+        extbrc_args = ["-extbrc", "1", "-mbbrc", "1", "-adaptive_i", "1", "-adaptive_b", "1"] if qsv_extbrc else []
+        extbrc_suffix = " + ExtBRC" if qsv_extbrc else ""
         configs = {
             "fast": (
                 ["-c:v", "hevc_qsv", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "faster", "-global_quality", "22"],
-                dict(codec="hevc_qsv", preset="faster", crf=None, quality_control="ICQ 22"),
+                 "-preset", "faster", "-global_quality", "19", *extbrc_args],
+                dict(codec="hevc_qsv", preset="faster", crf=None, quality_control="ICQ 19" + extbrc_suffix),
             ),
             "standard": (
                 ["-c:v", "hevc_qsv", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "medium", "-global_quality", "20"],
-                dict(codec="hevc_qsv", preset="medium", crf=None, quality_control="ICQ 20"),
+                 "-preset", "medium", "-global_quality", "16", *extbrc_args],
+                dict(codec="hevc_qsv", preset="medium", crf=None, quality_control="ICQ 16" + extbrc_suffix),
             ),
             "fine": (
                 ["-c:v", "hevc_qsv", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "slow", "-global_quality", "18"],
-                dict(codec="hevc_qsv", preset="slow", crf=None, quality_control="ICQ 18"),
+                 "-preset", "slow", "-global_quality", "14", *extbrc_args],
+                dict(codec="hevc_qsv", preset="slow", crf=None, quality_control="ICQ 14" + extbrc_suffix),
             ),
         }
         return configs[quality]
@@ -1043,7 +1052,7 @@ def _compiled_video_encoders(ffmpeg_path: str) -> set[str]:
 
 def _probe_hardware_encoder(ffmpeg_path: str, key: str, compiled: set[str]) -> dict:
     spec = ENCODER_SPECS[key]
-    entry = {**spec, "key": key, "available": False, "lossless": False, "reason": ""}
+    entry = {**spec, "key": key, "available": False, "lossless": False, "extbrc": False, "reason": ""}
     if spec["codec"] not in compiled:
         entry["reason"] = "当前 FFmpeg 未编译该硬件编码器"
         return entry
@@ -1086,6 +1095,16 @@ def _probe_hardware_encoder(ffmpeg_path: str, key: str, compiled: set[str]) -> d
             entry["reason"] = "硬件编码自检未通过完整 HDR10 元数据验证：" + "、".join(missing)
             return entry
         entry["available"] = True
+        if key == "qsv":
+            extbrc_args, _ = _hardware_encoder_args("qsv", "standard", qsv_extbrc=True)
+            probe_extbrc = Path(tmp) / "probe_extbrc.mp4"
+            try:
+                ext_result = capture([*base_prefix, *extbrc_args, *hdr_suffix, str(probe_extbrc)], timeout=15)
+                if ext_result.returncode == 0:
+                    ext_checks, _, _, _ = _hdr_probe_checks(probe_extbrc)
+                    entry["extbrc"] = all(ext_checks.values())
+            except (ConversionError, json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
+                entry["extbrc"] = False
         if spec["supports_lossless"]:
             ll_args, _ = _hardware_encoder_args(key, "lossless")
             probe_ll = Path(tmp) / "probe_lossless.mp4"
@@ -1213,6 +1232,7 @@ def build_command(opts: Options, info: dict, destination: Path,
     dv_bsf = None
     mastering_str, content_light_str, peak_nits = MASTERING_DISPLAY, CONTENT_LIGHT, 1000
     tools = None
+    qsv_extbrc = False
 
     if video_operation == "copy_hdr":
         encoder_key, encoder_note = "copy", ""
@@ -1248,8 +1268,10 @@ def build_command(opts: Options, info: dict, destination: Path,
             mastering_str, content_light_str, peak_nits = _dv_static_metadata(dv)
         elif opts.hdr_style == "natural":
             mastering_str, content_light_str, peak_nits = MASTERING_DISPLAY, NATURAL_CONTENT_LIGHT, int(NATURAL_PEAK_NITS)
-        encoder_key, encoder_note = resolve_encoder(opts.encoder, opts.quality, w, h, detected=detected_encoders)
+        detected_map = detected_encoders if detected_encoders is not None else detect_encoders()
+        encoder_key, encoder_note = resolve_encoder(opts.encoder, opts.quality, w, h, detected=detected_map)
         is_hw = encoder_key in HARDWARE_PRIORITY
+        qsv_extbrc = bool(detected_map.get("qsv", {}).get("extbrc"))
         encoder_label = ENCODER_SPECS[encoder_key]["label"]
 
     use_gpu_filter = False
@@ -1276,6 +1298,15 @@ def build_command(opts: Options, info: dict, destination: Path,
                 use_vulkan_hwdec = bool(gpu_caps.get("vulkan_hwdec") and hwdec_codec_ok and hwdec_color_ok)
                 pipeline_note = "Vulkan 硬解 + libplacebo GPU 色彩管线" if use_vulkan_hwdec else "libplacebo GPU 色彩管线"
                 encoder_note = f"{encoder_note}（{pipeline_note}）" if encoder_note else f"已启用 {pipeline_note}"
+    elif video_operation == "dv_reencode" and not lossless_video and opts.gpu_filter == "auto":
+        gpu_caps = gpu_filter_caps if gpu_filter_caps is not None else detect_gpu_filter()
+        codec_name = p.get("codec_name", "")
+        pix_fmt = p.get("pixel_format", "")
+        hwdec_codec_ok = codec_name in ("hevc", "av1") and pix_fmt in ("yuv420p10le", "p010le", "yuv420p", "nv12")
+        if gpu_caps.get("vulkan_hwdec") and hwdec_codec_ok:
+            use_vulkan_hwdec = True
+            dv_hw_note = "Vulkan 硬解 + libplacebo 杜比视界还原"
+            encoder_note = f"{encoder_note}（{dv_hw_note}）" if encoder_note else f"已启用 {dv_hw_note}"
 
     filter_threads = min(16, os.cpu_count() or 4) if is_hw else min(8, os.cpu_count() or 4)
     codec_threads = min(8, os.cpu_count() or 4)
@@ -1300,7 +1331,12 @@ def build_command(opts: Options, info: dict, destination: Path,
     elif video_operation == "dv_strip":
         args += ["-c:v", "copy", "-bsf:v", dv_bsf, "-tag:v", "hvc1"]
     elif is_hw:
-        enc_args, enc_meta = _hardware_encoder_args(encoder_key, opts.quality)
+        enc_args, enc_meta = _hardware_encoder_args(
+            encoder_key,
+            opts.quality,
+            multipass=bool(opts.multipass),
+            qsv_extbrc=qsv_extbrc,
+        )
         video_codec = enc_meta["codec"]
         preset = enc_meta["preset"]
         crf = enc_meta["crf"]
@@ -1380,6 +1416,8 @@ def build_command(opts: Options, info: dict, destination: Path,
                       hardware_accelerated=is_hw,
                       gpu_filter=use_gpu_filter,
                       vulkan_hwdec=use_vulkan_hwdec,
+                      multipass=bool(opts.multipass and encoder_key == "nvenc" and not lossless_video and not stream_copy),
+                      qsv_extbrc=bool(encoder_key == "qsv" and qsv_extbrc),
                       encoder_note=encoder_note,
                       quality_control=quality_control,
                       audio=args[args.index("-c:a") + 1],
@@ -1394,6 +1432,7 @@ def build_command(opts: Options, info: dict, destination: Path,
                       nominal_peak_nits=peak_nits,
                       clipped_stream_copy=bool(stream_copy and (opts.start or opts.duration is not None)),
                       require_limited_range=(p.get("range") == "limited") if video_operation == "dv_strip" else True,
+                      require_matrix_metadata=(p.get("matrix") == "bt2020nc") if video_operation == "dv_strip" else True,
                       require_mastering_metadata=bool(dv.get("source_has_mastering", False)) if video_operation == "dv_strip" else True,
                       require_content_light_metadata=bool(dv.get("source_has_content_light", False)) if video_operation == "dv_strip" else True,
                       expect_audio=bool(audio and (not audio_duration or audio_duration > opts.start)),
@@ -1407,6 +1446,8 @@ def validate_export(path: Path, expected: dict) -> dict:
     if expected.get("video_operation") == "dv_strip":
         if not expected.get("require_limited_range", True):
             optional_metadata["limited_range"] = checks.pop("limited_range")
+        if not expected.get("require_matrix_metadata", True):
+            optional_metadata["matrix"] = checks.pop("matrix")
         if not expected.get("require_mastering_metadata", True):
             optional_metadata["mastering_metadata"] = checks.pop("mastering_metadata")
         if not expected.get("require_content_light_metadata", True):
@@ -1706,8 +1747,9 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 fidelity_desc = "Dolby Vision RPU (and Profile 7 enhancement layer when present) is removed without re-encoding the 10-bit HDR10 base layer. Profile 7 FEL luminance deltas are not baked in."
             elif op == "dv_reencode":
                 peak_nits = plan.get("nominal_peak_nits", 1000)
+                dec_prefix = "Vulkan hwdec + " if plan.get("vulkan_hwdec") else ""
                 algorithm_desc = DV_REENCODE_ALGORITHM_ID
-                method_desc = f"libplacebo Dolby Vision reshaping/color conversion + 10-bit HEVC ({plan['video_codec']})"
+                method_desc = f"{dec_prefix}libplacebo Dolby Vision reshaping/color conversion + 10-bit HEVC ({plan['video_codec']})"
                 video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
                 mastering_desc = f"BT.2020 / D65 / {peak_nits} nits synthetic HDR10 target derived from source metadata"
                 light_desc = f"{peak_nits}/1000 nits declared HDR10 static bounds; not per-frame measured MaxFALL"
@@ -1744,6 +1786,7 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                           hardware_accelerated=plan["hardware_accelerated"],
                           gpu_filter=plan.get("gpu_filter", False),
                           vulkan_hwdec=plan.get("vulkan_hwdec", False),
+                          multipass=plan.get("multipass", False),
                           hdr_style=plan.get("hdr_style"),
                           dolby_vision=plan.get("dolby_vision"),
                           method=method_desc,
@@ -1790,6 +1833,8 @@ def cli():
                         help="SDR 转 HDR 风格：natural 自然高光保护（推荐电影实拍），vivid 高对比风格（原版，适合动漫/暗景）")
     parser.add_argument("--gpu-filter", choices=["auto", "off"], default="auto",
                         help="GPU 色彩滤镜加速：auto 自动启用 Vulkan/libplacebo GPU 着色器（不支持时回退 CPU），off 强制 CPU 滤镜")
+    parser.add_argument("--multipass", action="store_true",
+                        help="为 NVIDIA NVENC 有损档启用双遍分析（画质略优但耗时增加）")
     parser.add_argument("--encoder", choices=["auto", "cpu", "nvenc", "qsv", "amf"], default="auto")
     parser.add_argument("--dv-mode", choices=["auto", "strip", "reencode"], default="auto",
                         help="杜比视界模式：auto 自动选择（8.1/7 无损直剥，5/8.4 重编码），或手动指定 strip/reencode")

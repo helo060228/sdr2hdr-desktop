@@ -51,13 +51,13 @@ SDR 转 HDR10 提供两种独立管线：
 
 ### 1. 无损直剥（Profile 8.1 / Profile 7）
 
-- 仅在底层轨道为标准 HEVC 10-bit `yuv420p10le`、PQ（`smpte2084`）、BT.2020（`bt2020nc`）且保持原尺寸时启用。
+- 当底层轨道为 HEVC 10-bit `yuv420p10le`、PQ（`smpte2084`）、BT.2020 原色（`bt2020nc` 或部分蓝光 Remux 缺失的未标注矩阵）且保持原尺寸时启用。
 - Profile 8.1 采用 `-c:v copy -bsf:v dovi_rpu=strip=1 -tag:v hvc1`；Profile 7（含单轨 EL NAL 63 与双轨蓝光 Remux）采用 `-c:v copy -bsf:v dovi_split=mode=bl,dovi_rpu=strip=1 -tag:v hvc1`（旧版 FFmpeg 回退 `filter_units=remove_types=63,dovi_rpu=strip=1`）。
-- 导出校验强制确认输出容器与首帧均无任何残留的 `DOVI` / `Dolby Vision` 元数据或 `dvhe` / `dvh1` 标签；对于原片基础层未携带 `MaxCLL/MaxFALL` 的蓝光片源不作误报拦截。
+- 导出校验强制确认输出容器与首帧均无任何残留的 `DOVI` / `Dolby Vision` 元数据或 `dvhe` / `dvh1` 标签；对于原片基础层未携带 `MaxCLL/MaxFALL` 或矩阵标记的蓝光片源不作误报拦截。
 
 ### 2. 色彩还原重编码（Profile 5 / Profile 8.4 及其他无 HDR10 兼容层 DV）
 
-- 通过 `libplacebo` 执行杜比视界 RPU 重塑与色彩空间映射：
+- 通过 `libplacebo` 执行杜比视界 RPU 重塑与色彩空间映射（有损模式支持 Vulkan 硬解 `-hwaccel vulkan -hwaccel_output_format vulkan` 零拷贝直入 `libplacebo`，实测与 CPU 软解逐像素一致）：
   `libplacebo=w=<W>:h=<H>:format=<pix_fmt>:colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084:range=tv:apply_dolbyvision=true:peak_detect=false:tonemapping=clip:gamut_mode=clip:dithering=ordered_fixed,setsar=1`
 - 禁用动态峰值检测（`peak_detect=false`）并采用 `tonemapping=clip:gamut_mode=clip`，在保持原始 HDR 动态范围的同时避免逐帧亮度呼吸效应。
 - 显卡有损编码直接让 `libplacebo` 输出 `p010le` 以减少 CPU 格式转换瓶颈；CPU 编码与无损档使用确定性的 `yuv420p10le` 输出并通过逐帧 SHA-256 校验。
@@ -77,8 +77,8 @@ SDR 转 HDR10 提供两种独立管线：
 
 ### 显卡硬件编码（10-bit Main 10 / `p010le`）
 
-- **NVIDIA NVENC（`hevc_nvenc`）**：快速 `p2 / VBR CQ 22`；标准 `p5 / VBR CQ 20`；精细 `p7 / multipass qres / VBR CQ 18 / spatial-aq`；画面无损 `-preset p4 -tune lossless`（若本地显卡自检通过）。
-- **Intel QSV（`hevc_qsv`）**：快速 `faster / ICQ 22`；标准 `medium / ICQ 20`；精细 `slow / ICQ 18`（不支持无损档）。
+- **NVIDIA NVENC（`hevc_nvenc`）**：快速 `p2 / VBR CQ 22`；标准 `p5 / VBR CQ 20`；精细默认单遍 `p6 / VBR CQ 18 / spatial-aq`（启用 `--multipass` 时切换 `p7 / multipass qres`）；画面无损 `-preset p4 -tune lossless`（若本地显卡自检通过）。
+- **Intel QSV（`hevc_qsv`）**：针对 10-bit HDR10 校准为快速 `faster / ICQ 19`、标准 `medium / ICQ 16`、精细 `slow / ICQ 14`，并在运行时自检通过时自动启用 `-extbrc 1 -mbbrc 1 -adaptive_i 1 -adaptive_b 1`（不支持无损档；不兼容 ExtBRC 的驱动自动回退纯 ICQ）。
 - **AMD AMF（`hevc_amf`）**：启用 `-bitdepth 10`，快速 `speed / CQP 22`；标准 `balanced / CQP 20`；精细 `quality / CQP 18`（不支持无损档）。
 
 ### 滤镜衔接、GPU 色彩加速与元数据传播
