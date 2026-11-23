@@ -1139,6 +1139,47 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(len(done_events), 1)
         self.assertIn("elapsed", done_events[0])
 
+    def test_responsive_layout_windowed_maximized_and_hysteresis(self):
+        import app as gui_app
+
+        # 1. Normal windowed on 125% DPI (1175x781)
+        win = gui_app.compute_responsive_layout(1175, 781, 696, 1.25, "normal")
+        self.assertEqual(win["mode"], "normal")
+        self.assertFalse(win["need_scroll"])
+        self.assertEqual(win["card_w"], 1145)
+        self.assertEqual(win["card_x"], 15)
+
+        # 2. Maximized 2560x1440 at 125% DPI
+        max_qhd = gui_app.compute_responsive_layout(2560, 1370, 860, 1.25, "normal")
+        self.assertEqual(max_qhd["mode"], "large")
+        self.assertEqual(max_qhd["card_w"], 1600)
+        self.assertEqual(max_qhd["card_x"], 480)
+        self.assertGreater(max_qhd["card_y"], 100)
+        self.assertFalse(max_qhd["need_scroll"])
+
+        # 3. Maximized 1920x1080 at 100% DPI
+        max_fhd_100 = gui_app.compute_responsive_layout(1920, 1010, 680, 1.0, "normal")
+        self.assertEqual(max_fhd_100["mode"], "large")
+        self.assertEqual(max_fhd_100["card_w"], 1280)
+        self.assertEqual(max_fhd_100["card_x"], 320)
+        self.assertFalse(max_fhd_100["need_scroll"])
+
+        # 4. Maximized 1920x1080 at 125% DPI stays normal density + centered card without scroll
+        max_fhd_125 = gui_app.compute_responsive_layout(1920, 1010, 700, 1.25, "normal")
+        self.assertEqual(max_fhd_125["mode"], "normal")
+        self.assertEqual(max_fhd_125["card_w"], 1400)
+        self.assertEqual(max_fhd_125["card_x"], 260)
+        self.assertFalse(max_fhd_125["need_scroll"])
+
+        # 5. Hysteresis band (1280x790 at 100% DPI)
+        self.assertEqual(gui_app.compute_responsive_layout(1280, 790, 560, 1.0, "normal")["mode"], "normal")
+        self.assertEqual(gui_app.compute_responsive_layout(1280, 790, 640, 1.0, "large")["mode"], "large")
+
+        # 6. Short window activates vertical scrollbar cleanly
+        short = gui_app.compute_responsive_layout(940, 340, 560, 1.0, "normal")
+        self.assertEqual(short["mode"], "normal")
+        self.assertTrue(short["need_scroll"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

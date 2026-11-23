@@ -28,7 +28,7 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128

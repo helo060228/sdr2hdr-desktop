@@ -41,6 +41,16 @@ STYLE_LABELS = {
     "高对比风格（原版·动漫）": "vivid",
 }
 
+BACKDROP_BG = "#eef1f6"
+CARD_BG = "#ffffff"
+CARD_BORDER = "#d6dee9"
+DIVIDER_BG = "#e7ecf3"
+TEXT_PRIMARY = "#172132"
+TEXT_MUTED = "#566273"
+ACCENT_BLUE = "#2563eb"
+ACCENT_BLUE_HOVER = "#1d4ed8"
+ACCENT_BLUE_ACTIVE = "#1e40af"
+
 
 def format_progress_detail(seconds: float, total: float, speed: str = "",
                            elapsed: float | None = None,
@@ -62,6 +72,57 @@ def format_progress_detail(seconds: float, total: float, speed: str = "",
     return "  ·  ".join(parts)
 
 
+def compute_responsive_layout(vw: int, vh: int, content_h: int,
+                              dpi_scale: float, current_mode: str = "normal") -> dict:
+    """Compute responsive density tier, card geometry, and scroll state from viewport size."""
+    scale = max(1.0, float(dpi_scale))
+    if current_mode == "large":
+        if vw < int(round(1240 * scale)) or vh < int(round(760 * scale)):
+            mode = "normal"
+        else:
+            mode = "large"
+    else:
+        if vw >= int(round(1320 * scale)) and vh >= int(round(820 * scale)):
+            mode = "large"
+        else:
+            mode = "normal"
+
+    edge_x = int(round((36 if mode == "large" else 12) * scale))
+    edge_y = int(round((28 if mode == "large" else 12) * scale))
+    max_card_w = int(round((1280 if mode == "large" else 1120) * scale))
+
+    if vw <= 1:
+        card_w = max_card_w
+        card_x = edge_x
+    else:
+        avail_w = max(520, vw - 2 * edge_x)
+        card_w = max(1, min(max_card_w, avail_w, vw))
+        card_x = max(0, (vw - card_w) // 2)
+
+    need_scroll = vh > 1 and (content_h + 2 * edge_y) > vh + 2
+    if need_scroll:
+        card_y = edge_y
+        scroll_h = content_h + 2 * edge_y
+    else:
+        free_h = max(0, vh - content_h)
+        if free_h > int(round(64 * scale)):
+            card_y = max(edge_y, int(round(free_h * 0.44)))
+        else:
+            card_y = max(edge_y // 2, free_h // 2)
+        scroll_h = max(vh, card_y + content_h + edge_y)
+
+    return dict(
+        mode=mode,
+        card_x=card_x,
+        card_y=card_y,
+        card_w=card_w,
+        need_scroll=need_scroll,
+        scroll_h=scroll_h,
+        edge_x=edge_x,
+        edge_y=edge_y,
+    )
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -73,11 +134,11 @@ class App:
         except tk.TclError:
             tk_scaling = 96.0 / 72.0
         dpi_scale = max(1.0, tk_scaling / (96.0 / 72.0))
-        init_w = min(int(round(940 * dpi_scale)), max(760, screen_w - 80))
+        init_w = min(int(round(960 * dpi_scale)), max(760, screen_w - 80))
         min_w = min(max(820, int(round(780 * dpi_scale))), max(760, screen_w - 60))
         min_h = min(int(round(460 * dpi_scale)), max(440, screen_h - 90))
         root.minsize(min_w, min_h)
-        root.configure(bg="#f4f5f7")
+        root.configure(bg=BACKDROP_BG)
         self.dpi_scale = dpi_scale
         self.queue = queue.Queue()
         self.cancel = threading.Event()
@@ -87,8 +148,14 @@ class App:
         self.last_progress_info = None
         self._last_clock_tick = -1
         self._scrollbar_visible = False
+        self._density_mode = None
+        self._syncing = False
+        self._fullscreen = False
         self._last_wrap = 0
+        self._last_card_geom = None
         self._wrap_labels = []
+        self._font_inputs = []
+        self._dividers = []
         self.input = tk.StringVar()
         self.output = tk.StringVar()
         self.resolution = tk.StringVar(value="保持原尺寸")
@@ -112,25 +179,60 @@ class App:
 
         style = ttk.Style(root)
         style.theme_use("clam")
-        style.configure("TFrame", background="#f4f5f7")
-        style.configure("TLabel", background="#f4f5f7", font=("Microsoft YaHei UI", 10))
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 19, "bold"), foreground="#172132")
-        style.configure("Sub.TLabel", foreground="#566273")
-        style.configure("Percent.TLabel", font=("Microsoft YaHei UI", 10, "bold"), foreground="#172132")
+        self.style = style
+        style.configure("TFrame", background=CARD_BG)
+        style.configure("Card.TFrame", background=CARD_BG)
+        style.configure("TLabel", background=CARD_BG, foreground=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10))
+        style.configure("Title.TLabel", background=CARD_BG, foreground=TEXT_PRIMARY, font=("Microsoft YaHei UI", 19, "bold"))
+        style.configure("Sub.TLabel", background=CARD_BG, foreground=TEXT_MUTED)
+        style.configure("Percent.TLabel", background=CARD_BG, foreground=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("TButton", font=("Microsoft YaHei UI", 10), padding=(12, 6))
-        style.configure("Main.TButton", font=("Microsoft YaHei UI", 11, "bold"), padding=(18, 9))
-        style.configure("TEntry", padding=5)
-        style.configure("TCombobox", padding=4)
-        style.configure("TCheckbutton", background="#f4f5f7", font=("Microsoft YaHei UI", 10))
+        style.configure(
+            "Main.TButton",
+            font=("Microsoft YaHei UI", 11, "bold"),
+            padding=(18, 9),
+            foreground="#ffffff",
+            background=ACCENT_BLUE,
+            bordercolor=ACCENT_BLUE,
+            lightcolor=ACCENT_BLUE,
+            darkcolor=ACCENT_BLUE,
+            focuscolor="#93c5fd",
+        )
+        style.map(
+            "Main.TButton",
+            background=[("disabled", "#cbd5e1"), ("pressed", ACCENT_BLUE_ACTIVE), ("active", ACCENT_BLUE_HOVER)],
+            foreground=[("disabled", "#64748b"), ("active", "#ffffff")],
+            bordercolor=[("disabled", "#cbd5e1"), ("pressed", ACCENT_BLUE_ACTIVE), ("active", ACCENT_BLUE_HOVER)],
+            lightcolor=[("disabled", "#cbd5e1"), ("pressed", ACCENT_BLUE_ACTIVE), ("active", ACCENT_BLUE_HOVER)],
+            darkcolor=[("disabled", "#cbd5e1"), ("pressed", ACCENT_BLUE_ACTIVE), ("active", ACCENT_BLUE_HOVER)],
+        )
+        style.configure("TEntry", padding=5, fieldbackground=CARD_BG)
+        style.configure("TCombobox", padding=4, fieldbackground=CARD_BG)
+        style.map("TCombobox", fieldbackground=[("readonly", CARD_BG), ("disabled", "#f1f5f9")])
+        style.configure("TCheckbutton", background=CARD_BG, foreground=TEXT_PRIMARY, font=("Microsoft YaHei UI", 10))
+        style.map("TCheckbutton", background=[("active", CARD_BG)])
+        style.configure(
+            "Accent.Horizontal.TProgressbar",
+            troughcolor="#e5eaf1",
+            background=ACCENT_BLUE,
+            bordercolor=CARD_BORDER,
+            lightcolor=ACCENT_BLUE,
+            darkcolor=ACCENT_BLUE,
+            thickness=12,
+        )
 
-        viewport = tk.Canvas(root, bg="#f4f5f7", highlightthickness=0)
+        viewport = tk.Canvas(root, bg=BACKDROP_BG, highlightthickness=0)
         scrollbar = ttk.Scrollbar(root, orient="vertical", command=viewport.yview)
         viewport.pack(side="left", fill="both", expand=True)
         viewport.configure(yscrollcommand=scrollbar.set)
-        box = ttk.Frame(viewport, padding=(22, 14, 22, 14))
-        window_id = viewport.create_window((0, 0), window=box, anchor="nw")
+
+        card_border = tk.Frame(viewport, bg=CARD_BORDER, padx=1, pady=1)
+        box = ttk.Frame(card_border, style="Card.TFrame", padding=(24, 16, 24, 16))
+        box.pack(fill="both", expand=True)
+        window_id = viewport.create_window((0, 0), window=card_border, anchor="nw")
         self.viewport = viewport
         self.scrollbar = scrollbar
+        self.card_border = card_border
         self.box = box
         self._window_id = window_id
 
@@ -138,6 +240,8 @@ class App:
             if self._scrollbar_visible:
                 viewport.yview_scroll(-int(event.delta / 120), "units")
         root.bind_all("<MouseWheel>", wheel)
+        root.bind("<F11>", self.toggle_fullscreen)
+        root.bind("<Escape>", lambda _e: self.exit_fullscreen())
 
         ttk.Label(box, text="把画质和音效，一起写进视频", style="Title.TLabel").pack(anchor="w")
         ttk.Label(box, text="SDR 转 HDR10 · 杜比视界 (DV) 转 HDR10 · 已有 HDR10 无损加音效。", style="Sub.TLabel").pack(anchor="w", pady=(3, 12))
@@ -147,8 +251,12 @@ class App:
         info_lbl.pack(anchor="w", pady=(2, 8))
         self.path_row(box, "导出文件", self.output, self.pick_output, "保存到…")
 
+        div_top = tk.Frame(box, bg=DIVIDER_BG, height=1)
+        div_top.pack(fill="x", pady=(6, 10))
+        self._dividers.append(("top", div_top))
+
         row = ttk.Frame(box)
-        row.pack(fill="x", pady=(8, 6))
+        row.pack(fill="x", pady=(0, 6))
         row.columnconfigure(0, weight=10, uniform="opt")
         row.columnconfigure(1, weight=12, uniform="opt")
         row.columnconfigure(2, weight=11, uniform="opt")
@@ -181,6 +289,7 @@ class App:
         self.resolution_combo, self.style_combo, self.quality_combo, self.encoder_combo, self.audio_combo = c1, c_style, c2, c3, c4
         self.multipass_check = c_mp
         self.controls += [c1, c_style, c2, c3, c4, c_mp]
+        self._font_inputs += [c1, c_style, c2, c3, c4]
 
         self.encoding_note = tk.StringVar()
         enc_status_lbl = ttk.Label(box, textvariable=self.encoder_status, style="Sub.TLabel")
@@ -191,7 +300,11 @@ class App:
         c2.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         c3.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         audio_hint_lbl = ttk.Label(box, text="虚拟环绕输出双声道空间音效；原声模式尽可能保留原音轨，HDR 画面不重复增强。", style="Sub.TLabel")
-        audio_hint_lbl.pack(anchor="w", pady=(0, 10))
+        audio_hint_lbl.pack(anchor="w", pady=(0, 4))
+
+        div_bottom = tk.Frame(box, bg=DIVIDER_BG, height=1)
+        div_bottom.pack(fill="x", pady=(6, 12))
+        self._dividers.append(("bottom", div_bottom))
 
         actions = ttk.Frame(box)
         actions.pack(fill="x")
@@ -207,7 +320,12 @@ class App:
 
         progress_row = ttk.Frame(box)
         progress_row.pack(fill="x", pady=(12, 6))
-        ttk.Progressbar(progress_row, variable=self.progress, maximum=100).pack(side="left", fill="x", expand=True)
+        ttk.Progressbar(
+            progress_row,
+            variable=self.progress,
+            maximum=100,
+            style="Accent.Horizontal.TProgressbar",
+        ).pack(side="left", fill="x", expand=True)
         ttk.Label(progress_row, textvariable=self.percent_text, style="Percent.TLabel", width=7, anchor="e").pack(side="right", padx=(10, 0))
 
         status_lbl = ttk.Label(box, textvariable=self.status)
@@ -225,53 +343,127 @@ class App:
 
         self._wrap_labels = [info_lbl, enc_status_lbl, enc_note_lbl, audio_hint_lbl, status_lbl, detail_lbl]
 
-        initial_wrap = max(560, init_w - 52)
-        self._last_wrap = initial_wrap
-        for lbl in self._wrap_labels:
-            lbl.configure(wraplength=initial_wrap)
-        self.footer_label.configure(wraplength=max(400, init_w - 200))
+        self.apply_density_mode("normal")
+        init_edge_x = int(round(12 * dpi_scale))
+        init_card_w = min(int(round(1120 * dpi_scale)), max(520, init_w - 2 * init_edge_x))
+        self._apply_wrap_for_card(init_card_w, "normal")
 
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(100, self.poll)
         self.update_encoding_note()
         self.detect_encoders_async()
 
-        viewport.itemconfigure(window_id, width=init_w)
+        viewport.itemconfigure(window_id, width=init_card_w)
         root.update_idletasks()
-        req_h = box.winfo_reqheight()
-        headroom = int(round(68 * dpi_scale))
-        init_h = min(max(int(round(520 * dpi_scale)), req_h + headroom), max(480, screen_h - 90))
+        req_h = card_border.winfo_reqheight()
+        init_h = min(max(int(round(550 * dpi_scale)), req_h + int(round(78 * dpi_scale))), max(480, screen_h - 90))
         root.geometry(f"{init_w}x{init_h}")
 
-        box.bind("<Configure>", self.sync_layout)
+        card_border.bind("<Configure>", self.sync_layout)
         viewport.bind("<Configure>", self.sync_layout)
         self.sync_layout()
 
         if len(sys.argv) > 1 and Path(sys.argv[1]).is_file():
             root.after(200, lambda: self.set_input(sys.argv[1]))
 
-    def sync_layout(self, _event=None):
-        vw = self.viewport.winfo_width()
-        vh = self.viewport.winfo_height()
-        if vw > 1:
-            self.viewport.itemconfigure(self._window_id, width=vw)
-            wrap = max(560, vw - 52)
-            if abs(wrap - self._last_wrap) >= 4:
-                self._last_wrap = wrap
-                for lbl in self._wrap_labels:
-                    lbl.configure(wraplength=wrap)
-                self.footer_label.configure(wraplength=max(400, vw - 220))
-        content_h = self.box.winfo_reqheight()
-        self.viewport.configure(scrollregion=(0, 0, max(1, vw), content_h))
-        need_scroll = vh > 1 and content_h > vh + 2
-        if need_scroll != self._scrollbar_visible:
-            if need_scroll:
-                self.scrollbar.pack(side="right", fill="y", before=self.viewport)
-                self._scrollbar_visible = True
+    def _apply_wrap_for_card(self, card_w: int, mode: str) -> bool:
+        inner_pad = 72 if mode == "large" else 48
+        wrap = max(500, card_w - inner_pad - 8)
+        footer_wrap = max(360, card_w - inner_pad - 180)
+        if abs(wrap - self._last_wrap) < 4:
+            return False
+        self._last_wrap = wrap
+        for lbl in self._wrap_labels:
+            lbl.configure(wraplength=wrap)
+        self.footer_label.configure(wraplength=footer_wrap)
+        return True
+
+    def apply_density_mode(self, mode: str):
+        if mode == self._density_mode:
+            return
+        self._density_mode = mode
+        large = mode == "large"
+        body_size = 11 if large else 10
+        title_size = 23 if large else 19
+        main_btn_size = 12 if large else 11
+        body_font = ("Microsoft YaHei UI", body_size)
+
+        self.style.configure("TLabel", font=body_font)
+        self.style.configure("Title.TLabel", font=("Microsoft YaHei UI", title_size, "bold"))
+        self.style.configure("Percent.TLabel", font=("Microsoft YaHei UI", body_size, "bold"))
+        self.style.configure("TCheckbutton", font=body_font)
+        self.style.configure("TButton", font=body_font, padding=(15, 8) if large else (12, 6))
+        self.style.configure("Main.TButton", font=("Microsoft YaHei UI", main_btn_size, "bold"), padding=(22, 11) if large else (18, 9))
+        self.style.configure("TEntry", padding=(7, 6) if large else 5)
+        self.style.configure("TCombobox", padding=(6, 5) if large else 4)
+        self.style.configure("Accent.Horizontal.TProgressbar", thickness=16 if large else 12)
+        self.root.option_add("*TCombobox*Listbox.font", body_font)
+        for widget in self._font_inputs:
+            widget.configure(font=body_font)
+
+        self.box.configure(padding=(36, 26, 36, 24) if large else (24, 16, 24, 16))
+        for role, div in self._dividers:
+            if role == "top":
+                div.pack_configure(pady=(12, 16) if large else (6, 10))
             else:
-                self.scrollbar.pack_forget()
-                self.viewport.yview_moveto(0.0)
-                self._scrollbar_visible = False
+                div.pack_configure(pady=(8, 16) if large else (6, 12))
+        self._last_wrap = 0
+
+    def toggle_fullscreen(self, _event=None):
+        self._fullscreen = not self._fullscreen
+        self.root.attributes("-fullscreen", self._fullscreen)
+        self.sync_layout()
+
+    def exit_fullscreen(self, _event=None):
+        if self._fullscreen:
+            self._fullscreen = False
+            self.root.attributes("-fullscreen", False)
+            self.sync_layout()
+
+    def sync_layout(self, _event=None):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            vw = self.viewport.winfo_width()
+            vh = self.viewport.winfo_height()
+            if vw <= 1 or vh <= 1:
+                return
+            current_mode = self._density_mode or "normal"
+            content_h = self.card_border.winfo_reqheight()
+            layout = compute_responsive_layout(vw, vh, content_h, self.dpi_scale, current_mode)
+            changed = False
+            if layout["mode"] != self._density_mode:
+                self.apply_density_mode(layout["mode"])
+                changed = True
+            if self._apply_wrap_for_card(layout["card_w"], layout["mode"]):
+                changed = True
+            if self._last_card_geom is None or self._last_card_geom[2] != layout["card_w"]:
+                self.viewport.itemconfigure(self._window_id, width=layout["card_w"])
+                changed = True
+            if changed:
+                self.card_border.update_idletasks()
+                content_h = self.card_border.winfo_reqheight()
+                layout = compute_responsive_layout(vw, vh, content_h, self.dpi_scale, layout["mode"])
+
+            geom = (layout["card_x"], layout["card_y"], layout["card_w"])
+            if geom != self._last_card_geom:
+                self.viewport.coords(self._window_id, layout["card_x"], layout["card_y"])
+                self.viewport.itemconfigure(self._window_id, width=layout["card_w"])
+                self._last_card_geom = geom
+
+            self.viewport.configure(scrollregion=(0, 0, max(1, vw), layout["scroll_h"]))
+            need_scroll = layout["need_scroll"]
+            if need_scroll != self._scrollbar_visible:
+                if need_scroll:
+                    self.scrollbar.pack(side="right", fill="y", before=self.viewport)
+                    self._scrollbar_visible = True
+                else:
+                    self.scrollbar.pack_forget()
+                    self.viewport.yview_moveto(0.0)
+                    self._scrollbar_visible = False
+        finally:
+            self._syncing = False
 
     def detect_encoders_async(self):
         def probe_worker():
@@ -347,6 +539,7 @@ class App:
         button = ttk.Button(row, text=label, command=command)
         button.pack(side="right", padx=(9, 0))
         self.controls += [entry, button]
+        self._font_inputs.append(entry)
 
     def pick_input(self):
         p = filedialog.askopenfilename(title="选择 SDR／杜比视界／HDR 视频", filetypes=[("视频", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.ts"), ("所有文件", "*.*")])
