@@ -1,11 +1,13 @@
 """Small local desktop front end. All video processing stays on the computer."""
 import concurrent.futures
 import json
+import math
 import os
 from pathlib import Path
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -19,6 +21,8 @@ from hdr_core import (
     detect_dv_tools,
     detect_encoders,
     detect_gpu_filter,
+    estimate_eta_seconds,
+    format_duration_clock,
     inspect_input,
 )
 
@@ -38,17 +42,53 @@ STYLE_LABELS = {
 }
 
 
+def format_progress_detail(seconds: float, total: float, speed: str = "",
+                           elapsed: float | None = None,
+                           eta_seconds: float | None = None) -> str:
+    """Format progress timing string including processed seconds, speed, elapsed, and ETA."""
+    base = (f"已处理 {seconds:.1f} / {total:.1f} 秒" if total and total > 0 else
+            f"已处理 {seconds:.1f} 秒（原片时长未提供）")
+    parts = [base]
+    speed_text = str(speed or "").strip()
+    if speed_text:
+        parts.append(speed_text)
+    if elapsed is not None and math.isfinite(elapsed) and elapsed >= 0:
+        parts.append(f"已用 {format_duration_clock(elapsed)}")
+    if total and total > 0:
+        if eta_seconds is not None and math.isfinite(eta_seconds) and eta_seconds >= 0:
+            parts.append(f"预计剩余 {format_duration_clock(eta_seconds)}")
+        else:
+            parts.append("预计剩余 计算中…")
+    return "  ·  ".join(parts)
+
+
 class App:
     def __init__(self, root):
         self.root = root
         root.title(f"SDR / 杜比视界转 HDR10 · 离线转换器 {VERSION}")
-        root.geometry(f"{min(840, root.winfo_screenwidth()-80)}x{min(820, root.winfo_screenheight()-90)}")
-        root.minsize(710, 580)
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+        try:
+            tk_scaling = float(root.tk.call("tk", "scaling"))
+        except tk.TclError:
+            tk_scaling = 96.0 / 72.0
+        dpi_scale = max(1.0, tk_scaling / (96.0 / 72.0))
+        init_w = min(int(round(940 * dpi_scale)), max(760, screen_w - 80))
+        min_w = min(max(820, int(round(780 * dpi_scale))), max(760, screen_w - 60))
+        min_h = min(int(round(460 * dpi_scale)), max(440, screen_h - 90))
+        root.minsize(min_w, min_h)
         root.configure(bg="#f4f5f7")
+        self.dpi_scale = dpi_scale
         self.queue = queue.Queue()
         self.cancel = threading.Event()
         self.keep_partial = threading.Event()
         self.running = False
+        self.job_started = None
+        self.last_progress_info = None
+        self._last_clock_tick = -1
+        self._scrollbar_visible = False
+        self._last_wrap = 0
+        self._wrap_labels = []
         self.input = tk.StringVar()
         self.output = tk.StringVar()
         self.resolution = tk.StringVar(value="保持原尺寸")
@@ -66,70 +106,96 @@ class App:
         self.info = tk.StringVar(value="支持 MP4、MOV、MKV 等本地视频；自动识别 SDR 与杜比视界 Profile 5 / 7 / 8.1 / 8.4。")
         self.encoder_status = tk.StringVar(value="正在检测显卡硬件加速与杜比视界组件…")
         self.progress = tk.DoubleVar()
+        self.percent_text = tk.StringVar(value="0.0%")
         self.detail = tk.StringVar(value="")
         self.controls = []
+
         style = ttk.Style(root)
         style.theme_use("clam")
         style.configure("TFrame", background="#f4f5f7")
         style.configure("TLabel", background="#f4f5f7", font=("Microsoft YaHei UI", 10))
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 23, "bold"), foreground="#172132")
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 19, "bold"), foreground="#172132")
         style.configure("Sub.TLabel", foreground="#566273")
-        style.configure("TButton", font=("Microsoft YaHei UI", 10), padding=(13, 7))
-        style.configure("Main.TButton", font=("Microsoft YaHei UI", 12, "bold"), padding=(20, 11))
-        style.configure("TEntry", padding=7)
-        style.configure("TCombobox", padding=5)
+        style.configure("Percent.TLabel", font=("Microsoft YaHei UI", 10, "bold"), foreground="#172132")
+        style.configure("TButton", font=("Microsoft YaHei UI", 10), padding=(12, 6))
+        style.configure("Main.TButton", font=("Microsoft YaHei UI", 11, "bold"), padding=(18, 9))
+        style.configure("TEntry", padding=5)
+        style.configure("TCombobox", padding=4)
         style.configure("TCheckbutton", background="#f4f5f7", font=("Microsoft YaHei UI", 10))
+
         viewport = tk.Canvas(root, bg="#f4f5f7", highlightthickness=0)
         scrollbar = ttk.Scrollbar(root, orient="vertical", command=viewport.yview)
-        scrollbar.pack(side="right", fill="y")
         viewport.pack(side="left", fill="both", expand=True)
         viewport.configure(yscrollcommand=scrollbar.set)
-        box = ttk.Frame(viewport, padding=26)
+        box = ttk.Frame(viewport, padding=(22, 14, 22, 14))
         window_id = viewport.create_window((0, 0), window=box, anchor="nw")
-        box.bind("<Configure>", lambda e: viewport.configure(scrollregion=viewport.bbox("all")))
-        viewport.bind("<Configure>", lambda e: viewport.itemconfigure(window_id, width=e.width))
+        self.viewport = viewport
+        self.scrollbar = scrollbar
+        self.box = box
+        self._window_id = window_id
+
         def wheel(event):
-            bounds = viewport.bbox("all")
-            if bounds and bounds[3] > viewport.winfo_height():
+            if self._scrollbar_visible:
                 viewport.yview_scroll(-int(event.delta / 120), "units")
         root.bind_all("<MouseWheel>", wheel)
+
         ttk.Label(box, text="把画质和音效，一起写进视频", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(box, text="SDR 转 HDR10 · 杜比视界 (DV) 转 HDR10 · 已有 HDR10 无损加音效。", style="Sub.TLabel").pack(anchor="w", pady=(9, 23))
+        ttk.Label(box, text="SDR 转 HDR10 · 杜比视界 (DV) 转 HDR10 · 已有 HDR10 无损加音效。", style="Sub.TLabel").pack(anchor="w", pady=(3, 12))
+
         self.path_row(box, "原始视频", self.input, self.pick_input, "选择视频")
-        ttk.Label(box, textvariable=self.info, style="Sub.TLabel", wraplength=700).pack(anchor="w", pady=(2, 17))
+        info_lbl = ttk.Label(box, textvariable=self.info, style="Sub.TLabel")
+        info_lbl.pack(anchor="w", pady=(2, 8))
         self.path_row(box, "导出文件", self.output, self.pick_output, "保存到…")
+
         row = ttk.Frame(box)
-        row.pack(fill="x", pady=(14, 10))
-        ttk.Label(row, text="输出尺寸").grid(row=0, column=0, sticky="w")
-        c1 = ttk.Combobox(row, textvariable=self.resolution, values=["保持原尺寸", "2K · 短边 1440", "4K · 短边 2160"], state="readonly", width=28)
-        c1.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(row, text="HDR 风格").grid(row=0, column=1, sticky="w", padx=(28, 0))
-        c_style = ttk.Combobox(row, textvariable=self.hdr_style, values=list(STYLE_LABELS.keys()), state="readonly", width=31)
-        c_style.grid(row=1, column=1, sticky="w", padx=(28, 0), pady=(6, 0))
-        ttk.Label(row, text="转换方式").grid(row=2, column=0, sticky="w", pady=(12, 0))
-        c2 = ttk.Combobox(row, textvariable=self.quality, values=["快速试转", "标准画质", "精细画质", "画面无损编码"], state="readonly", width=28)
-        c2.grid(row=3, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(row, text="编码器").grid(row=2, column=1, sticky="w", padx=(28, 0), pady=(12, 0))
-        c3 = ttk.Combobox(row, textvariable=self.encoder, values=list(ENCODER_LABELS.keys()), state="readonly", width=28)
-        c3.grid(row=3, column=1, sticky="w", padx=(28, 0), pady=(6, 0))
-        ttk.Label(row, text="音效").grid(row=4, column=0, sticky="w", pady=(12, 0))
-        c4 = ttk.Combobox(row, textvariable=self.audio_effect, values=["原声（保留）", "虚拟环绕（双声道）"], state="readonly", width=28)
-        c4.grid(row=5, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(row, text="高级选项").grid(row=4, column=1, sticky="w", padx=(28, 0), pady=(12, 0))
+        row.pack(fill="x", pady=(8, 6))
+        row.columnconfigure(0, weight=10, uniform="opt")
+        row.columnconfigure(1, weight=12, uniform="opt")
+        row.columnconfigure(2, weight=11, uniform="opt")
+
+        ttk.Label(row, text="输出尺寸").grid(row=0, column=0, sticky="w", padx=(0, 14))
+        c1 = ttk.Combobox(row, textvariable=self.resolution, values=["保持原尺寸", "2K · 短边 1440", "4K · 短边 2160"], state="readonly", width=16)
+        c1.grid(row=1, column=0, sticky="ew", padx=(0, 14), pady=(4, 0))
+
+        ttk.Label(row, text="HDR 风格").grid(row=0, column=1, sticky="w", padx=(0, 14))
+        c_style = ttk.Combobox(row, textvariable=self.hdr_style, values=list(STYLE_LABELS.keys()), state="readonly", width=18)
+        c_style.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=(4, 0))
+
+        ttk.Label(row, text="音效").grid(row=0, column=2, sticky="w")
+        c4 = ttk.Combobox(row, textvariable=self.audio_effect, values=["原声（保留）", "虚拟环绕（双声道）"], state="readonly", width=16)
+        c4.grid(row=1, column=2, sticky="ew", pady=(4, 0))
+
+        ttk.Label(row, text="转换方式").grid(row=2, column=0, sticky="w", padx=(0, 14), pady=(9, 0))
+        c2 = ttk.Combobox(row, textvariable=self.quality, values=["快速试转", "标准画质", "精细画质", "画面无损编码"], state="readonly", width=16)
+        c2.grid(row=3, column=0, sticky="ew", padx=(0, 14), pady=(4, 0))
+
+        ttk.Label(row, text="编码器").grid(row=2, column=1, sticky="w", padx=(0, 14), pady=(9, 0))
+        c3 = ttk.Combobox(row, textvariable=self.encoder, values=list(ENCODER_LABELS.keys()), state="readonly", width=16)
+        c3.grid(row=3, column=1, sticky="ew", padx=(0, 14), pady=(4, 0))
+
+        ttk.Label(row, text="高级选项").grid(row=2, column=2, sticky="w", pady=(9, 0))
         c_mp = ttk.Checkbutton(row, text="NVENC 双遍分析 (Multipass，更慢)", variable=self.multipass, command=self.update_encoding_note)
-        c_mp.grid(row=5, column=1, sticky="w", padx=(28, 0), pady=(6, 0))
+        c_mp.grid(row=3, column=2, sticky="w", pady=(4, 0))
+
+        self.option_grid = row
         self.resolution_combo, self.style_combo, self.quality_combo, self.encoder_combo, self.audio_combo = c1, c_style, c2, c3, c4
         self.multipass_check = c_mp
         self.controls += [c1, c_style, c2, c3, c4, c_mp]
+
         self.encoding_note = tk.StringVar()
-        ttk.Label(box, textvariable=self.encoder_status, style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(0, 4))
-        ttk.Label(box, textvariable=self.encoding_note, style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(0, 6))
+        enc_status_lbl = ttk.Label(box, textvariable=self.encoder_status, style="Sub.TLabel")
+        enc_status_lbl.pack(anchor="w", pady=(4, 2))
+        enc_note_lbl = ttk.Label(box, textvariable=self.encoding_note, style="Sub.TLabel")
+        enc_note_lbl.pack(anchor="w", pady=(0, 2))
         c_style.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         c2.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         c3.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
-        ttk.Label(box, text="虚拟环绕通过声场扩展和短延迟增加空间感，输出双声道。\n原声模式尽可能保留原音轨；HDR 画面不会重复增强。", style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(0, 14))
+        audio_hint_lbl = ttk.Label(box, text="虚拟环绕输出双声道空间音效；原声模式尽可能保留原音轨，HDR 画面不重复增强。", style="Sub.TLabel")
+        audio_hint_lbl.pack(anchor="w", pady=(0, 10))
+
         actions = ttk.Frame(box)
         actions.pack(fill="x")
+        self.actions_frame = actions
         self.start_button = ttk.Button(actions, text="导出完整 HDR", style="Main.TButton", command=self.start)
         self.start_button.pack(side="left")
         self.preview_button = ttk.Button(actions, text="先试转 10 秒", command=lambda: self.start(preview=True))
@@ -138,18 +204,74 @@ class App:
         self.stop_button.pack(side="right")
         self.save_partial_button = ttk.Button(actions, text="停止并保留", command=self.stop_and_keep, state="disabled")
         self.save_partial_button.pack(side="right", padx=(0, 8))
-        ttk.Progressbar(box, variable=self.progress, maximum=100).pack(fill="x", pady=(20, 12))
-        ttk.Label(box, textvariable=self.status, wraplength=710).pack(anchor="w")
-        ttk.Label(box, textvariable=self.detail, style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(5, 10))
-        self.open_button = ttk.Button(box, text="打开导出文件夹", command=self.open_folder)
-        self.open_button.pack(anchor="w")
-        ttk.Label(box, text="B 站转码后仍需检查 HDR 档位；不同屏幕和平台的显示可能存在差异。\n本工具离线处理，不会自动上传或发布。", style="Sub.TLabel", wraplength=710).pack(anchor="w", pady=(17, 0))
+
+        progress_row = ttk.Frame(box)
+        progress_row.pack(fill="x", pady=(12, 6))
+        ttk.Progressbar(progress_row, variable=self.progress, maximum=100).pack(side="left", fill="x", expand=True)
+        ttk.Label(progress_row, textvariable=self.percent_text, style="Percent.TLabel", width=7, anchor="e").pack(side="right", padx=(10, 0))
+
+        status_lbl = ttk.Label(box, textvariable=self.status)
+        status_lbl.pack(anchor="w")
+        detail_lbl = ttk.Label(box, textvariable=self.detail, style="Sub.TLabel")
+        detail_lbl.pack(anchor="w", pady=(3, 6))
+
+        bottom_row = ttk.Frame(box)
+        bottom_row.pack(fill="x", pady=(2, 0))
+        self.open_button = ttk.Button(bottom_row, text="打开导出文件夹", command=self.open_folder)
+        self.open_button.pack(side="left")
+        footer_lbl = ttk.Label(bottom_row, text="B 站转码后仍需检查 HDR 档位；不同屏幕和平台的显示可能存在差异。本工具离线处理，不会自动上传或发布。", style="Sub.TLabel")
+        footer_lbl.pack(side="left", padx=(14, 0))
+        self.footer_label = footer_lbl
+
+        self._wrap_labels = [info_lbl, enc_status_lbl, enc_note_lbl, audio_hint_lbl, status_lbl, detail_lbl]
+
+        initial_wrap = max(560, init_w - 52)
+        self._last_wrap = initial_wrap
+        for lbl in self._wrap_labels:
+            lbl.configure(wraplength=initial_wrap)
+        self.footer_label.configure(wraplength=max(400, init_w - 200))
+
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(100, self.poll)
         self.update_encoding_note()
         self.detect_encoders_async()
+
+        viewport.itemconfigure(window_id, width=init_w)
+        root.update_idletasks()
+        req_h = box.winfo_reqheight()
+        headroom = int(round(68 * dpi_scale))
+        init_h = min(max(int(round(520 * dpi_scale)), req_h + headroom), max(480, screen_h - 90))
+        root.geometry(f"{init_w}x{init_h}")
+
+        box.bind("<Configure>", self.sync_layout)
+        viewport.bind("<Configure>", self.sync_layout)
+        self.sync_layout()
+
         if len(sys.argv) > 1 and Path(sys.argv[1]).is_file():
             root.after(200, lambda: self.set_input(sys.argv[1]))
+
+    def sync_layout(self, _event=None):
+        vw = self.viewport.winfo_width()
+        vh = self.viewport.winfo_height()
+        if vw > 1:
+            self.viewport.itemconfigure(self._window_id, width=vw)
+            wrap = max(560, vw - 52)
+            if abs(wrap - self._last_wrap) >= 4:
+                self._last_wrap = wrap
+                for lbl in self._wrap_labels:
+                    lbl.configure(wraplength=wrap)
+                self.footer_label.configure(wraplength=max(400, vw - 220))
+        content_h = self.box.winfo_reqheight()
+        self.viewport.configure(scrollregion=(0, 0, max(1, vw), content_h))
+        need_scroll = vh > 1 and content_h > vh + 2
+        if need_scroll != self._scrollbar_visible:
+            if need_scroll:
+                self.scrollbar.pack(side="right", fill="y", before=self.viewport)
+                self._scrollbar_visible = True
+            else:
+                self.scrollbar.pack_forget()
+                self.viewport.yview_moveto(0.0)
+                self._scrollbar_visible = False
 
     def detect_encoders_async(self):
         def probe_worker():
@@ -217,11 +339,11 @@ class App:
         self.update_multipass_state()
 
     def path_row(self, parent, title, var, command, label):
-        ttk.Label(parent, text=title).pack(anchor="w", pady=(0, 6))
         row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(0, 8))
+        row.pack(fill="x", pady=(0, 6))
+        ttk.Label(row, text=title, width=8).pack(side="left")
         entry = ttk.Entry(row, textvariable=var)
-        entry.pack(side="left", fill="x", expand=True)
+        entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
         button = ttk.Button(row, text=label, command=command)
         button.pack(side="right", padx=(9, 0))
         self.controls += [entry, button]
@@ -303,9 +425,13 @@ class App:
                        audio_effect=audio_effect, encoder=encoder, hdr_style=hdr_style,
                        multipass=bool(self.multipass.get()))
         self.running = True
+        self.job_started = time.monotonic()
+        self.last_progress_info = None
+        self._last_clock_tick = -1
         self.cancel.clear()
         self.keep_partial.clear()
         self.progress.set(0)
+        self.percent_text.set("0.0%")
         self.status.set("正在准备…")
         self.detail.set("转换速度取决于视频尺寸与所选显卡/处理器；原片保持不变。")
         self.set_busy(True)
@@ -365,7 +491,7 @@ class App:
             return
         self.keep_partial.set()
         self.save_partial_button.configure(state="disabled")
-        self.status.set("正在正常封包并保存已转换的 MP4 片段（请稍候）…")
+        self.status.set("正在正常封包并保存已转换的 MP4 片段（请勿强行关闭）…")
 
     def poll(self):
         try:
@@ -431,28 +557,69 @@ class App:
                 elif stage == "stopping":
                     self.save_partial_button.configure(state="disabled")
                     self.status.set(p["message"])
+                    self.last_progress_info = dict(stage="stopping")
                 elif stage in ("encoding", "verifying", "done"):
-                    self.progress.set(p.get("percent", 0))
+                    pct = float(p.get("percent", 0) or 0)
+                    pct = max(0.0, min(100.0, pct))
+                    self.progress.set(pct)
+                    self.percent_text.set(
+                        "已保留" if (stage == "done" and p.get("partial")) else f"{pct:.1f}%"
+                    )
                     self.status.set(p["message"])
-                    if p.get("plan") and p["plan"].get("encoder_note"):
-                        self.detail.set(p["plan"]["encoder_note"])
-                    if "seconds" in p:
-                        timing = (f"已处理 {p['seconds']:.1f} / {p['total']:.1f} 秒" if p.get("total") else
-                                  f"已处理 {p['seconds']:.1f} 秒（原片时长未提供）")
-                        self.detail.set(timing + (f"    {p['speed']}" if p.get("speed") else ""))
+                    live_elapsed = p.get("elapsed")
+                    if live_elapsed is None and self.job_started is not None:
+                        live_elapsed = max(0.0, time.monotonic() - self.job_started)
+                    if stage == "verifying":
+                        self.last_progress_info = dict(stage="verifying")
+                        if live_elapsed is not None:
+                            self.detail.set(f"已用 {format_duration_clock(live_elapsed)}  ·  正在校验导出文件…")
+                    elif stage == "done":
+                        self.last_progress_info = dict(stage="done")
+                    else:
+                        if p.get("plan") and p["plan"].get("encoder_note") and "seconds" not in p:
+                            self.detail.set(p["plan"]["encoder_note"])
+                        if "seconds" in p:
+                            sec = float(p["seconds"])
+                            tot = float(p.get("total") or 0)
+                            spd = p.get("speed") or ""
+                            eta = p.get("eta_seconds")
+                            if eta is None and live_elapsed is not None:
+                                eta = estimate_eta_seconds(sec, tot, live_elapsed, spd)
+                            self.last_progress_info = dict(
+                                stage="encoding",
+                                seconds=sec,
+                                total=tot,
+                                speed=spd,
+                            )
+                            self.detail.set(format_progress_detail(sec, tot, spd, live_elapsed, eta))
                 elif stage in ("finished", "cancelled", "error"):
+                    total_elapsed = None
+                    if stage == "finished":
+                        total_elapsed = p["result"].get("elapsed_seconds")
+                    if total_elapsed is None and self.job_started is not None:
+                        total_elapsed = max(0.0, time.monotonic() - self.job_started)
                     self.running = False
+                    self.job_started = None
+                    self.last_progress_info = None
+                    self._last_clock_tick = -1
                     self.set_busy(False)
                     if stage == "finished":
                         self.last_output = p["result"]["output"]
                         encoder_label = p["result"].get("plan", {}).get("encoder_label")
-                        if p["result"].get("partial"):
+                        is_partial = bool(p["result"].get("partial"))
+                        self.progress.set(100.0)
+                        self.percent_text.set("已保留" if is_partial else "100.0%")
+                        if is_partial:
                             prefix = f"已停止并保留片段（{encoder_label}）" if encoder_label else "已停止并保留片段"
                             self.status.set(f"{prefix}：可正常播放，HDR10 检查均通过。")
                         else:
                             done_prefix = f"已完成（{encoder_label}）" if encoder_label else "已完成"
                             self.status.set(f"{done_prefix}：HDR 视频和文件检查均通过。")
-                        self.detail.set(self.last_output)
+                        elapsed_prefix = (
+                            f"总耗时 {format_duration_clock(total_elapsed)}  ·  "
+                            if total_elapsed is not None else ""
+                        )
+                        self.detail.set(elapsed_prefix + self.last_output)
                     else:
                         self.status.set("已取消。" if stage == "cancelled" else "转换未完成。")
                         self.detail.set(p["message"][:500])
@@ -460,6 +627,26 @@ class App:
                             messagebox.showerror("转换未完成", p["message"])
         except queue.Empty:
             pass
+        if self.running and self.job_started is not None:
+            live_elapsed = max(0.0, time.monotonic() - self.job_started)
+            whole_sec = int(live_elapsed)
+            if whole_sec != self._last_clock_tick:
+                self._last_clock_tick = whole_sec
+                info = self.last_progress_info
+                if info and info.get("stage") == "encoding":
+                    eta = estimate_eta_seconds(
+                        info["seconds"], info["total"], live_elapsed, info.get("speed")
+                    )
+                    self.detail.set(
+                        format_progress_detail(
+                            info["seconds"], info["total"], info.get("speed", ""),
+                            live_elapsed, eta,
+                        )
+                    )
+                elif info and info.get("stage") == "verifying":
+                    self.detail.set(f"已用 {format_duration_clock(live_elapsed)}  ·  正在校验导出文件…")
+                elif info and info.get("stage") == "stopping":
+                    self.detail.set(f"已用 {format_duration_clock(live_elapsed)}  ·  正在封包保存已转换片段…")
         self.root.after(120, self.poll)
 
     def open_folder(self):

@@ -28,7 +28,7 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128
@@ -172,6 +172,62 @@ def progress_seconds(fields: dict, previous=0.0) -> float:
                     and remainder is not None and 0 <= remainder < 60):
                 seconds = (hours * 3600 + minutes * 60 + remainder) * (-1 if clock.startswith("-") else 1)
     return max(0.0, previous, seconds if seconds is not None else previous)
+
+
+def format_duration_clock(seconds: float | None) -> str:
+    """Format a non-negative duration in seconds as MM:SS or H:MM:SS."""
+    number = _finite_number(seconds)
+    if number is None or number < 0:
+        return "--:--"
+    total_secs = max(0, int(round(number)))
+    hours, rem = divmod(total_secs, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def parse_speed_factor(speed: str | float | int | None) -> float | None:
+    """Parse an FFmpeg speed indicator (e.g. '2.67x') into a positive float."""
+    if isinstance(speed, bool) or speed is None:
+        return None
+    raw = str(speed).strip() if not isinstance(speed, (int, float)) else speed
+    if isinstance(raw, str):
+        if raw.lower().endswith("x"):
+            raw = raw[:-1].strip()
+        if not raw:
+            return None
+    number = _finite_number(raw)
+    if number is None or number <= 0:
+        return None
+    return number
+
+
+def estimate_eta_seconds(seconds: float, total: float, elapsed: float,
+                         speed: str | float | None = None) -> float | None:
+    """Estimate remaining transcoding seconds by blending average rate and speed."""
+    sec_num = _finite_number(seconds)
+    tot_num = _finite_number(total)
+    el_num = _finite_number(elapsed)
+    if tot_num is None or tot_num <= 0 or sec_num is None or sec_num < 0:
+        return None
+    remaining = max(0.0, tot_num - sec_num)
+    if remaining == 0.0 and sec_num >= tot_num:
+        return 0.0
+    avg_rate = (sec_num / el_num) if (sec_num > 0.05 and el_num is not None and el_num > 0.25) else None
+    inst_rate = parse_speed_factor(speed)
+    if avg_rate is not None and inst_rate is not None:
+        rate = 0.6 * avg_rate + 0.4 * inst_rate
+    elif avg_rate is not None:
+        rate = avg_rate
+    else:
+        rate = inst_rate
+    if rate is None or not math.isfinite(rate) or rate <= 1e-6:
+        return None
+    eta = remaining / rate
+    if not math.isfinite(eta):
+        return None
+    return max(0.0, eta)
 
 
 def pq_encode(nits: float) -> float:
@@ -1774,6 +1830,7 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                         if keep_partial.is_set() and not keep_partial_triggered:
                             keep_partial_triggered = True
                             callback(dict(stage="stopping", percent=last_percent,
+                                          elapsed=round(max(0.0, time.monotonic() - started), 2),
                                           message="正在正常封包并保存已转换的 MP4 片段（请勿强行关闭）…"))
                             try:
                                 if process.stdin:
@@ -1792,16 +1849,20 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                     if key == "progress":
                         seconds = progress_seconds(progress, last_seconds)
                         last_seconds = seconds
-                        last_percent = max(last_percent, min(98, seconds / total * 98) if total else 0)
+                        last_percent = max(last_percent, min(99.0, seconds / total * 100.0) if total else 0.0)
                         speed = progress.get("speed", "")
                         if speed.strip().lower() in ("n/a", "nan", "inf", "-inf"):
                             speed = ""
                         frame = progress.get("frame", "")
                         if _finite_number(frame) is None:
                             frame = ""
+                        elapsed = max(0.0, time.monotonic() - started)
+                        eta_seconds = estimate_eta_seconds(seconds, total, elapsed, speed)
                         if not keep_partial_triggered:
                             callback(dict(stage="encoding", percent=last_percent,
                                           seconds=seconds, total=total, speed=speed,
+                                          elapsed=round(elapsed, 2),
+                                          eta_seconds=round(eta_seconds, 2) if eta_seconds is not None else None,
                                           frame=frame, message=encoding_message))
                 returncode = process.wait()
                 watcher.join(timeout=1)
@@ -1813,7 +1874,9 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
             if keep_partial_triggered:
                 if not temporary.is_file() or temporary.stat().st_size == 0:
                     raise Cancelled("已停止转换，当前尚无可保存的完整视频片段，原片保留。")
-                callback(dict(stage="verifying", percent=99, message="正在检查已转片段的 HDR、色深和编码标记…"))
+                callback(dict(stage="verifying", percent=99,
+                              elapsed=round(max(0.0, time.monotonic() - started), 2),
+                              message="正在检查已转片段的 HDR、色深和编码标记…"))
                 partial_plan = {**plan, "expected_video_duration": None, "require_nonzero_duration": True}
                 try:
                     validation = validate_export(temporary, partial_plan)
@@ -1824,7 +1887,9 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
             else:
                 if returncode:
                     raise ConversionError("转换失败：\n" + tail[-5000:])
-                callback(dict(stage="verifying", percent=99, message="正在检查 HDR、色深和编码标记…"))
+                callback(dict(stage="verifying", percent=99,
+                              elapsed=round(max(0.0, time.monotonic() - started), 2),
+                              message="正在检查 HDR、色深和编码标记…"))
                 validation = validate_export(temporary, plan)
                 if plan["lossless_video"]:
                     validation["lossless_pixels"] = verify_lossless(opts, plan, temporary, cache_path, cancel, callback)
@@ -1915,7 +1980,9 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 pass  # A valid finished video must not be reported as failed over an optional log.
             done_msg = ("已停止并保留已转换的 HDR 视频片段（已通过文件检查）。"
                         if is_partial else "HDR 视频已导出并通过文件检查。")
-            callback(dict(stage="done", percent=100, partial=is_partial, message=done_msg, result=result))
+            callback(dict(stage="done", percent=100, partial=is_partial,
+                          elapsed=result["elapsed_seconds"],
+                          message=done_msg, result=result))
             return result
         finally:
             if process and process.poll() is None:

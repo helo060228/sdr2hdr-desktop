@@ -1076,6 +1076,69 @@ class ConversionTests(unittest.TestCase):
         self.assertTrue(report["partial"])
         self.assertEqual(report["output"], str(partial_path))
 
+    def test_progress_clock_eta_and_gui_detail_formatting(self):
+        import app as gui_app
+
+        self.assertEqual(core.format_duration_clock(None), "--:--")
+        self.assertEqual(core.format_duration_clock(-1), "--:--")
+        self.assertEqual(core.format_duration_clock(float("nan")), "--:--")
+        self.assertEqual(core.format_duration_clock(0), "00:00")
+        self.assertEqual(core.format_duration_clock(59.4), "00:59")
+        self.assertEqual(core.format_duration_clock(60), "01:00")
+        self.assertEqual(core.format_duration_clock(3661), "1:01:01")
+        self.assertEqual(core.format_duration_clock(7120.3), "1:58:40")
+
+        self.assertAlmostEqual(core.parse_speed_factor("2.67x"), 2.67, places=5)
+        self.assertAlmostEqual(core.parse_speed_factor(" 0.95X "), 0.95, places=5)
+        self.assertAlmostEqual(core.parse_speed_factor(4.2), 4.2, places=5)
+        for bad in ("N/A", "", None, 0, -1.5, True, "nanx"):
+            self.assertIsNone(core.parse_speed_factor(bad))
+
+        # Both average elapsed rate (20/10=2.0) and instantaneous speed (2.5x) blend: 0.6*2.0 + 0.4*2.5 = 2.2
+        eta_blend = core.estimate_eta_seconds(20.0, 130.0, 10.0, "2.5x")
+        self.assertAlmostEqual(eta_blend, 110.0 / 2.2, places=4)
+        # Early tick falls back to instantaneous speed when elapsed <= 0.25s.
+        eta_inst = core.estimate_eta_seconds(0.5, 100.5, 0.1, "4.0x")
+        self.assertAlmostEqual(eta_inst, 25.0, places=4)
+        # Missing speed still computes from elapsed average rate.
+        eta_avg = core.estimate_eta_seconds(50.0, 150.0, 20.0, "N/A")
+        self.assertAlmostEqual(eta_avg, 40.0, places=4)
+        self.assertEqual(core.estimate_eta_seconds(100.0, 100.0, 25.0, "4.0x"), 0.0)
+        self.assertIsNone(core.estimate_eta_seconds(10.0, 0.0, 5.0, "2.0x"))
+
+        detail_known = gui_app.format_progress_detail(5861.8, 7120.3, "2.67x", 2195, 471)
+        self.assertIn("已处理 5861.8 / 7120.3 秒", detail_known)
+        self.assertIn("2.67x", detail_known)
+        self.assertIn("已用 36:35", detail_known)
+        self.assertIn("预计剩余 07:51", detail_known)
+
+        detail_wait = gui_app.format_progress_detail(1.0, 120.0, "", 0.2, None)
+        self.assertIn("预计剩余 计算中…", detail_wait)
+
+        detail_unknown_total = gui_app.format_progress_detail(12.3, 0.0, "1.5x", 8.2, None)
+        self.assertIn("原片时长未提供", detail_unknown_total)
+        self.assertIn("已用 00:08", detail_unknown_total)
+        self.assertNotIn("预计剩余", detail_unknown_total)
+
+        # Verify real convert() progress events include elapsed, eta_seconds, and percentage in [0, 100].
+        source = self.make_source(width=256, height=144, name="计时事件.mkv")
+        out = self.dir / "计时事件_HDR.mp4"
+        events = []
+        core.convert(core.Options(str(source), str(out), quality="fast", encoder="cpu"), callback=events.append)
+        enc_updates = [e for e in events if e.get("stage") == "encoding" and "seconds" in e]
+        self.assertTrue(enc_updates)
+        for ev in enc_updates:
+            self.assertIn("elapsed", ev)
+            self.assertGreaterEqual(ev["elapsed"], 0.0)
+            self.assertIn("eta_seconds", ev)
+            if ev["eta_seconds"] is not None:
+                self.assertGreaterEqual(ev["eta_seconds"], 0.0)
+            self.assertGreaterEqual(ev["percent"], 0.0)
+            self.assertLessEqual(ev["percent"], 100.0)
+        done_events = [e for e in events if e.get("stage") == "done"]
+        self.assertEqual(len(done_events), 1)
+        self.assertIn("elapsed", done_events[0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
