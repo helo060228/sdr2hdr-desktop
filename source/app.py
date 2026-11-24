@@ -17,6 +17,7 @@ from hdr_core import (
     HARDWARE_PRIORITY,
     Options,
     VERSION,
+    check_container_compatibility,
     convert,
     detect_dv_tools,
     detect_encoders,
@@ -70,6 +71,40 @@ def format_progress_detail(seconds: float, total: float, speed: str = "",
         else:
             parts.append("预计剩余 计算中…")
     return "  ·  ".join(parts)
+
+
+def format_track_summary(audio_tracks: list[dict], selected_audio: list[int] | None,
+                         subtitle_tracks: list[dict], selected_subs: list[int] | None,
+                         audio_effect: str = "original") -> str:
+    """Build a concise 1-line summary of selected audio & embedded subtitle tracks."""
+    if not audio_tracks:
+        audio_part = "无音轨"
+    else:
+        sel_a = audio_tracks if selected_audio is None else [t for t in audio_tracks if t["stream_index"] in set(selected_audio)]
+        if audio_effect == "surround":
+            if sel_a:
+                audio_part = f"音轨 {sel_a[0]['channel_label']} {sel_a[0]['codec']} → 双声道环绕"
+            else:
+                audio_part = f"音轨 0/{len(audio_tracks)}（环绕需至少勾选 1 条）"
+        elif len(sel_a) == len(audio_tracks):
+            audio_part = f"音轨 全部保留（{len(audio_tracks)} 条）"
+        elif len(sel_a) == 0:
+            audio_part = f"音轨 0/{len(audio_tracks)}（不保留音频）"
+        else:
+            audio_part = f"音轨 已选 {len(sel_a)}/{len(audio_tracks)} 条"
+
+    if not subtitle_tracks:
+        sub_part = "无内嵌字幕"
+    else:
+        sel_s = subtitle_tracks if selected_subs is None else [t for t in subtitle_tracks if t["stream_index"] in set(selected_subs)]
+        if len(sel_s) == len(subtitle_tracks):
+            sub_part = f"内嵌字幕 全部保留（{len(subtitle_tracks)} 条）"
+        elif len(sel_s) == 0:
+            sub_part = f"内嵌字幕 0/{len(subtitle_tracks)}（不保留）"
+        else:
+            sub_part = f"内嵌字幕 已选 {len(sel_s)}/{len(subtitle_tracks)} 条"
+
+    return f"{audio_part}  ·  {sub_part}"
 
 
 def compute_responsive_layout(vw: int, vh: int, content_h: int,
@@ -169,6 +204,12 @@ class App:
         self.gpu_filter_caps = None
         self.input_kind = "sdr"
         self.input_dv = None
+        self.input_info = None
+        self.audio_tracks_meta = []
+        self.subtitle_tracks_meta = []
+        self.selected_audio_indices = None
+        self.selected_subtitle_indices = None
+        self.track_summary = tk.StringVar(value="选择视频后可勾选保留音轨与内嵌字幕")
         self.status = tk.StringVar(value="选择 SDR、杜比视界或 HDR 视频开始处理。")
         self.info = tk.StringVar(value="支持 MP4、MOV、MKV 等本地视频；自动识别 SDR 与杜比视界 Profile 5 / 7 / 8.1 / 8.4。")
         self.encoder_status = tk.StringVar(value="正在检测显卡硬件加速与杜比视界组件…")
@@ -291,15 +332,25 @@ class App:
         self.controls += [c1, c_style, c2, c3, c4, c_mp]
         self._font_inputs += [c1, c_style, c2, c3, c4]
 
+        track_row = ttk.Frame(box)
+        track_row.pack(fill="x", pady=(6, 4))
+        ttk.Label(track_row, text="轨道保留", width=8).pack(side="left")
+        track_summary_lbl = ttk.Label(track_row, textvariable=self.track_summary, style="Sub.TLabel")
+        track_summary_lbl.pack(side="left", fill="x", expand=True, padx=(8, 10))
+        self.tracks_button = ttk.Button(track_row, text="勾选音轨 / 字幕…", command=self.open_track_selector, state="disabled")
+        self.tracks_button.pack(side="right")
+        self.track_summary_label = track_summary_lbl
+
         self.encoding_note = tk.StringVar()
         enc_status_lbl = ttk.Label(box, textvariable=self.encoder_status, style="Sub.TLabel")
-        enc_status_lbl.pack(anchor="w", pady=(4, 2))
+        enc_status_lbl.pack(anchor="w", pady=(2, 2))
         enc_note_lbl = ttk.Label(box, textvariable=self.encoding_note, style="Sub.TLabel")
         enc_note_lbl.pack(anchor="w", pady=(0, 2))
         c_style.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         c2.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         c3.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
-        audio_hint_lbl = ttk.Label(box, text="原声模式无损直拷原多声道音轨（5.1/7.1/Atmos 等，支持 MP4/MKV）；虚拟环绕输出双声道；HDR 画面不重复增强。", style="Sub.TLabel")
+        c4.bind("<<ComboboxSelected>>", lambda e: self.update_track_summary())
+        audio_hint_lbl = ttk.Label(box, text="同封装默认导出（MKV→MKV / MP4→MP4）；原声模式支持勾选多声道音轨与内嵌字幕无损直拷；HDR 画面不重复增强。", style="Sub.TLabel")
         audio_hint_lbl.pack(anchor="w", pady=(0, 4))
 
         div_bottom = tk.Frame(box, bg=DIVIDER_BG, height=1)
@@ -556,11 +607,140 @@ class App:
             count += 1
         return str(dest)
 
+    def update_track_summary(self):
+        if self.input_info is None:
+            self.tracks_button.configure(state="disabled")
+            return
+        audio_effect = {"原声（保留）": "original", "虚拟环绕（双声道）": "surround"}[self.audio_effect.get()]
+        self.track_summary.set(
+            format_track_summary(
+                self.audio_tracks_meta,
+                self.selected_audio_indices,
+                self.subtitle_tracks_meta,
+                self.selected_subtitle_indices,
+                audio_effect=audio_effect,
+            )
+        )
+        has_tracks = bool(self.audio_tracks_meta or self.subtitle_tracks_meta)
+        self.tracks_button.configure(state="normal" if (not self.running and has_tracks) else "disabled")
+
+    def open_track_selector(self):
+        if self.running or not (self.audio_tracks_meta or self.subtitle_tracks_meta):
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("勾选保留的音轨与内嵌字幕")
+        dlg.configure(bg=BACKDROP_BG)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        w = int(round(620 * self.dpi_scale))
+        h = int(round(460 * self.dpi_scale))
+        x = self.root.winfo_rootx() + max(20, (self.root.winfo_width() - w) // 2)
+        y = self.root.winfo_rooty() + max(20, (self.root.winfo_height() - h) // 2)
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        dlg.minsize(int(round(500 * self.dpi_scale)), int(round(360 * self.dpi_scale)))
+
+        outer = tk.Frame(dlg, bg=CARD_BORDER, padx=1, pady=1)
+        outer.pack(fill="both", expand=True, padx=14, pady=14)
+        card = ttk.Frame(outer, style="Card.TFrame", padding=(18, 14, 18, 14))
+        card.pack(fill="both", expand=True)
+
+        ttk.Label(card, text="勾选需要保留的音轨与内嵌字幕（取消勾选将丢弃）", style="TLabel").pack(anchor="w")
+        audio_effect = {"原声（保留）": "original", "虚拟环绕（双声道）": "surround"}[self.audio_effect.get()]
+        if audio_effect == "surround":
+            ttk.Label(
+                card,
+                text="提示：当前为“虚拟环绕（双声道）”模式，将仅对勾选的第一条音轨进行双声道环绕处理。",
+                style="Sub.TLabel",
+            ).pack(anchor="w", pady=(3, 0))
+
+        scroll_wrap = ttk.Frame(card)
+        scroll_wrap.pack(fill="both", expand=True, pady=(10, 10))
+        canvas = tk.Canvas(scroll_wrap, bg=CARD_BG, highlightthickness=0)
+        sb = ttk.Scrollbar(scroll_wrap, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, style="Card.TFrame")
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb_visible = [False]
+
+        def sync_dlg(_e=None):
+            cw = canvas.winfo_width()
+            ch = canvas.winfo_height()
+            if cw > 1:
+                canvas.itemconfigure(win_id, width=cw)
+            req_h = inner.winfo_reqheight()
+            canvas.configure(scrollregion=(0, 0, max(1, cw), req_h))
+            need = ch > 1 and req_h > ch + 2
+            if need != sb_visible[0]:
+                if need:
+                    sb.pack(side="right", fill="y", before=canvas)
+                else:
+                    sb.pack_forget()
+                    canvas.yview_moveto(0.0)
+                sb_visible[0] = need
+        inner.bind("<Configure>", sync_dlg)
+        canvas.bind("<Configure>", sync_dlg)
+
+        def on_wheel(event):
+            if sb_visible[0]:
+                canvas.yview_scroll(-int(event.delta / 120), "units")
+        dlg.bind("<MouseWheel>", on_wheel)
+
+        audio_vars = []
+        sub_vars = []
+        sel_a_set = set(self.selected_audio_indices) if self.selected_audio_indices is not None else {t["stream_index"] for t in self.audio_tracks_meta}
+        sel_s_set = set(self.selected_subtitle_indices) if self.selected_subtitle_indices is not None else {t["stream_index"] for t in self.subtitle_tracks_meta}
+
+        def build_section(title_text, tracks, sel_set, store_list, is_sub=False):
+            hdr = ttk.Frame(inner)
+            hdr.pack(fill="x", pady=(6, 4))
+            ttk.Label(hdr, text=title_text, style="Percent.TLabel").pack(side="left")
+            if tracks:
+                ttk.Button(hdr, text="全不选", command=lambda: [v.set(False) for _, v in store_list]).pack(side="right")
+                ttk.Button(hdr, text="全选", command=lambda: [v.set(True) for _, v in store_list]).pack(side="right", padx=(0, 6))
+                for t in tracks:
+                    var = tk.BooleanVar(value=(t["stream_index"] in sel_set))
+                    if is_sub:
+                        tag = "  [MP4/MKV]" if t.get("mp4_supported") else "  [仅 MKV 支持]"
+                    else:
+                        tag = "  [MP4/MKV 直拷]" if t.get("mp4_copyable") else "  [建议 MKV 直拷]"
+                    cb = ttk.Checkbutton(inner, text=t["label"] + tag, variable=var)
+                    cb.pack(anchor="w", padx=(8, 4), pady=2)
+                    store_list.append((t, var))
+            else:
+                ttk.Label(inner, text="（原片未包含此类轨道）", style="Sub.TLabel").pack(anchor="w", padx=(8, 4), pady=(0, 4))
+
+        build_section(f"音轨（共 {len(self.audio_tracks_meta)} 条）", self.audio_tracks_meta, sel_a_set, audio_vars, is_sub=False)
+        tk.Frame(inner, bg=DIVIDER_BG, height=1).pack(fill="x", pady=(10, 6))
+        build_section(f"内嵌字幕（共 {len(self.subtitle_tracks_meta)} 条）", self.subtitle_tracks_meta, sel_s_set, sub_vars, is_sub=True)
+
+        btns = ttk.Frame(card)
+        btns.pack(fill="x", pady=(4, 0))
+
+        def confirm():
+            self.selected_audio_indices = [t["stream_index"] for t, v in audio_vars if v.get()]
+            self.selected_subtitle_indices = [t["stream_index"] for t, v in sub_vars if v.get()]
+            self.update_track_summary()
+            dlg.destroy()
+
+        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="right")
+        ttk.Button(btns, text="确定", style="Main.TButton", command=confirm).pack(side="right", padx=(0, 8))
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.wait_window()
+
     def set_input(self, path):
         self.input.set(path)
         source = Path(path)
-        initial_output = self._next_output_path(source, "_HDR.mp4")
+        default_ext = ".mkv" if source.suffix.lower() == ".mkv" else ".mp4"
+        initial_output = self._next_output_path(source, f"_HDR{default_ext}")
         self.output.set(initial_output)
+        self.input_info = None
+        self.audio_tracks_meta = []
+        self.subtitle_tracks_meta = []
+        self.selected_audio_indices = None
+        self.selected_subtitle_indices = None
+        self.track_summary.set("正在读取音轨与内嵌字幕…")
+        self.tracks_button.configure(state="disabled")
         self.info.set("正在读取视频信息…")
         def read():
             try:
@@ -569,6 +749,9 @@ class App:
                 p = inspected["properties"]
                 dv = inspected["dv"]
                 audio = inspected.get("audio") or {}
+                audio_tracks = inspected.get("audio_tracks") or []
+                subtitle_tracks = inspected.get("subtitle_tracks") or []
+                default_container = inspected.get("default_container") or ("mkv" if source.suffix.lower() == ".mkv" else "mp4")
                 duration_label = f"{p['duration']:.1f} 秒" if p["duration"] else "时长未提供"
                 if audio.get("count"):
                     ch_info = audio.get("primary_label") or "音频"
@@ -578,8 +761,8 @@ class App:
                     )
                 else:
                     audio_tag = "  ·  无音轨"
-                prefer_mkv = source.suffix.lower() == ".mkv" and bool(audio.get("needs_mkv_for_lossless_audio"))
-                base = f"{p['width']} × {p['height']}  ·  {p['fps']:g} 帧/秒  ·  {duration_label}{audio_tag}  ·  "
+                sub_tag = f"  ·  {len(subtitle_tracks)} 条字幕" if subtitle_tracks else ""
+                base = f"{p['width']} × {p['height']}  ·  {p['fps']:g} 帧/秒  ·  {duration_label}{audio_tag}{sub_tag}  ·  "
                 if kind == "dv_strip":
                     msg = base + f"杜比视界 {dv['profile_label']} → 秒级无损直剥 HDR10"
                     if dv.get("dv_profile") == 7:
@@ -594,21 +777,32 @@ class App:
                     msg = base + "SDR → HDR10"
                     if p["guessed"]:
                         msg += "\n" + "；".join(p["guessed"])
-                if prefer_mkv and kind != "hdr10":
-                    msg += "\n说明：原片包含 MP4 不支持直拷的音轨，已默认设为 .mkv 以无损保留原多声道音轨（可在“保存到…”改选 MP4）。"
-                self.queue.put(dict(stage="input", path=path, message=msg, kind=kind, dv=dv,
-                                    prefer_mkv=prefer_mkv, initial_output=initial_output))
+                self.queue.put(dict(
+                    stage="input",
+                    path=path,
+                    message=msg,
+                    kind=kind,
+                    dv=dv,
+                    info=inspected.get("info"),
+                    audio_tracks=audio_tracks,
+                    subtitle_tracks=subtitle_tracks,
+                    default_container=default_container,
+                    initial_output=initial_output,
+                ))
             except Exception as e:
-                self.queue.put(dict(stage="input", path=path, message=str(e), kind="sdr", dv=None, prefer_mkv=False))
+                self.queue.put(dict(
+                    stage="input", path=path, message=str(e), kind="sdr", dv=None,
+                    info=None, audio_tracks=[], subtitle_tracks=[], default_container="mp4",
+                ))
         threading.Thread(target=read, daemon=True).start()
 
     def pick_output(self):
         current = Path(self.output.get() or "output_HDR.mp4")
         default_ext = current.suffix.lower() if current.suffix.lower() in (".mp4", ".mkv") else ".mp4"
         filetypes = (
-            [("MKV 视频 (*.mkv，完整保留 TrueHD/DTS-HD 等多声道)", "*.mkv"), ("MP4 视频 (*.mp4)", "*.mp4")]
+            [("MKV 视频 (*.mkv，完整保留 TrueHD/DTS-HD 与蓝光字幕)", "*.mkv"), ("MP4 视频 (*.mp4)", "*.mp4")]
             if default_ext == ".mkv" else
-            [("MP4 视频 (*.mp4)", "*.mp4"), ("MKV 视频 (*.mkv，完整保留 TrueHD/DTS-HD 等多声道)", "*.mkv")]
+            [("MP4 视频 (*.mp4)", "*.mp4"), ("MKV 视频 (*.mkv，完整保留 TrueHD/DTS-HD 与蓝光字幕)", "*.mkv")]
         )
         p = filedialog.asksaveasfilename(title="保存 HDR 副本", defaultextension=default_ext, initialfile=current.name,
                                        filetypes=filetypes, confirmoverwrite=False)
@@ -623,6 +817,44 @@ class App:
         if not source or not output:
             messagebox.showinfo("选择视频", "请先选择输入视频和导出位置。")
             return
+        resolution = {"保持原尺寸": "original", "2K · 短边 1440": "1440", "4K · 短边 2160": "2160"}[self.resolution.get()]
+        hdr_style = STYLE_LABELS[self.hdr_style.get()]
+        quality = {"快速试转": "fast", "标准画质": "standard", "精细画质": "fine", "画面无损编码": "lossless"}[self.quality.get()]
+        encoder = ENCODER_LABELS[self.encoder.get()]
+        audio_effect = {"原声（保留）": "original", "虚拟环绕（双声道）": "surround"}[self.audio_effect.get()]
+
+        sel_audio = list(self.selected_audio_indices) if self.selected_audio_indices is not None else None
+        sel_subs = list(self.selected_subtitle_indices) if self.selected_subtitle_indices is not None else None
+        if audio_effect == "surround" and sel_audio is not None and len(sel_audio) == 0 and self.audio_tracks_meta:
+            messagebox.showinfo("未勾选音轨", "虚拟环绕模式需要至少勾选 1 条音轨，请点击“勾选音轨 / 字幕…”重新勾选。")
+            return
+
+        if Path(output).suffix.lower() == ".mp4" and self.input_info is not None:
+            compat = check_container_compatibility(
+                self.input_info,
+                "mp4",
+                audio_effect=audio_effect,
+                audio_streams=sel_audio,
+                subtitle_streams=sel_subs,
+            )
+            if compat["needs_warning"]:
+                choice = messagebox.askyesnocancel(
+                    "MP4 封装兼容提示",
+                    compat["warning_message"]
+                    + "\n\n• 点击「是」：自动改存为 .mkv（无损直拷原音轨与字幕，推荐）"
+                    + "\n• 点击「否」：仍按 .mp4 导出"
+                    + "\n• 点击「取消」：返回修改设置",
+                )
+                if choice is None:
+                    return
+                if choice is True:
+                    mkv_dest = Path(output).with_suffix(".mkv")
+                    if mkv_dest.exists():
+                        suffix = "_HDR10.mkv" if self.input_kind in ("dv_strip", "dv_reencode") else "_HDR.mkv"
+                        mkv_dest = Path(self._next_output_path(Path(source), suffix))
+                    output = str(mkv_dest)
+                    self.output.set(output)
+
         if preview:
             p = Path(output)
             ext = p.suffix if p.suffix.lower() in (".mp4", ".mkv") else ".mp4"
@@ -632,14 +864,12 @@ class App:
                 p = Path(output).with_name(f"{Path(output).stem}_10秒试转_{n}{ext}")
                 n += 1
             output = str(p)
-        resolution = {"保持原尺寸": "original", "2K · 短边 1440": "1440", "4K · 短边 2160": "2160"}[self.resolution.get()]
-        hdr_style = STYLE_LABELS[self.hdr_style.get()]
-        quality = {"快速试转": "fast", "标准画质": "standard", "精细画质": "fine", "画面无损编码": "lossless"}[self.quality.get()]
-        encoder = ENCODER_LABELS[self.encoder.get()]
-        audio_effect = {"原声（保留）": "original", "虚拟环绕（双声道）": "surround"}[self.audio_effect.get()]
+
         opts = Options(source, output, resolution=resolution, quality=quality, duration=10 if preview else None,
                        audio_effect=audio_effect, encoder=encoder, hdr_style=hdr_style,
-                       multipass=bool(self.multipass.get()))
+                       multipass=bool(self.multipass.get()),
+                       audio_streams=sel_audio,
+                       subtitle_streams=sel_subs)
         self.running = True
         self.job_started = time.monotonic()
         self.last_progress_info = None
@@ -695,6 +925,9 @@ class App:
                 self.encoder_combo.configure(state="disabled")
             if self.input_kind != "sdr":
                 self.style_combo.configure(state="disabled")
+        self.tracks_button.configure(
+            state="normal" if (not busy and bool(self.audio_tracks_meta or self.subtitle_tracks_meta)) else "disabled"
+        )
         self.update_multipass_state()
 
     def stop(self):
@@ -719,17 +952,20 @@ class App:
                         self.info.set(p["message"])
                         self.input_kind = p.get("kind", "sdr")
                         self.input_dv = p.get("dv")
+                        self.input_info = p.get("info")
+                        self.audio_tracks_meta = list(p.get("audio_tracks") or [])
+                        self.subtitle_tracks_meta = list(p.get("subtitle_tracks") or [])
+                        self.selected_audio_indices = [t["stream_index"] for t in self.audio_tracks_meta]
+                        self.selected_subtitle_indices = [t["stream_index"] for t in self.subtitle_tracks_meta]
                         if self.input_kind in ("hdr10", "dv_strip"):
                             self.resolution.set("保持原尺寸")
                         if self.output.get() == p.get("initial_output"):
                             name = Path(p["path"])
-                            ext = ".mkv" if p.get("prefer_mkv") else ".mp4"
+                            ext = ".mkv" if p.get("default_container") == "mkv" else ".mp4"
                             if self.input_kind == "hdr10":
-                                self.output.set(self._next_output_path(name, "_环绕.mp4"))
+                                self.output.set(self._next_output_path(name, f"_环绕{ext}"))
                             elif self.input_kind in ("dv_strip", "dv_reencode"):
                                 self.output.set(self._next_output_path(name, f"_HDR10{ext}"))
-                            elif p.get("prefer_mkv"):
-                                self.output.set(self._next_output_path(name, "_HDR.mkv"))
                         button_text = {
                             "dv_strip": "无损导出 HDR10",
                             "dv_reencode": "导出完整 HDR10",
@@ -737,6 +973,7 @@ class App:
                         }.get(self.input_kind, "导出完整 HDR")
                         self.start_button.configure(text=button_text)
                         self.set_busy(self.running)
+                        self.update_track_summary()
                         self.update_encoding_note()
                 elif stage == "encoders":
                     if "error" in p:

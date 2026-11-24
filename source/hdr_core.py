@@ -28,9 +28,11 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.5.6"
+VERSION = "1.5.7"
 SUPPORTED_OUTPUT_CONTAINERS = (".mp4", ".mkv")
 MP4_COPY_AUDIO_CODECS = frozenset({"aac", "ac3", "eac3", "dts", "flac", "alac", "mp3", "opus"})
+MP4_TEXT_SUBTITLE_CODECS = frozenset({"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"})
+BITMAP_SUBTITLE_CODECS = frozenset({"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub", "pgssub"})
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128
@@ -507,6 +509,20 @@ def _audio_streams(info: dict) -> list[dict]:
     return [s for s in info.get("streams", []) if s.get("codec_type") == "audio"]
 
 
+def _subtitle_streams(info: dict) -> list[dict]:
+    return [s for s in info.get("streams", []) if s.get("codec_type") == "subtitle"]
+
+
+def _stream_lang_and_title(stream: dict) -> tuple[str, str]:
+    tags = stream.get("tags") or {}
+    lower_map = {str(k).lower(): str(v).strip() for k, v in tags.items() if v is not None}
+    lang = lower_map.get("language", "")
+    if lang.lower() in ("und", "unknown", ""):
+        lang = ""
+    title = lower_map.get("title", "")
+    return lang, title
+
+
 def _audio_stream_copyable(stream: dict, container: str) -> bool:
     codec = str(stream.get("codec_name") or "").lower()
     sr = _finite_number(stream.get("sample_rate"))
@@ -516,6 +532,10 @@ def _audio_stream_copyable(stream: dict, container: str) -> bool:
     if container == "mkv":
         return True
     return codec in MP4_COPY_AUDIO_CODECS
+
+
+def _subtitle_codec_mp4_supported(codec_name: str | None) -> bool:
+    return str(codec_name or "").lower() in MP4_TEXT_SUBTITLE_CODECS
 
 
 def _aac_bitrate_for_channels(channels: float | None) -> str:
@@ -535,6 +555,129 @@ def _format_channel_label(channels: float | None, layout: str | None = None) -> 
         if ch > 0:
             return f"{ch}声道"
     return str(layout or "").strip() or "未知声道"
+
+
+def describe_audio_tracks(info: dict) -> list[dict]:
+    """Return UI-friendly metadata descriptors for every audio stream in info."""
+    tracks = []
+    for idx, s in enumerate(_audio_streams(info)):
+        codec_lower = str(s.get("codec_name") or "").lower()
+        codec_upper = codec_lower.upper() or "UNKNOWN"
+        channels = _finite_number(s.get("channels"))
+        ch_int = int(round(channels)) if channels is not None and channels > 0 else 0
+        ch_label = _format_channel_label(channels, s.get("channel_layout"))
+        lang, title = _stream_lang_and_title(s)
+        disp = s.get("disposition") or {}
+        parts = [f"#{idx + 1}"]
+        if lang:
+            parts.append(lang.upper())
+        parts.append(f"{ch_label} {codec_upper}".strip())
+        if title:
+            parts.append(title)
+        if disp.get("default"):
+            parts.append("默认")
+        tracks.append(dict(
+            stream_index=int(s["index"]),
+            track_index=idx,
+            codec=codec_upper,
+            codec_name=codec_lower,
+            channels=ch_int,
+            channel_label=ch_label,
+            language=lang,
+            title=title,
+            default=bool(disp.get("default")),
+            mp4_copyable=_audio_stream_copyable(s, "mp4"),
+            label="  ·  ".join(parts),
+        ))
+    return tracks
+
+
+def describe_subtitle_tracks(info: dict) -> list[dict]:
+    """Return UI-friendly metadata descriptors for every embedded subtitle stream."""
+    tracks = []
+    for idx, s in enumerate(_subtitle_streams(info)):
+        codec_lower = str(s.get("codec_name") or "").lower()
+        codec_upper = codec_lower.upper() or "SUB"
+        lang, title = _stream_lang_and_title(s)
+        disp = s.get("disposition") or {}
+        is_bitmap = codec_lower in BITMAP_SUBTITLE_CODECS
+        mp4_ok = _subtitle_codec_mp4_supported(codec_lower)
+        codec_display = "PGS (图形字幕)" if codec_lower in ("hdmv_pgs_subtitle", "pgssub") else (
+            "VobSub (图形字幕)" if codec_lower == "dvd_subtitle" else codec_upper
+        )
+        parts = [f"#{idx + 1}"]
+        if lang:
+            parts.append(lang.upper())
+        parts.append(codec_display)
+        if title:
+            parts.append(title)
+        if disp.get("forced"):
+            parts.append("强制")
+        elif disp.get("default"):
+            parts.append("默认")
+        tracks.append(dict(
+            stream_index=int(s["index"]),
+            track_index=idx,
+            codec=codec_upper,
+            codec_name=codec_lower,
+            language=lang,
+            title=title,
+            default=bool(disp.get("default")),
+            forced=bool(disp.get("forced")),
+            is_bitmap=is_bitmap,
+            mp4_supported=mp4_ok,
+            label="  ·  ".join(parts),
+        ))
+    return tracks
+
+
+def check_container_compatibility(info: dict, container: str, audio_effect: str = "original",
+                                  audio_streams: list[int] | None = None,
+                                  subtitle_streams: list[int] | None = None) -> dict:
+    """Inspect whether selected audio/subtitle tracks require conversion or skipping in target container."""
+    cont = "mkv" if str(container).lower().lstrip(".") == "mkv" else "mp4"
+    all_audio = describe_audio_tracks(info)
+    all_subs = describe_subtitle_tracks(info)
+    if audio_streams is None:
+        sel_audio = all_audio[:1] if audio_effect == "surround" else all_audio
+    else:
+        wanted_a = set(audio_streams)
+        sel_audio = [t for t in all_audio if t["stream_index"] in wanted_a]
+        if audio_effect == "surround":
+            sel_audio = sel_audio[:1]
+    if subtitle_streams is None:
+        sel_subs = all_subs
+    else:
+        wanted_s = set(subtitle_streams)
+        sel_subs = [t for t in all_subs if t["stream_index"] in wanted_s]
+
+    incompat_audio = []
+    incompat_subs = []
+    if cont == "mp4":
+        if audio_effect == "original":
+            incompat_audio = [t for t in sel_audio if not t["mp4_copyable"]]
+        incompat_subs = [t for t in sel_subs if not t["mp4_supported"]]
+
+    lines = []
+    if incompat_audio:
+        lines.append("以下已选音轨无法在 MP4 中无损直拷，将按原声道数转为高码率 AAC：")
+        for t in incompat_audio:
+            br = _aac_bitrate_for_channels(t["channels"] or None)
+            lines.append(f"  • {t['label']} → {t['channel_label']} AAC ({br})")
+    if incompat_subs:
+        lines.append("以下已选内嵌字幕为图形／非文本格式，MP4 不支持，导出 MP4 时将被跳过：")
+        for t in incompat_subs:
+            lines.append(f"  • {t['label']}")
+    needs_warning = bool(incompat_audio or incompat_subs)
+    if needs_warning:
+        lines.append("\n建议：改存为 .mkv 可 100% 原样无损直拷所有音轨与蓝光字幕。")
+    return dict(
+        container=cont,
+        incompatible_audio=incompat_audio,
+        incompatible_subtitles=incompat_subs,
+        needs_warning=needs_warning,
+        warning_message="\n".join(lines),
+    )
 
 
 def summarize_audio(info: dict) -> dict:
@@ -568,6 +711,9 @@ def inspect_input(path: Path, info: dict | None = None) -> dict:
     """Classify an input file as sdr, dv_strip, dv_reencode, or hdr10."""
     info = info if info is not None else probe(path)
     audio_summary = summarize_audio(info)
+    audio_tracks = describe_audio_tracks(info)
+    subtitle_tracks = describe_subtitle_tracks(info)
+    default_container = "mkv" if path.suffix.lower() == ".mkv" else "mp4"
     dv = detect_dolby_vision(info, path)
     if dv is not None:
         strip = dv["strip_supported"]
@@ -576,6 +722,9 @@ def inspect_input(path: Path, info: dict | None = None) -> dict:
             dv=dv,
             properties=dv_properties(info, dv, strip=strip),
             audio=audio_summary,
+            audio_tracks=audio_tracks,
+            subtitle_tracks=subtitle_tracks,
+            default_container=default_container,
             info=info,
         )
     if is_hdr_video(info):
@@ -584,6 +733,9 @@ def inspect_input(path: Path, info: dict | None = None) -> dict:
             dv=None,
             properties=hdr_copy_properties(info),
             audio=audio_summary,
+            audio_tracks=audio_tracks,
+            subtitle_tracks=subtitle_tracks,
+            default_container=default_container,
             info=info,
         )
     return dict(
@@ -591,6 +743,9 @@ def inspect_input(path: Path, info: dict | None = None) -> dict:
         dv=None,
         properties=source_properties(info),
         audio=audio_summary,
+        audio_tracks=audio_tracks,
+        subtitle_tracks=subtitle_tracks,
+        default_container=default_container,
         info=info,
     )
 
@@ -986,6 +1141,8 @@ class Options:
     hdr_style: str = "balanced"
     gpu_filter: str = "auto"
     multipass: bool = False
+    audio_streams: list[int] | None = None
+    subtitle_streams: list[int] | None = None
 
 
 def clear_encoder_cache() -> None:
@@ -1545,11 +1702,53 @@ def build_command(opts: Options, info: dict, destination: Path,
         ]
     container = "mkv" if destination.suffix.lower() == ".mkv" else "mp4"
     is_mkv = container == "mkv"
-    audio_map = "0:a:0?" if opts.audio_effect == "surround" else "0:a?"
+    all_audio = _audio_streams(info)
+    if opts.audio_streams is None:
+        selected_audio = all_audio
+    else:
+        wanted_a = set(opts.audio_streams)
+        selected_audio = [s for s in all_audio if s["index"] in wanted_a]
+    if opts.audio_effect == "surround":
+        if not selected_audio:
+            raise ConversionError("原片没有音轨（或未勾选音轨），无法添加环绕音效。")
+        active_audio = [selected_audio[0]]
+    else:
+        active_audio = selected_audio
+
+    all_subs = _subtitle_streams(info)
+    if opts.subtitle_streams is None:
+        raw_subs = all_subs
+    else:
+        wanted_s = set(opts.subtitle_streams)
+        raw_subs = [s for s in all_subs if s["index"] in wanted_s]
+    if is_mkv:
+        selected_subs = raw_subs
+        skipped_subs = []
+    else:
+        selected_subs = [s for s in raw_subs if _subtitle_codec_mp4_supported(s.get("codec_name"))]
+        skipped_subs = [s for s in raw_subs if s not in selected_subs]
+
+    copy_attachments = bool(
+        is_mkv
+        and any(str(s.get("codec_name") or "").lower() in ("ass", "ssa") for s in selected_subs)
+        and any(s.get("codec_type") == "attachment" for s in info.get("streams", []))
+    )
+
     args += ["-i", opts.source]
     if opts.duration is not None:
         args += ["-t", str(opts.duration)]
-    args += ["-map", f"0:{p['stream_index']}", "-map", audio_map, "-map_metadata", "-1", "-map_chapters", "-1"]
+    args += ["-map", f"0:{p['stream_index']}"]
+    for s in active_audio:
+        args += ["-map", f"0:{s['index']}"]
+    for s in selected_subs:
+        args += ["-map", f"0:{s['index']}"]
+    if copy_attachments:
+        args += ["-map", "0:t?"]
+    args += ["-map_metadata", "-1", "-map_chapters", "-1"]
+    for out_i, s in enumerate(active_audio):
+        args += [f"-map_metadata:s:a:{out_i}", f"0:s:{s['index']}"]
+    for out_i, s in enumerate(selected_subs):
+        args += [f"-map_metadata:s:s:{out_i}", f"0:s:{s['index']}"]
 
     if video_operation == "copy_hdr":
         args += ["-c:v", "copy"]
@@ -1623,35 +1822,35 @@ def build_command(opts: Options, info: dict, destination: Path,
         if video_operation == "dv_reencode" and tools and tools.get("dovi_rpu"):
             args += ["-bsf:v", "dovi_rpu=strip=1"]
 
-    audio_list = _audio_streams(info)
     audio_tracks = []
     if opts.audio_effect == "surround":
-        if not audio_list:
-            raise ConversionError("原片没有音轨，无法添加环绕音效。")
         args += ["-af", SURROUND_FILTER, "-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-ac", "2"]
         audio_summary = "aac"
-        audio_tracks = [dict(index=0, mode="aac", channels=2, source_codec=audio_list[0].get("codec_name"))]
-        first_dur = _known_duration(audio_list[0].get("duration"), p["duration"])
+        audio_tracks = [dict(index=0, stream_index=active_audio[0]["index"], mode="aac", channels=2,
+                             source_codec=active_audio[0].get("codec_name"))]
+        first_dur = _known_duration(active_audio[0].get("duration"), p["duration"])
         expect_audio = bool(not first_dur or first_dur > opts.start)
-    elif not audio_list:
+    elif not active_audio:
         args += ["-an"]
         audio_summary = "none"
         expect_audio = False
     else:
-        copy_flags = [_audio_stream_copyable(s, container) for s in audio_list]
-        for idx, (s, can_copy) in enumerate(zip(audio_list, copy_flags)):
+        copy_flags = [_audio_stream_copyable(s, container) for s in active_audio]
+        for idx, (s, can_copy) in enumerate(zip(active_audio, copy_flags)):
             ch = _finite_number(s.get("channels"))
             ch_out = int(round(ch)) if ch is not None and ch > 0 else None
             if can_copy:
-                audio_tracks.append(dict(index=idx, mode="copy", channels=ch_out, source_codec=s.get("codec_name")))
+                audio_tracks.append(dict(index=idx, stream_index=s["index"], mode="copy", channels=ch_out,
+                                         source_codec=s.get("codec_name")))
             else:
                 out_ch = min(8, ch_out) if ch_out is not None else None
-                audio_tracks.append(dict(index=idx, mode="aac", channels=out_ch, source_codec=s.get("codec_name")))
+                audio_tracks.append(dict(index=idx, stream_index=s["index"], mode="aac", channels=out_ch,
+                                         source_codec=s.get("codec_name")))
         if all(copy_flags):
             args += ["-c:a", "copy"]
             audio_summary = "copy"
         else:
-            for idx, (s, can_copy) in enumerate(zip(audio_list, copy_flags)):
+            for idx, (s, can_copy) in enumerate(zip(active_audio, copy_flags)):
                 if can_copy:
                     args += [f"-c:a:{idx}", "copy"]
                 else:
@@ -1667,8 +1866,21 @@ def build_command(opts: Options, info: dict, destination: Path,
         expect_audio = any(
             (_known_duration(s.get("duration"), p["duration"]) == 0
              or _known_duration(s.get("duration"), p["duration"]) > opts.start)
-            for s in audio_list
+            for s in active_audio
         )
+
+    if not selected_subs:
+        args += ["-sn"]
+        sub_summary = "none"
+    elif is_mkv:
+        args += ["-c:s", "copy"]
+        sub_summary = "copy"
+    else:
+        args += ["-c:s", "mov_text"]
+        sub_summary = "mov_text"
+    if copy_attachments:
+        args += ["-c:t", "copy"]
+
     if not is_mkv:
         args += ["-movflags", "+faststart+write_colr"]
     args += ["-progress", "pipe:1", "-nostats", str(destination)]
@@ -1691,6 +1903,10 @@ def build_command(opts: Options, info: dict, destination: Path,
                       audio_tracks=audio_tracks,
                       audio_effect=opts.audio_effect,
                       audio_filter=SURROUND_FILTER if opts.audio_effect == "surround" else None,
+                      subtitles=sub_summary,
+                      selected_audio_indices=[s["index"] for s in active_audio],
+                      selected_subtitle_indices=[s["index"] for s in selected_subs],
+                      skipped_subtitle_indices=[s["index"] for s in skipped_subs],
                       video_operation=video_operation,
                       hdr_style=opts.hdr_style if video_operation == "sdr_to_hdr" else None,
                       dolby_vision=dv,
@@ -1704,7 +1920,7 @@ def build_command(opts: Options, info: dict, destination: Path,
                       require_mastering_metadata=bool(dv.get("source_has_mastering", False)) if video_operation == "dv_strip" else True,
                       require_content_light_metadata=bool(dv.get("source_has_content_light", False)) if video_operation == "dv_strip" else True,
                       expect_audio=expect_audio,
-                      expected_audio_count=len(audio_list) if (opts.audio_effect == "original" and expect_audio) else (1 if expect_audio else 0),
+                      expected_audio_count=len(active_audio) if expect_audio else 0,
                       expected_video_duration=expected_duration if math.isfinite(expected_duration) else None)
 
 
@@ -2123,6 +2339,30 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 temporary.unlink()
 
 
+def _parse_track_selector(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    text = raw.strip().lower()
+    if text in ("all", ""):
+        return None
+    if text == "none":
+        return []
+    indices = []
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            idx = int(token)
+        except ValueError:
+            raise ConversionError(f"无效的轨道流编号：{token}（请使用 all、none 或逗号分隔的流编号，如 1,2）。") from None
+        if idx < 0:
+            raise ConversionError(f"无效的轨道流编号：{token}。")
+        if idx not in indices:
+            indices.append(idx)
+    return indices
+
+
 def cli():
     import argparse
     if hasattr(sys.stdout, "reconfigure"):
@@ -2147,6 +2387,8 @@ def cli():
     parser.add_argument("--start", type=float, default=0)
     parser.add_argument("--duration", type=float)
     parser.add_argument("--audio-effect", choices=["original", "surround"], default="original")
+    parser.add_argument("--audio-tracks", default="all", help="保留的音轨流编号：all（全部）、none（丢弃全部），或逗号分隔流编号如 1,2")
+    parser.add_argument("--subtitle-tracks", default="all", help="保留的内嵌字幕流编号：all（全部兼容字幕）、none（不保留），或逗号分隔流编号如 3,4")
     parser.add_argument("--copy-hdr-video", action="store_true", help="仅给已有 HEVC HDR 加音效，不重复处理画面")
     args = parser.parse_args()
     try:
@@ -2162,7 +2404,10 @@ def cli():
         if not args.source or not args.output:
             parser.error("请提供输入视频和输出路径（或使用 --list-encoders / --list-dv-tools / --list-gpu-filter 查看环境状态）。")
         option_fields = {f.name for f in dataclasses.fields(Options)}
-        opts = Options(**{k: v for k, v in vars(args).items() if k in option_fields})
+        kwargs = {k: v for k, v in vars(args).items() if k in option_fields}
+        kwargs["audio_streams"] = _parse_track_selector(args.audio_tracks)
+        kwargs["subtitle_streams"] = _parse_track_selector(args.subtitle_tracks)
+        opts = Options(**kwargs)
         convert(opts, lambda p: print(json.dumps(p, ensure_ascii=False), flush=True))
     except ConversionError as e:
         print(str(e), file=sys.stderr)

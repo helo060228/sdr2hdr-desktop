@@ -1263,6 +1263,114 @@ class ConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(core.ConversionError, r"\.mp4 或 \.mkv"):
             core.convert(core.Options(str(src_multi), str(self.dir / "无效容器.avi")))
 
+    def test_selective_audio_subtitle_tracks_and_container_compatibility(self):
+        import app as gui_app
+
+        ffmpeg = core.find_tool("ffmpeg")
+        srt_zh = self.dir / "zh.srt"
+        srt_zh.write_text("1\n00:00:00,000 --> 00:00:00,500\n你好世界\n", encoding="utf-8")
+        srt_en = self.dir / "en.srt"
+        srt_en.write_text("1\n00:00:00,000 --> 00:00:00,500\nHello World\n", encoding="utf-8")
+
+        src = self.dir / "多轨字幕.mkv"
+        r = core.capture([
+            ffmpeg, "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc2=s=256x144:r=25:d=0.6",
+            "-f", "lavfi", "-t", "0.6", "-i", "anullsrc=r=48000:cl=5.1",
+            "-f", "lavfi", "-t", "0.6", "-i", "anullsrc=r=48000:cl=stereo",
+            "-i", str(srt_zh),
+            "-i", str(srt_en),
+            "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0", "-map", "3:s:0", "-map", "4:s:0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+            "-c:a:0", "eac3", "-metadata:s:a:0", "language=eng", "-metadata:s:a:0", "title=English 5.1",
+            "-c:a:1", "ac3", "-metadata:s:a:1", "language=chi", "-metadata:s:a:1", "title=国语 2.0",
+            "-c:s:0", "subrip", "-metadata:s:s:0", "language=chi", "-metadata:s:s:0", "title=简体中文",
+            "-c:s:1", "ass", "-metadata:s:s:1", "language=eng", "-metadata:s:s:1", "title=English ASS",
+            str(src),
+        ])
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        inspected = core.inspect_input(src)
+        self.assertEqual(inspected["default_container"], "mkv")
+        self.assertEqual(len(inspected["audio_tracks"]), 2)
+        self.assertEqual(len(inspected["subtitle_tracks"]), 2)
+        a_second = inspected["audio_tracks"][1]["stream_index"]
+        s_first = inspected["subtitle_tracks"][0]["stream_index"]
+
+        def stream_hash(path: Path, spec: str) -> str:
+            h = core.capture([ffmpeg, "-v", "error", "-i", str(path), "-map", spec,
+                              "-c", "copy", "-f", "hash", "-hash", "sha256", "-"])
+            self.assertEqual(h.returncode, 0, h.stderr)
+            return h.stdout.strip()
+
+        # 1. Select ONLY second audio track (chi 2.0 AC3) + ONLY first subtitle (chi subrip) -> .mkv
+        out_sel_mkv = self.dir / "精选轨道.mkv"
+        res_sel = core.convert(core.Options(
+            str(src), str(out_sel_mkv), quality="fast", encoder="cpu",
+            audio_streams=[a_second], subtitle_streams=[s_first],
+        ))
+        self.assertEqual(res_sel["plan"]["audio"], "copy")
+        self.assertEqual(res_sel["plan"]["subtitles"], "copy")
+        self.assertTrue(all(res_sel["validation"]["checks"].values()))
+        probed_mkv = core.probe(out_sel_mkv)
+        out_a = [s for s in probed_mkv["streams"] if s["codec_type"] == "audio"]
+        out_s = [s for s in probed_mkv["streams"] if s["codec_type"] == "subtitle"]
+        self.assertEqual(len(out_a), 1)
+        self.assertEqual((out_a[0]["codec_name"], out_a[0]["channels"]), ("ac3", 2))
+        self.assertEqual((out_a[0].get("tags") or {}).get("language"), "chi")
+        self.assertEqual((out_a[0].get("tags") or {}).get("title"), "国语 2.0")
+        self.assertEqual(len(out_s), 1)
+        self.assertEqual(out_s[0]["codec_name"], "subrip")
+        self.assertEqual((out_s[0].get("tags") or {}).get("language"), "chi")
+        self.assertEqual((out_s[0].get("tags") or {}).get("title"), "简体中文")
+        self.assertEqual(stream_hash(src, "0:a:1"), stream_hash(out_sel_mkv, "0:a:0"))
+        self.assertEqual(stream_hash(src, "0:s:0"), stream_hash(out_sel_mkv, "0:s:0"))
+
+        # 2. Drop all audio tracks ([]) while keeping Chinese subtitle into .mp4 (converts subrip -> mov_text)
+        out_mp4_sub = self.dir / "静音带字幕.mp4"
+        res_mp4 = core.convert(core.Options(
+            str(src), str(out_mp4_sub), quality="fast", encoder="cpu",
+            audio_streams=[], subtitle_streams=[s_first],
+        ))
+        self.assertEqual(res_mp4["plan"]["audio"], "none")
+        self.assertEqual(res_mp4["plan"]["subtitles"], "mov_text")
+        self.assertTrue(all(res_mp4["validation"]["checks"].values()))
+        probed_mp4 = core.probe(out_mp4_sub)
+        self.assertEqual([s for s in probed_mp4["streams"] if s["codec_type"] == "audio"], [])
+        mp4_subs = [s for s in probed_mp4["streams"] if s["codec_type"] == "subtitle"]
+        self.assertEqual(len(mp4_subs), 1)
+        self.assertEqual(mp4_subs[0]["codec_name"], "mov_text")
+        self.assertEqual((mp4_subs[0].get("tags") or {}).get("language"), "chi")
+
+        # 3. Verify compatibility checker on synthetic TrueHD + PGS Blu-ray info
+        bluray_info = {
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "hevc"},
+                {"index": 1, "codec_type": "audio", "codec_name": "truehd", "channels": 8, "sample_rate": "48000", "tags": {"language": "eng"}},
+                {"index": 2, "codec_type": "audio", "codec_name": "eac3", "channels": 6, "sample_rate": "48000", "tags": {"language": "chi"}},
+                {"index": 3, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle", "tags": {"language": "chi"}},
+                {"index": 4, "codec_type": "subtitle", "codec_name": "subrip", "tags": {"language": "eng"}},
+            ]
+        }
+        c_mp4_all = core.check_container_compatibility(bluray_info, "mp4")
+        self.assertTrue(c_mp4_all["needs_warning"])
+        self.assertEqual([t["stream_index"] for t in c_mp4_all["incompatible_audio"]], [1])
+        self.assertEqual([t["stream_index"] for t in c_mp4_all["incompatible_subtitles"]], [3])
+
+        c_mp4_compat = core.check_container_compatibility(bluray_info, "mp4", audio_streams=[2], subtitle_streams=[4])
+        self.assertFalse(c_mp4_compat["needs_warning"])
+
+        c_mkv_all = core.check_container_compatibility(bluray_info, "mkv")
+        self.assertFalse(c_mkv_all["needs_warning"])
+
+        # 4. Verify GUI summary formatting helper
+        summary = gui_app.format_track_summary(
+            inspected["audio_tracks"], [a_second], inspected["subtitle_tracks"], [s_first], "original"
+        )
+        self.assertIn("已选 1/2 条", summary)
+        self.assertIn("内嵌字幕 已选 1/2 条", summary)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
