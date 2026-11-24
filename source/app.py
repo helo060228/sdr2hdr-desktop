@@ -510,9 +510,9 @@ class App:
         if self.input_kind == "sdr":
             style_key = STYLE_LABELS[self.hdr_style.get()]
             if style_key == "balanced":
-                notes.append("影院均衡高光：深黑位 + 明亮中间调 + 等色度高光保护，稳住额头与肤色细节的同时释放 750 nits 极亮冲击力。")
+                notes.append("影院均衡高光：Gamma 2.2 通透暗部（黑位纯黑不发灰）+ 饱满中间调 + 等色度高光保护，稳住额头与肤色细节的同时释放 750 nits 极亮冲击力。")
             elif style_key == "natural":
-                notes.append("柔和暗室保护：更克制的 190 nits 漫反射基准与 450 nits 峰值，适合全黑暗室观影与保守高光控制。")
+                notes.append("柔和暗室保护：BT.1886 (Gamma 2.4) 全黑暗室基准与 450 nits 峰值，适合全黑环境观影与保守高光控制。")
             else:
                 notes.append("高对比风格：原版对数曲线，暗部更沉、色彩更艳丽，适合动漫与暗景；明亮实拍人脸可能偏亮。")
         enc_key = ENCODER_LABELS[self.encoder.get()]

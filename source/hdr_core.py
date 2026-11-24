@@ -1,8 +1,8 @@
 """Offline SDR / Dolby Vision to HDR10 transcoder.
 
 SDR-to-HDR offers three styles:
-- balanced (default): colorimetric BT.1886 linear BT.709->BT.2020 luminance-preserving
-  expansion with deep shadows, bright midtones, and highlight headroom up to 750 nits.
+- balanced (default): colorimetric Gamma 2.2 linear BT.709->BT.2020 luminance-preserving
+  expansion with transparent shadow detail, natural midtones, and highlight headroom up to 750 nits.
 - natural: softer colorimetric BT.1886 luminance-preserving curve capped at 450 nits
   for dark-room viewing and conservative highlight protection.
 - vivid (legacy): fixed logarithmic expansion in nonlinear RGB for stylized high-contrast
@@ -28,28 +28,30 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.5.5"
+VERSION = "1.5.6"
 SUPPORTED_OUTPUT_CONTAINERS = (".mp4", ".mkv")
 MP4_COPY_AUDIO_CODECS = frozenset({"aac", "ac3", "eac3", "dts", "flac", "alac", "mp3", "opus"})
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128
 ALGORITHM_ID = "Fixed logarithmic SDR-to-PQ tone expansion with chroma gain 0.56"
-BALANCED_ALGORITHM_ID = "Colorimetric BT.1886 linear BT.709-to-BT.2020 luminance-preserving balanced midtone & highlight-protected SDR-to-PQ expansion (750 nits peak)"
+BALANCED_ALGORITHM_ID = "Colorimetric Gamma 2.2 linear BT.709-to-BT.2020 luminance-preserving shadow-transparent balanced midtone & highlight-protected SDR-to-PQ expansion (750 nits peak)"
 NATURAL_ALGORITHM_ID = "Colorimetric BT.1886 linear BT.709-to-BT.2020 luminance-preserving highlight-protected SDR-to-PQ expansion (450 nits peak)"
 DV_STRIP_ALGORITHM_ID = "Lossless Dolby Vision RPU/EL strip preserving native 10-bit HDR10 base layer"
 DV_REENCODE_ALGORITHM_ID = "Dolby Vision to HDR10 conversion via libplacebo (apply_dolbyvision=true)"
 MASTERING_DISPLAY = "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)"
 CONTENT_LIGHT = "1000,1000"
 BALANCED_CONTENT_LIGHT = "750,260"
+BALANCED_GAMMA = 2.2
 BALANCED_BASE_NITS = 255.0
-BALANCED_MID_LIFT = 0.22
+BALANCED_MID_LIFT = 0.12
 BALANCED_SHADOW_RAMP = 0.08
 BALANCED_KNEE = 0.68
 BALANCED_BOOST_NITS = 495.0
 BALANCED_POWER = 2.3
 BALANCED_PEAK_NITS = 750.0
 NATURAL_CONTENT_LIGHT = "450,200"
+NATURAL_GAMMA = 2.4
 NATURAL_BASE_NITS = 190.0
 NATURAL_KNEE = 0.62
 NATURAL_BOOST_NITS = 260.0
@@ -693,9 +695,9 @@ def natural_target_nits(y: float) -> float:
 
 
 def _colorimetric_reference_rgb(rgb: tuple[float, float, float], target_fn: Callable[[float], float],
-                                peak_cap: float) -> tuple[float, float, float]:
-    """Analytical BT.1886 linear BT.709->BT.2020 luminance-preserving PQ transform."""
-    r0, g0, b0 = (max(0.0, min(1.0, v)) ** 2.4 for v in rgb)
+                                peak_cap: float, gamma: float = NATURAL_GAMMA) -> tuple[float, float, float]:
+    """Analytical linear BT.709->BT.2020 luminance-preserving PQ transform."""
+    r0, g0, b0 = (max(0.0, min(1.0, v)) ** gamma for v in rgb)
     r20 = M_BT709_TO_BT2020[0][0] * r0 + M_BT709_TO_BT2020[0][1] * g0 + M_BT709_TO_BT2020[0][2] * b0
     g20 = M_BT709_TO_BT2020[1][0] * r0 + M_BT709_TO_BT2020[1][1] * g0 + M_BT709_TO_BT2020[1][2] * b0
     b20 = M_BT709_TO_BT2020[2][0] * r0 + M_BT709_TO_BT2020[2][1] * g0 + M_BT709_TO_BT2020[2][2] * b0
@@ -712,13 +714,13 @@ def _colorimetric_reference_rgb(rgb: tuple[float, float, float], target_fn: Call
 
 
 def balanced_reference_rgb(rgb: tuple[float, float, float]) -> tuple[float, float, float]:
-    """Analytical BT.1886 linear BT.709->BT.2020 balanced 750-nit PQ transform."""
-    return _colorimetric_reference_rgb(rgb, balanced_target_nits, BALANCED_PEAK_NITS)
+    """Analytical Gamma 2.2 linear BT.709->BT.2020 balanced 750-nit PQ transform."""
+    return _colorimetric_reference_rgb(rgb, balanced_target_nits, BALANCED_PEAK_NITS, gamma=BALANCED_GAMMA)
 
 
 def natural_reference_rgb(rgb: tuple[float, float, float]) -> tuple[float, float, float]:
     """Analytical BT.1886 linear BT.709->BT.2020 luminance-preserving PQ transform."""
-    return _colorimetric_reference_rgb(rgb, natural_target_nits, NATURAL_PEAK_NITS)
+    return _colorimetric_reference_rgb(rgb, natural_target_nits, NATURAL_PEAK_NITS, gamma=NATURAL_GAMMA)
 
 
 def _write_colorimetric_lut(path: Path, style: str, size: int = NATURAL_LUT_SIZE):
@@ -727,18 +729,19 @@ def _write_colorimetric_lut(path: Path, style: str, size: int = NATURAL_LUT_SIZE
     with _NATURAL_LUT_LOCK:
         cached = _NATURAL_LUT_CACHE.get(cache_key)
     if cached is None:
+        is_balanced = style == "balanced"
+        if not is_balanced and style != "natural":
+            raise ConversionError("未知的 HDR 风格设置。")
         inv = 1.0 / (size - 1)
-        pow_tbl = [(i * inv) ** 2.4 for i in range(size)]
+        gamma = BALANCED_GAMMA if is_balanced else NATURAL_GAMMA
+        pow_tbl = [(i * inv) ** gamma for i in range(size)]
         m00, m01, m02 = M_BT709_TO_BT2020[0]
         m10, m11, m12 = M_BT709_TO_BT2020[1]
         m20, m21, m22 = M_BT709_TO_BT2020[2]
         yr, yg, yb = Y_BT2020
-        is_balanced = style == "balanced"
-        if not is_balanced and style != "natural":
-            raise ConversionError("未知的 HDR 风格设置。")
         cap = BALANCED_PEAK_NITS if is_balanced else NATURAL_PEAK_NITS
         title = (
-            'TITLE "Colorimetric Balanced Highlight-Protected SDR-to-PQ (750 nits)"'
+            'TITLE "Colorimetric Gamma 2.2 Balanced Highlight-Protected SDR-to-PQ (750 nits)"'
             if is_balanced else 'TITLE "Colorimetric Highlight-Protected SDR-to-PQ (450 nits)"'
         )
         knee = NATURAL_KNEE
@@ -854,7 +857,7 @@ def write_balanced_shader(path: Path, primaries: str = "bt709"):
         "//!BIND HOOKED\n"
         "vec4 hook() {\n"
         "    vec4 c = HOOKED_texOff(0);\n"
-        "    vec3 lin = pow(clamp(c.rgb, 0.0, 1.0), vec3(2.4));\n"
+        f"    vec3 lin = pow(clamp(c.rgb, 0.0, 1.0), vec3({BALANCED_GAMMA:.4f}));\n"
         "    vec3 b20 = vec3(\n"
         f"        dot(lin, vec3({m[0][0]:.7f}, {m[0][1]:.7f}, {m[0][2]:.7f})),\n"
         f"        dot(lin, vec3({m[1][0]:.7f}, {m[1][1]:.7f}, {m[1][2]:.7f})),\n"
@@ -2041,13 +2044,13 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 algorithm_desc = BALANCED_ALGORITHM_ID
                 if plan.get("gpu_filter"):
                     dec_prefix = "Vulkan hwdec + " if plan.get("vulkan_hwdec") else ""
-                    method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (BT.1886 BT.709->BT.2020 balanced 750 nits -> PQ) + 10-bit HEVC ({plan['video_codec']})"
+                    method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (Gamma 2.2 BT.709->BT.2020 balanced 750 nits -> PQ) + 10-bit HEVC ({plan['video_codec']})"
                 else:
-                    method_desc = f"BT.1886 linear BT.709->BT.2020 balanced luminance-preserving 49^3 tetrahedral 3D LUT + spline36 + 10-bit HEVC ({plan['video_codec']})"
+                    method_desc = f"Gamma 2.2 linear BT.709->BT.2020 balanced luminance-preserving 49^3 tetrahedral 3D LUT + spline36 + 10-bit HEVC ({plan['video_codec']})"
                 video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
                 mastering_desc = "BT.2020 / D65 / 1000 nits mastering container; curve peak capped at 750 nits"
                 light_desc = "750/260 nits declared MaxCLL/MaxFALL matching balanced curve ceiling (750 nits) and diffuse reference (~255 nits)"
-                fidelity_desc = "Colorimetric BT.709-to-BT.2020 mapping keeps deep shadows anchored while lifting midtones to natural cinema brightness and expanding specular highlights smoothly to 750 nits with wide skin headroom. Lost SDR detail cannot be synthesized. Online platform transcoding is outside this tool."
+                fidelity_desc = "Colorimetric Gamma 2.2 BT.709-to-BT.2020 mapping keeps pure blacks at 0 nits while preserving legible shadow detail in fullscreen HDR playback, natural midtones, wide skin headroom, and smooth 750-nit specular highlights. Lost SDR detail cannot be synthesized. Online platform transcoding is outside this tool."
             elif plan.get("hdr_style") == "natural":
                 algorithm_desc = NATURAL_ALGORITHM_ID
                 if plan.get("gpu_filter"):

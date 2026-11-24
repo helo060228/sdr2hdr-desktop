@@ -957,7 +957,7 @@ class ConversionTests(unittest.TestCase):
         self.assertGreater(min_slope, 200.0)
 
         def expected_bt2020_linear(rgb):
-            lin = [v ** 2.4 for v in rgb]
+            lin = [v ** core.BALANCED_GAMMA for v in rgb]
             return tuple(sum(row[j] * lin[j] for j in range(3)) for row in core.M_BT709_TO_BT2020)
 
         def decoded_nits(rgb):
@@ -970,12 +970,19 @@ class ConversionTests(unittest.TestCase):
             self.assertAlmostEqual(nits[1] / nits[0], lin20[1] / lin20[0], delta=1e-5)
             self.assertAlmostEqual(nits[2] / nits[0], lin20[2] / lin20[0], delta=1e-5)
 
-        # Deep shadow anchor, bright midtone recovery, wide skin headroom, and 750-nit specular punch.
-        self.assertLess(max(decoded_nits((0.12, 0.10, 0.08))), 2.0)
-        self.assertGreater(max(decoded_nits((0.50, 0.52, 0.56))), 65.0)
+        # True black, Gamma 2.2 shadow transparency, natural midtones, wide skin headroom, and 750-nit specular punch.
+        self.assertEqual(decoded_nits((0.0, 0.0, 0.0)), (0.0, 0.0, 0.0))
+        self.assertGreaterEqual(max(decoded_nits((0.05, 0.05, 0.05))), 0.30)
+        shelf_nits = max(decoded_nits((0.10, 0.10, 0.10)))
+        self.assertGreaterEqual(shelf_nits, 1.4)
+        self.assertLessEqual(shelf_nits, 1.8)
+        shadow_nits = max(decoded_nits((0.12, 0.10, 0.08)))
+        self.assertGreaterEqual(shadow_nits, 1.8)
+        self.assertLessEqual(shadow_nits, 2.4)
+        self.assertGreater(max(decoded_nits((0.50, 0.52, 0.56))), 70.0)
         forehead_peak = max(decoded_nits((0.92, 0.78, 0.65)))
-        self.assertGreater(forehead_peak, 200.0)
-        self.assertLess(forehead_peak, 235.0)
+        self.assertGreater(forehead_peak, 195.0)
+        self.assertLess(forehead_peak, 220.0)
         self.assertGreater(max(decoded_nits((0.99, 0.99, 0.98))), 600.0)
         for ch in decoded_nits((1.0, 1.0, 1.0)):
             self.assertAlmostEqual(ch, core.BALANCED_PEAK_NITS, delta=0.5)
