@@ -2,7 +2,8 @@
 
 SDR-to-HDR offers three styles:
 - balanced (default): colorimetric Gamma 2.2 linear BT.709->BT.2020 luminance-preserving
-  expansion with transparent shadow detail, natural midtones, and highlight headroom up to 750 nits.
+  zero-trough expansion with transparent shadow detail, rich cloud/snow highlight
+  gradation, and specular headroom up to 1000 nits.
 - natural: softer colorimetric BT.1886 luminance-preserving curve capped at 450 nits
   for dark-room viewing and conservative highlight protection.
 - vivid (legacy): fixed logarithmic expansion in nonlinear RGB for stylized high-contrast
@@ -11,6 +12,7 @@ SDR-to-HDR offers three styles:
 from __future__ import annotations
 
 import concurrent.futures
+import ctypes
 import dataclasses
 import hashlib
 import json
@@ -19,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -28,7 +31,7 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.5.7"
+VERSION = "1.6.0"
 SUPPORTED_OUTPUT_CONTAINERS = (".mp4", ".mkv")
 MP4_COPY_AUDIO_CODECS = frozenset({"aac", "ac3", "eac3", "dts", "flac", "alac", "mp3", "opus"})
 MP4_TEXT_SUBTITLE_CODECS = frozenset({"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"})
@@ -37,21 +40,19 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128
 ALGORITHM_ID = "Fixed logarithmic SDR-to-PQ tone expansion with chroma gain 0.56"
-BALANCED_ALGORITHM_ID = "Colorimetric Gamma 2.2 linear BT.709-to-BT.2020 luminance-preserving shadow-transparent balanced midtone & highlight-protected SDR-to-PQ expansion (750 nits peak)"
+BALANCED_ALGORITHM_ID = "Colorimetric Gamma 2.2 linear BT.709-to-BT.2020 luminance-preserving zero-trough highlight-protected SDR-to-PQ expansion (1000 nits peak)"
 NATURAL_ALGORITHM_ID = "Colorimetric BT.1886 linear BT.709-to-BT.2020 luminance-preserving highlight-protected SDR-to-PQ expansion (450 nits peak)"
 DV_STRIP_ALGORITHM_ID = "Lossless Dolby Vision RPU/EL strip preserving native 10-bit HDR10 base layer"
 DV_REENCODE_ALGORITHM_ID = "Dolby Vision to HDR10 conversion via libplacebo (apply_dolbyvision=true)"
 MASTERING_DISPLAY = "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)"
 CONTENT_LIGHT = "1000,1000"
-BALANCED_CONTENT_LIGHT = "750,260"
+BALANCED_CONTENT_LIGHT = "1000,260"
 BALANCED_GAMMA = 2.2
-BALANCED_BASE_NITS = 255.0
-BALANCED_MID_LIFT = 0.12
-BALANCED_SHADOW_RAMP = 0.08
-BALANCED_KNEE = 0.68
-BALANCED_BOOST_NITS = 495.0
-BALANCED_POWER = 2.3
-BALANCED_PEAK_NITS = 750.0
+BALANCED_BASE_NITS = 235.0
+BALANCED_KNEE = 0.58
+BALANCED_BOOST_NITS = 765.0
+BALANCED_POWER = 2.5
+BALANCED_PEAK_NITS = 1000.0
 NATURAL_CONTENT_LIGHT = "450,200"
 NATURAL_GAMMA = 2.4
 NATURAL_BASE_NITS = 190.0
@@ -138,6 +139,125 @@ class ConversionError(Exception):
 
 class Cancelled(ConversionError):
     pass
+
+
+class _SkipLosslessVerify(Exception):
+    pass
+
+
+def parse_timecode_seconds(raw: str | float | int) -> float:
+    """Parse seconds or MM:SS / HH:MM:SS(.ms) timecode into non-negative seconds."""
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        val = float(raw)
+        if not math.isfinite(val) or val < 0:
+            raise ValueError("时间必须为非负数值。")
+        return val
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("请输入有效时间。")
+    if ":" not in text:
+        val = _finite_number(text)
+        if val is None or val < 0:
+            raise ValueError(f"无法解析时间：{text}")
+        return val
+    parts = text.split(":")
+    if len(parts) not in (2, 3):
+        raise ValueError(f"时间格式应为 秒数、MM:SS 或 HH:MM:SS：{text}")
+    nums = [_finite_number(p.strip()) for p in parts]
+    if any(n is None or n < 0 for n in nums):
+        raise ValueError(f"无法解析时间：{text}")
+    if len(nums) == 2:
+        mins, secs = nums
+        if secs >= 60:
+            raise ValueError(f"秒数应小于 60：{text}")
+        return mins * 60.0 + secs
+    hours, mins, secs = nums
+    if mins >= 60 or secs >= 60:
+        raise ValueError(f"分、秒应小于 60：{text}")
+    return hours * 3600.0 + mins * 60.0 + secs
+
+
+def default_preview_window(total_duration: float, clip_duration: float = 30.0) -> tuple[float, float]:
+    """Return a default (start, duration) preview clip centered around the middle of the video."""
+    clip = max(1.0, float(clip_duration))
+    total = _finite_number(total_duration)
+    if total is None or total <= 0:
+        return (0.0, round(clip, 1))
+    if total <= clip:
+        return (0.0, max(1.0, round(total, 1)))
+    start = max(0.0, (total - clip) * 0.5)
+    return (round(start, 1), round(clip, 1))
+
+
+def suspend_process(pid: int) -> bool:
+    """Suspend a running child process (Windows NtSuspendProcess / POSIX SIGSTOP)."""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        PROCESS_SUSPEND_RESUME = 0x0800
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll")
+        handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, int(pid))
+        if not handle:
+            return False
+        try:
+            return int(ntdll.NtSuspendProcess(handle)) == 0
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(int(pid), signal.SIGSTOP)
+        return True
+    except OSError:
+        return False
+
+
+def resume_process(pid: int) -> bool:
+    """Resume a previously suspended child process (Windows NtResumeProcess / POSIX SIGCONT)."""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        PROCESS_SUSPEND_RESUME = 0x0800
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll")
+        handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, int(pid))
+        if not handle:
+            return False
+        try:
+            return int(ntdll.NtResumeProcess(handle)) == 0
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(int(pid), signal.SIGCONT)
+        return True
+    except OSError:
+        return False
+
+
+def trigger_power_action(action: str) -> None:
+    """Execute a post-completion power action ('none', 'shutdown', or 'sleep')."""
+    if action == "none":
+        return
+    if action not in ("shutdown", "sleep"):
+        raise ConversionError(f"未知的完成后电源动作：{action}")
+    if os.name == "nt":
+        if action == "shutdown":
+            subprocess.Popen(["shutdown", "/s", "/t", "0"], creationflags=CREATE_NO_WINDOW)
+            return
+        try:
+            powrprof = ctypes.WinDLL("powrprof", use_last_error=True)
+            powrprof.SetSuspendState.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ubyte]
+            powrprof.SetSuspendState.restype = ctypes.c_ubyte
+            ok = powrprof.SetSuspendState(0, 0, 0)
+            if ok:
+                return
+        except OSError:
+            pass
+        subprocess.Popen(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], creationflags=CREATE_NO_WINDOW)
+        return
+    if action == "shutdown":
+        subprocess.Popen(["shutdown", "-h", "now"])
+    else:
+        subprocess.Popen(["systemctl", "suspend"])
 
 
 def _finite_number(value) -> float | None:
@@ -825,17 +945,14 @@ def dimensions(p: dict, resolution="original") -> tuple[int, int]:
 
 
 def balanced_target_nits(y: float) -> float:
-    """Luminance-preserving balanced SDR->HDR curve (deep blacks, bright midtones, 750 nits peak)."""
+    """Luminance-preserving zero-trough Gamma 2.2 SDR->HDR curve (1000 nits peak)."""
     y = max(0.0, y)
-    if y >= 1.0:
-        return BALANCED_PEAK_NITS
-    s = min(1.0, y / BALANCED_SHADOW_RAMP)
-    smooth_s = s * s * (3.0 - 2.0 * s)
-    l_diff = BALANCED_BASE_NITS * y * (1.0 + BALANCED_MID_LIFT * 4.0 * y * (1.0 - y) * smooth_s)
     if y <= BALANCED_KNEE:
-        return l_diff
-    t = (y - BALANCED_KNEE) / (1.0 - BALANCED_KNEE)
-    return l_diff + BALANCED_BOOST_NITS * (t ** BALANCED_POWER)
+        return BALANCED_BASE_NITS * y
+    if y <= 1.0:
+        t = (y - BALANCED_KNEE) / (1.0 - BALANCED_KNEE)
+        return BALANCED_BASE_NITS * y + BALANCED_BOOST_NITS * (t ** BALANCED_POWER)
+    return BALANCED_PEAK_NITS
 
 
 def natural_target_nits(y: float) -> float:
@@ -869,7 +986,7 @@ def _colorimetric_reference_rgb(rgb: tuple[float, float, float], target_fn: Call
 
 
 def balanced_reference_rgb(rgb: tuple[float, float, float]) -> tuple[float, float, float]:
-    """Analytical Gamma 2.2 linear BT.709->BT.2020 balanced 750-nit PQ transform."""
+    """Analytical Gamma 2.2 linear BT.709->BT.2020 balanced 1000-nit PQ transform."""
     return _colorimetric_reference_rgb(rgb, balanced_target_nits, BALANCED_PEAK_NITS, gamma=BALANCED_GAMMA)
 
 
@@ -896,7 +1013,7 @@ def _write_colorimetric_lut(path: Path, style: str, size: int = NATURAL_LUT_SIZE
         yr, yg, yb = Y_BT2020
         cap = BALANCED_PEAK_NITS if is_balanced else NATURAL_PEAK_NITS
         title = (
-            'TITLE "Colorimetric Gamma 2.2 Balanced Highlight-Protected SDR-to-PQ (750 nits)"'
+            'TITLE "Colorimetric Gamma 2.2 Balanced Highlight-Protected SDR-to-PQ (1000 nits)"'
             if is_balanced else 'TITLE "Colorimetric Highlight-Protected SDR-to-PQ (450 nits)"'
         )
         knee = NATURAL_KNEE
@@ -949,7 +1066,7 @@ def _write_colorimetric_lut(path: Path, style: str, size: int = NATURAL_LUT_SIZE
 
 
 def write_balanced_lut(path: Path, size: int = NATURAL_LUT_SIZE):
-    """Write a cached 49^3 tetrahedral 3D LUT for balanced 750-nit cinema HDR10."""
+    """Write a cached 49^3 tetrahedral 3D LUT for balanced 1000-nit cinema HDR10."""
     _write_colorimetric_lut(path, "balanced", size)
 
 
@@ -1002,11 +1119,10 @@ def filter_chain(p: dict, width: int, height: int, lut_name="tone.cube", style="
 
 
 def write_balanced_shader(path: Path, primaries: str = "bt709"):
-    """Write a self-contained MAIN-stage GLSL shader for balanced 750-nit cinema HDR10."""
+    """Write a self-contained MAIN-stage GLSL shader for balanced 1000-nit cinema HDR10."""
     m = PRIMARY_TO_BT2020.get(primaries, M_BT709_TO_BT2020)
     yr, yg, yb = Y_BT2020
     span = 1.0 - BALANCED_KNEE
-    lift4 = BALANCED_MID_LIFT * 4.0
     shader = (
         "//!HOOK MAIN\n"
         "//!BIND HOOKED\n"
@@ -1020,12 +1136,9 @@ def write_balanced_shader(path: Path, primaries: str = "bt709"):
         "    );\n"
         f"    float y = dot(b20, vec3({yr:.4f}, {yg:.4f}, {yb:.4f}));\n"
         "    if (y <= 1e-9) return vec4(0.0, 0.0, 0.0, c.a);\n"
-        f"    float s = clamp(y / {BALANCED_SHADOW_RAMP:.6f}, 0.0, 1.0);\n"
-        "    float smooth_s = s * s * (3.0 - 2.0 * s);\n"
-        f"    float yc = min(y, 1.0);\n"
-        f"    float l_diff = {BALANCED_BASE_NITS:.6f} * yc * (1.0 + {lift4:.6f} * yc * (1.0 - yc) * smooth_s);\n"
-        f"    float tn = (y >= 1.0) ? {BALANCED_PEAK_NITS:.6f} : ((y <= {BALANCED_KNEE:.6f}) ? l_diff : "
-        f"(l_diff + {BALANCED_BOOST_NITS:.6f} * pow((y - {BALANCED_KNEE:.6f}) / {span:.6f}, {BALANCED_POWER:.6f})));\n"
+        f"    float tn = (y <= {BALANCED_KNEE:.6f}) ? ({BALANCED_BASE_NITS:.6f} * y) : "
+        f"((y >= 1.0) ? {BALANCED_PEAK_NITS:.6f} : "
+        f"({BALANCED_BASE_NITS:.6f} * y + {BALANCED_BOOST_NITS:.6f} * pow((y - {BALANCED_KNEE:.6f}) / {span:.6f}, {BALANCED_POWER:.6f})));\n"
         "    vec3 nits = b20 * (tn / y);\n"
         "    float pk = max(nits.r, max(nits.g, nits.b));\n"
         f"    if (pk > {BALANCED_PEAK_NITS:.6f}) nits *= ({BALANCED_PEAK_NITS:.6f} / pk);\n"
@@ -1170,23 +1283,23 @@ def _hardware_encoder_args(encoder_key: str, quality: str, multipass: bool = Fal
         mp_suffix = " (multipass)" if multipass else ""
         if quality == "fine":
             fine_preset = "p7" if multipass else "p6"
-            fine_qc = "VBR CQ 18 (multipass)" if multipass else "VBR CQ 18 (1-pass)"
+            fine_qc = "VBR CQ 21 (multipass)" if multipass else "VBR CQ 21 (1-pass)"
             return (
                 ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", fine_preset, "-tune", "hq", *mp_args, "-rc", "vbr", "-cq", "18",
+                 "-preset", fine_preset, "-tune", "hq", *mp_args, "-rc", "vbr", "-cq", "21",
                  "-b:v", "0", "-spatial-aq", "1"],
                 dict(codec="hevc_nvenc", preset=fine_preset, crf=None, quality_control=fine_qc),
             )
         configs = {
             "fast": (
                 ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "p2", "-tune", "hq", *mp_args, "-rc", "vbr", "-cq", "22", "-b:v", "0"],
-                dict(codec="hevc_nvenc", preset="p2", crf=None, quality_control="VBR CQ 22" + mp_suffix),
+                 "-preset", "p2", "-tune", "hq", *mp_args, "-rc", "vbr", "-cq", "25", "-b:v", "0"],
+                dict(codec="hevc_nvenc", preset="p2", crf=None, quality_control="VBR CQ 25" + mp_suffix),
             ),
             "standard": (
                 ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "p5", "-tune", "hq", *mp_args, "-rc", "vbr", "-cq", "20", "-b:v", "0"],
-                dict(codec="hevc_nvenc", preset="p5", crf=None, quality_control="VBR CQ 20" + mp_suffix),
+                 "-preset", "p5", "-tune", "hq", *mp_args, "-rc", "vbr", "-cq", "23", "-b:v", "0"],
+                dict(codec="hevc_nvenc", preset="p5", crf=None, quality_control="VBR CQ 23" + mp_suffix),
             ),
             "lossless": (
                 ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-pix_fmt", "p010le",
@@ -1203,18 +1316,18 @@ def _hardware_encoder_args(encoder_key: str, quality: str, multipass: bool = Fal
         configs = {
             "fast": (
                 ["-c:v", "hevc_qsv", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "faster", "-global_quality", "19", *extbrc_args],
-                dict(codec="hevc_qsv", preset="faster", crf=None, quality_control="ICQ 19" + extbrc_suffix),
+                 "-preset", "faster", "-global_quality", "23", *extbrc_args],
+                dict(codec="hevc_qsv", preset="faster", crf=None, quality_control="ICQ 23" + extbrc_suffix),
             ),
             "standard": (
                 ["-c:v", "hevc_qsv", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "medium", "-global_quality", "16", *extbrc_args],
-                dict(codec="hevc_qsv", preset="medium", crf=None, quality_control="ICQ 16" + extbrc_suffix),
+                 "-preset", "medium", "-global_quality", "21", *extbrc_args],
+                dict(codec="hevc_qsv", preset="medium", crf=None, quality_control="ICQ 21" + extbrc_suffix),
             ),
             "fine": (
                 ["-c:v", "hevc_qsv", "-profile:v", "main10", "-pix_fmt", "p010le",
-                 "-preset", "slow", "-global_quality", "14", *extbrc_args],
-                dict(codec="hevc_qsv", preset="slow", crf=None, quality_control="ICQ 14" + extbrc_suffix),
+                 "-preset", "slow", "-global_quality", "19", *extbrc_args],
+                dict(codec="hevc_qsv", preset="slow", crf=None, quality_control="ICQ 19" + extbrc_suffix),
             ),
         }
         return configs[quality]
@@ -1224,21 +1337,21 @@ def _hardware_encoder_args(encoder_key: str, quality: str, multipass: bool = Fal
         configs = {
             "fast": (
                 ["-c:v", "hevc_amf", "-profile:v", "main10", "-bitdepth", "10", "-pix_fmt", "p010le",
-                 "-usage", "transcoding", "-quality", "speed", "-rc", "cqp", "-qp_i", "22", "-qp_p", "22",
+                 "-usage", "transcoding", "-quality", "speed", "-rc", "cqp", "-qp_i", "25", "-qp_p", "25",
                  "-header_insertion_mode", "gop"],
-                dict(codec="hevc_amf", preset="speed", crf=None, quality_control="CQP 22"),
+                dict(codec="hevc_amf", preset="speed", crf=None, quality_control="CQP 25"),
             ),
             "standard": (
                 ["-c:v", "hevc_amf", "-profile:v", "main10", "-bitdepth", "10", "-pix_fmt", "p010le",
-                 "-usage", "transcoding", "-quality", "balanced", "-rc", "cqp", "-qp_i", "20", "-qp_p", "20",
+                 "-usage", "transcoding", "-quality", "balanced", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23",
                  "-header_insertion_mode", "gop"],
-                dict(codec="hevc_amf", preset="balanced", crf=None, quality_control="CQP 20"),
+                dict(codec="hevc_amf", preset="balanced", crf=None, quality_control="CQP 23"),
             ),
             "fine": (
                 ["-c:v", "hevc_amf", "-profile:v", "main10", "-bitdepth", "10", "-pix_fmt", "p010le",
-                 "-usage", "transcoding", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "18",
+                 "-usage", "transcoding", "-quality", "quality", "-rc", "cqp", "-qp_i", "21", "-qp_p", "21",
                  "-header_insertion_mode", "gop"],
-                dict(codec="hevc_amf", preset="quality", crf=None, quality_control="CQP 18"),
+                dict(codec="hevc_amf", preset="quality", crf=None, quality_control="CQP 21"),
             ),
         }
         return configs[quality]
@@ -1786,7 +1899,7 @@ def build_command(opts: Options, info: dict, destination: Path,
         args += [
             "-vf", vf,
             *enc_args,
-            "-g", str(max(1, round(p["fps"] * 2))), "-fps_mode", "passthrough", "-enc_time_base", "filter",
+            "-g", str(max(1, round(p["fps"] * 4))), "-fps_mode", "passthrough", "-enc_time_base", "filter",
             "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv",
         ]
         if not is_mkv:
@@ -1794,8 +1907,8 @@ def build_command(opts: Options, info: dict, destination: Path,
         if video_operation == "dv_reencode" and tools and tools.get("dovi_rpu"):
             args += ["-bsf:v", "dovi_rpu=strip=1"]
     else:
-        preset, crf = {"fast": ("ultrafast", 17), "standard": ("fast", 17),
-                       "fine": ("medium", 16), "lossless": ("fast", None)}[opts.quality]
+        preset, crf = {"fast": ("ultrafast", 21), "standard": ("fast", 19),
+                       "fine": ("medium", 18), "lossless": ("fast", None)}[opts.quality]
         video_codec = "libx265"
         quality_control = "x265 lossless=1" if lossless_video else f"CRF {crf}"
         if video_operation == "dv_reencode":
@@ -1814,7 +1927,7 @@ def build_command(opts: Options, info: dict, destination: Path,
             args += ["-crf", str(crf)]
         args += [
             "-profile:v", "main10", "-pix_fmt", "yuv420p10le", "-x265-params", params,
-            "-g", str(max(1, round(p["fps"] * 2))), "-fps_mode", "passthrough", "-enc_time_base", "filter",
+            "-g", str(max(1, round(p["fps"] * 4))), "-fps_mode", "passthrough", "-enc_time_base", "filter",
             "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv",
         ]
         if not is_mkv:
@@ -1962,11 +2075,15 @@ def validate_export(path: Path, expected: dict) -> dict:
 
 
 def _decoded_frame_hashes(command: list[str], cache: Path, cancel: threading.Event,
-                         label: str) -> list[tuple[int, str]]:
+                         label: str, keep_partial: threading.Event | None = None,
+                         pause: threading.Event | None = None) -> list[tuple[int, str]]:
     """Hash raw 10-bit frames without storing a large uncompressed video."""
     if cancel.is_set():
         raise Cancelled("无损校验已取消，原片保留。")
+    if keep_partial is not None and keep_partial.is_set():
+        raise _SkipLosslessVerify()
     process = None
+    is_paused = False
     records = []
     log_path = cache / f"verify-{label}.log"
     try:
@@ -1974,15 +2091,27 @@ def _decoded_frame_hashes(command: list[str], cache: Path, cancel: threading.Eve
             process = subprocess.Popen(command, cwd=cache, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=log, text=True,
                                        encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
-            def stop_when_cancelled():
+            def watch_control():
+                nonlocal is_paused
                 while process.poll() is None:
-                    if cancel.wait(.2):
+                    if cancel.is_set() or (keep_partial is not None and keep_partial.is_set()):
+                        if is_paused:
+                            resume_process(process.pid)
+                            is_paused = False
                         try:
                             process.terminate()
                         except OSError:
                             pass
                         return
-            watcher = threading.Thread(target=stop_when_cancelled, daemon=True)
+                    if pause is not None:
+                        if pause.is_set() and not is_paused:
+                            if suspend_process(process.pid):
+                                is_paused = True
+                        elif not pause.is_set() and is_paused:
+                            resume_process(process.pid)
+                            is_paused = False
+                    time.sleep(.1)
+            watcher = threading.Thread(target=watch_control, daemon=True)
             watcher.start()
             for line in process.stdout:
                 if line.startswith("#") or not line.strip():
@@ -1995,6 +2124,8 @@ def _decoded_frame_hashes(command: list[str], cache: Path, cancel: threading.Eve
             watcher.join(timeout=1)
         if cancel.is_set():
             raise Cancelled("无损校验已取消，原片保留。")
+        if keep_partial is not None and keep_partial.is_set():
+            raise _SkipLosslessVerify()
         if code:
             raise ConversionError("无法完成无损校验：\n" + log_path.read_text(encoding="utf-8", errors="replace")[-4000:])
         if not records:
@@ -2002,6 +2133,9 @@ def _decoded_frame_hashes(command: list[str], cache: Path, cancel: threading.Eve
         return records
     finally:
         if process and process.poll() is None:
+            if is_paused:
+                resume_process(process.pid)
+                is_paused = False
             process.terminate()
             process.wait(timeout=15)
         if process and process.stdout:
@@ -2009,7 +2143,9 @@ def _decoded_frame_hashes(command: list[str], cache: Path, cancel: threading.Eve
 
 
 def verify_lossless(opts: Options, plan: dict, encoded: Path, cache: Path,
-                    cancel: threading.Event, callback: Callable[[dict], None]) -> dict:
+                    cancel: threading.Event, callback: Callable[[dict], None],
+                    keep_partial: threading.Event | None = None,
+                    pause: threading.Event | None = None) -> dict:
     """Compare EVERY decoded frame with the intended encoder input, not SDR."""
     threads = str(min(8, os.cpu_count() or 4))
     reference = [find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error",
@@ -2031,10 +2167,10 @@ def verify_lossless(opts: Options, plan: dict, encoded: Path, cache: Path,
     reference += suffix
     decoded = [find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-threads", threads,
                "-i", str(encoded), "-map", "0:v:0", "-an", "-sn", "-dn"] + suffix
-    callback(dict(stage="verifying", percent=99.1, message="正在逐帧校验无损：计算 HDR 编码前的参考画面…"))
-    before = _decoded_frame_hashes(reference, cache, cancel, "reference")
-    callback(dict(stage="verifying", percent=99.5, message="正在逐帧校验无损：核对解码后的每一帧…"))
-    after = _decoded_frame_hashes(decoded, cache, cancel, "decoded")
+    callback(dict(stage="verifying", percent=99.1, message="正在逐帧校验无损：计算 HDR 编码前的参考画面（可点击“停止并保留”跳过校验）…"))
+    before = _decoded_frame_hashes(reference, cache, cancel, "reference", keep_partial=keep_partial, pause=pause)
+    callback(dict(stage="verifying", percent=99.5, message="正在逐帧校验无损：核对解码后的每一帧（可点击“停止并保留”跳过校验）…"))
+    after = _decoded_frame_hashes(decoded, cache, cancel, "decoded", keep_partial=keep_partial, pause=pause)
     if len(before) != len(after):
         raise ConversionError(f"无损校验未通过：参考画面 {len(before)} 帧，导出文件 {len(after)} 帧。")
     for index, (original, reconstructed) in enumerate(zip(before, after), 1):
@@ -2079,10 +2215,12 @@ def _next_partial_path(output: Path) -> Path:
 
 def convert(opts: Options, callback: Callable[[dict], None] | None = None,
             cancel: threading.Event | None = None,
-            keep_partial: threading.Event | None = None) -> dict:
+            keep_partial: threading.Event | None = None,
+            pause: threading.Event | None = None) -> dict:
     callback = callback or (lambda _: None)
     cancel = cancel or threading.Event()
     keep_partial = keep_partial or threading.Event()
+    pause = pause or threading.Event()
     source = Path(opts.source).expanduser().resolve()
     output = Path(opts.output).expanduser().resolve()
     if not source.is_file():
@@ -2100,6 +2238,17 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
     process = None
     temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex[:10]}.part{out_ext}")
     started = time.monotonic()
+    state_lock = threading.Lock()
+    paused_total = 0.0
+    pause_started_at: float | None = None
+    is_paused = False
+
+    def active_elapsed() -> float:
+        now = time.monotonic()
+        with state_lock:
+            extra = max(0.0, now - pause_started_at) if pause_started_at is not None else 0.0
+            return max(0.0, now - started - paused_total - extra)
+
     tail = ""
     with tempfile.TemporaryDirectory(prefix="sdr2hdr-") as cache:
         cache_path = Path(cache)
@@ -2153,10 +2302,26 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 progress = {}
                 last_percent = 0
                 last_seconds = 0.0
+
+                def _resume_if_paused():
+                    nonlocal is_paused, pause_started_at, paused_total
+                    with state_lock:
+                        was_paused = is_paused
+                    if was_paused:
+                        resume_process(process.pid)
+                        with state_lock:
+                            if pause_started_at is not None:
+                                paused_total += max(0.0, time.monotonic() - pause_started_at)
+                                pause_started_at = None
+                            is_paused = False
+                        return True
+                    return False
+
                 def stop_when_cancelled():
-                    nonlocal keep_partial_triggered
+                    nonlocal keep_partial_triggered, is_paused, pause_started_at
                     while process.poll() is None:
                         if cancel.is_set():
+                            _resume_if_paused()
                             if process.poll() is None:
                                 try:
                                     process.terminate()
@@ -2164,9 +2329,10 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                                     pass
                             return
                         if keep_partial.is_set() and not keep_partial_triggered:
+                            _resume_if_paused()
                             keep_partial_triggered = True
                             callback(dict(stage="stopping", percent=last_percent,
-                                          elapsed=round(max(0.0, time.monotonic() - started), 2),
+                                          elapsed=round(active_elapsed(), 2),
                                           message="正在正常封包并保存已转换的视频片段（请勿强行关闭）…"))
                             try:
                                 if process.stdin:
@@ -2175,7 +2341,23 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                                     process.stdin.close()
                             except (OSError, ValueError):
                                 pass
-                        time.sleep(.1)
+                        elif not keep_partial_triggered:
+                            if pause.is_set():
+                                with state_lock:
+                                    already = is_paused
+                                if not already and suspend_process(process.pid):
+                                    with state_lock:
+                                        is_paused = True
+                                        pause_started_at = time.monotonic()
+                                    callback(dict(stage="paused", percent=last_percent,
+                                                  elapsed=round(active_elapsed(), 2),
+                                                  message="已暂停转换，点击“继续”可恢复编码。"))
+                            else:
+                                if _resume_if_paused():
+                                    callback(dict(stage="resumed", percent=last_percent,
+                                                  elapsed=round(active_elapsed(), 2),
+                                                  message=encoding_message))
+                        time.sleep(.08)
                 watcher = threading.Thread(target=stop_when_cancelled, daemon=True)
                 watcher.start()
                 for line in process.stdout:
@@ -2192,7 +2374,7 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                         frame = progress.get("frame", "")
                         if _finite_number(frame) is None:
                             frame = ""
-                        elapsed = max(0.0, time.monotonic() - started)
+                        elapsed = active_elapsed()
                         eta_seconds = estimate_eta_seconds(seconds, total, elapsed, speed)
                         if not keep_partial_triggered:
                             callback(dict(stage="encoding", percent=last_percent,
@@ -2202,16 +2384,22 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                                           frame=frame, message=encoding_message))
                 returncode = process.wait()
                 watcher.join(timeout=1)
+                with state_lock:
+                    if pause_started_at is not None:
+                        paused_total += max(0.0, time.monotonic() - pause_started_at)
+                        pause_started_at = None
+                    is_paused = False
             tail = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
             if cancel.is_set():
                 raise Cancelled("转换已取消，原片保留。")
             is_partial = False
+            skipped_lossless_verify = False
             final_output = output
             if keep_partial_triggered:
                 if not temporary.is_file() or temporary.stat().st_size == 0:
                     raise Cancelled("已停止转换，当前尚无可保存的完整视频片段，原片保留。")
                 callback(dict(stage="verifying", percent=99,
-                              elapsed=round(max(0.0, time.monotonic() - started), 2),
+                              elapsed=round(active_elapsed(), 2),
                               message="正在检查已转片段的 HDR、色深和编码标记…"))
                 partial_plan = {**plan, "expected_video_duration": None, "require_nonzero_duration": True}
                 try:
@@ -2224,11 +2412,22 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 if returncode:
                     raise ConversionError("转换失败：\n" + tail[-5000:])
                 callback(dict(stage="verifying", percent=99,
-                              elapsed=round(max(0.0, time.monotonic() - started), 2),
+                              elapsed=round(active_elapsed(), 2),
                               message="正在检查 HDR、色深和编码标记…"))
                 validation = validate_export(temporary, plan)
                 if plan["lossless_video"]:
-                    validation["lossless_pixels"] = verify_lossless(opts, plan, temporary, cache_path, cancel, callback)
+                    try:
+                        validation["lossless_pixels"] = verify_lossless(
+                            opts, plan, temporary, cache_path, cancel, callback,
+                            keep_partial=keep_partial, pause=pause,
+                        )
+                    except _SkipLosslessVerify:
+                        skipped_lossless_verify = True
+                        validation["lossless_pixels"] = dict(
+                            all_frames_equal=None,
+                            skipped_by_user=True,
+                            note="用户在无损逐帧校验阶段点击了“停止并保留”，已跳过耗时校验并保留完整编码的无损视频文件。",
+                        )
             if cancel.is_set():
                 raise Cancelled("转换已取消，原片保留。")
             publish_without_overwrite(temporary, final_output)
@@ -2260,13 +2459,13 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 algorithm_desc = BALANCED_ALGORITHM_ID
                 if plan.get("gpu_filter"):
                     dec_prefix = "Vulkan hwdec + " if plan.get("vulkan_hwdec") else ""
-                    method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (Gamma 2.2 BT.709->BT.2020 balanced 750 nits -> PQ) + 10-bit HEVC ({plan['video_codec']})"
+                    method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (Gamma 2.2 BT.709->BT.2020 zero-trough balanced 1000 nits -> PQ) + 10-bit HEVC ({plan['video_codec']})"
                 else:
-                    method_desc = f"Gamma 2.2 linear BT.709->BT.2020 balanced luminance-preserving 49^3 tetrahedral 3D LUT + spline36 + 10-bit HEVC ({plan['video_codec']})"
+                    method_desc = f"Gamma 2.2 linear BT.709->BT.2020 zero-trough balanced luminance-preserving 49^3 tetrahedral 3D LUT + spline36 + 10-bit HEVC ({plan['video_codec']})"
                 video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
-                mastering_desc = "BT.2020 / D65 / 1000 nits mastering container; curve peak capped at 750 nits"
-                light_desc = "750/260 nits declared MaxCLL/MaxFALL matching balanced curve ceiling (750 nits) and diffuse reference (~255 nits)"
-                fidelity_desc = "Colorimetric Gamma 2.2 BT.709-to-BT.2020 mapping keeps pure blacks at 0 nits while preserving legible shadow detail in fullscreen HDR playback, natural midtones, wide skin headroom, and smooth 750-nit specular highlights. Lost SDR detail cannot be synthesized. Online platform transcoding is outside this tool."
+                mastering_desc = "BT.2020 / D65 / 1000 nits mastering container; curve peak aligned to 1000 nits"
+                light_desc = "1000/260 nits declared MaxCLL/MaxFALL matching balanced curve ceiling (1000 nits) and diffuse reference (~235 nits)"
+                fidelity_desc = "Colorimetric Gamma 2.2 BT.709-to-BT.2020 zero-trough mapping keeps pure blacks at 0 nits while preserving legible shadow detail, natural skin tones, crisp cloud/snow highlight gradation, and full 1000-nit specular punch. Lost SDR detail cannot be synthesized. Online platform transcoding is outside this tool."
             elif plan.get("hdr_style") == "natural":
                 algorithm_desc = NATURAL_ALGORITHM_ID
                 if plan.get("gpu_filter"):
@@ -2291,9 +2490,10 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 fidelity_desc = "Fixed tone and color adjustment changes the SDR presentation intentionally. Resampling and 10-bit quantization are part of the conversion. Extreme over-range samples are capped at 1000 nits. Online platform transcoding is outside this tool."
             result = dict(tool_version=VERSION, algorithm=algorithm_desc, source=str(source), output=str(final_output),
                           options=dataclasses.asdict(opts), plan=plan, validation=validation,
-                          elapsed_seconds=round(time.monotonic() - started, 2),
+                          elapsed_seconds=round(active_elapsed(), 2),
                           partial=is_partial,
                           stopped_early=is_partial,
+                          skipped_lossless_verify=skipped_lossless_verify,
                           encoder=plan["encoder"],
                           video_codec=plan["video_codec"],
                           hardware_accelerated=plan["hardware_accelerated"],
@@ -2318,14 +2518,23 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                     json.dump(result, f, ensure_ascii=False, indent=2)
             except OSError:
                 pass  # A valid finished video must not be reported as failed over an optional log.
-            done_msg = ("已停止并保留已转换的 HDR 视频片段（已通过文件检查）。"
-                        if is_partial else "HDR 视频已导出并通过文件检查。")
+            if is_partial:
+                done_msg = "已停止并保留已转换的 HDR 视频片段（已通过文件检查）。"
+            elif skipped_lossless_verify:
+                done_msg = "已跳过无损逐帧校验并保留完整无损 HDR 视频（基础 HDR10 检查均通过）。"
+            else:
+                done_msg = "HDR 视频已导出并通过文件检查。"
             callback(dict(stage="done", percent=100, partial=is_partial,
+                          skipped_lossless_verify=skipped_lossless_verify,
                           elapsed=result["elapsed_seconds"],
                           message=done_msg, result=result))
             return result
         finally:
             if process and process.poll() is None:
+                with state_lock:
+                    was_paused = is_paused
+                if was_paused:
+                    resume_process(process.pid)
                 process.terminate()
                 process.wait(timeout=15)
             if process and process.stdin:
@@ -2373,7 +2582,7 @@ def cli():
     parser.add_argument("--resolution", choices=["original", "1440", "2160"], default="original")
     parser.add_argument("--quality", choices=["fast", "standard", "fine", "lossless"], default="standard")
     parser.add_argument("--style", dest="hdr_style", choices=["balanced", "natural", "vivid"], default="balanced",
-                        help="SDR 转 HDR 风格：balanced 影院均衡高光（推荐电影·750 nit），natural 柔和暗室保护（450 nit），vivid 高对比风格（原版·动漫）")
+                        help="SDR 转 HDR 风格：balanced 影院均衡高光（推荐电影·1000 nit），natural 柔和暗室保护（450 nit），vivid 高对比风格（原版·动漫）")
     parser.add_argument("--gpu-filter", choices=["auto", "off"], default="auto",
                         help="GPU 色彩滤镜加速：auto 自动启用 Vulkan/libplacebo GPU 着色器（不支持时回退 CPU），off 强制 CPU 滤镜")
     parser.add_argument("--multipass", action="store_true",

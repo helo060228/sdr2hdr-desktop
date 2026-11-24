@@ -4,7 +4,7 @@
 
 SDR 转 HDR10 提供三种独立管线（显卡有损编码默认经 Vulkan + `libplacebo` GLSL GPU 着色器执行；CPU / 无损编码经 `zscale` + LUT 浮点管线执行）：
 
-- **影院均衡高光（`balanced`，750 nit，默认）**：解析输入颜色信息 → `Gamma 2.2` 线性解码 → `BT.709→BT.2020` 线性色域变换 → 通透暗部 + 中间调平滑抬升 + 高光余量曲线（峰值 `750 nits`）→ PQ / BT.2020 → 10-bit YUV 4:2:0 → HEVC / MP4·MKV（`MaxCLL = 750 / MaxFALL = 260`）。
+- **影院均衡高光（`balanced`，1000 nit，默认）**：解析输入颜色信息 → `Gamma 2.2` 线性解码 → `BT.709→BT.2020` 线性色域变换 → 零凹陷通透暗部与 1000 nit 高光余量曲线 → PQ / BT.2020 → 10-bit YUV 4:2:0 → HEVC / MP4·MKV（`MaxCLL = 1000 / MaxFALL = 260`）。
 - **柔和暗室保护（`natural`，450 nit）**：解析输入颜色信息 → `BT.1886` 线性解码 → `BT.709→BT.2020` 线性色域变换 → 保守等色度高光保护曲线（峰值 `450 nits`）→ PQ / BT.2020 → 10-bit YUV 4:2:0 → HEVC / MP4（`MaxCLL = 450 / MaxFALL = 200`）。
 - **高对比风格（`vivid`，原版）**：解析输入颜色信息 → 浮点非线性 RGB → 色差增益（`U/V × 0.56`）→ 65,536 点一维对数曲线 / 等价着色器 → PQ / BT.2020 → 10-bit YUV 4:2:0 → HEVC / MP4（`MaxCLL = 1000 / MaxFALL = 1000`）。
 
@@ -16,21 +16,18 @@ SDR 转 HDR10 提供三种独立管线（显卡有损编码默认经 Vulkan + `l
 
 读取输入视频的颜色矩阵、传递函数、原色和量化范围，按输入信息显式完成 YUV / RGB 转换。当前接受逐行扫描 BT.709 / BT.601 SDR；缺失颜色标记时会使用推定值并记录在 `.hdr.json` 转换计划中。
 
-### 风格一：影院均衡高光（`balanced`，默认，推荐电影·750 nit）
+### 风格一：影院均衡高光（`balanced`，默认，推荐电影·1000 nit）
 
-兼顾纯黑不泛灰、通透暗部细节、自然中间调亮度、肤色纹理不发白过曝与 750 nits 极亮高光冲击力：
+兼顾纯黑不泛灰、通透暗部细节、自然中间调亮度、清晰云层／雪地亮部层次、肤色不发白过曝与 1000 nits 极亮高光冲击力：
 
 1. **线性解码与色域矩阵**：按 **Gamma 2.2**（贴合 PC 与客厅 SDR 观感，避免全屏 HDR 分区控光压黑暗部细节）解码至相对线性光并使用对应原色矩阵变换到线性 BT.2020 `(R_2020, G_2020, B_2020)`，保持零色度偏移。
-2. **暗部通透 + 中间调均衡 + 750 nit 高光余量曲线**：按 BT.2020 相对亮度 `Y = 0.2627·R_2020 + 0.6780·G_2020 + 0.0593·B_2020` 计算目标尼特亮度（暗部斜坡 `0.08`、漫反射基准 `255 nits`、中间调平滑增益 `0.12`、拐点 `Y_k = 0.68`）：
+2. **零凹陷单调 1000 nit 高光曲线**：按 BT.2020 相对亮度 `Y = 0.2627·R_2020 + 0.6780·G_2020 + 0.0593·B_2020` 计算目标尼特亮度（漫反射基准 `235 nits`、拐点 `Y_k = 0.58`、指数 `2.5`、峰值 `1000 nits`，一阶导数全程连续且无高亮对比度凹陷）：
    ```text
-   s        = clamp(Y / 0.08, 0, 1)
-   smooth_s = s^2 · (3 - 2s)
-   L_diff(Y)= 255 · Y · (1 + 0.48 · Y · (1 - Y) · smooth_s)
-   L(Y)     = L_diff(Y)                                       ,  0 ≤ Y ≤ 0.68
-   L(Y)     = L_diff(Y) + 495 · ((Y - 0.68) / 0.32)^2.3       ,  0.68 < Y < 1.0
+   L(Y) = 235 · Y                                       ,  0 ≤ Y ≤ 0.58
+   L(Y) = 235 · Y + 765 · ((Y - 0.58) / 0.42)^2.5       ,  0.58 < Y ≤ 1.0
    ```
-   对三通道施加**同一亮度增益** `gain = L(Y) / Y`（峰值按 `750 / max(R, G, B)` 等比例限幅）。纯黑锚定 `0.00 nits`，暗木与室内阴影（`v = 0.05～0.20`）位于 `0.35～7.42 nits` 贴齐 Gamma 2.2，正常肤色稳在约 `138.5 nits`，受光额头稳在约 `207 / 750 nits`（PQ 余量超 3.6 倍），极亮灯光平滑冲至 `750 nits`。
-3. **执行路径与元数据**：GPU 路径由 `//!HOOK MAIN` GLSL 着色器直接解析计算；CPU / 无损路径烘焙为缓存的 `49³` `.cube` 3D LUT 并经 `lut3d=interp=tetrahedral` 与 `spline36 + error_diffusion` 输出有限范围 `yuv420p10le`，写入 **`MaxCLL = 750 / MaxFALL = 260`**。
+   对三通道施加**同一亮度增益** `gain = L(Y) / Y`（峰值按 `1000 / max(R, G, B)` 等比例限幅）。纯黑锚定 `0.00 nits`，暗木与室内阴影（`v = 0.05～0.20`）位于 `0.32～6.82 nits` 贴齐 Gamma 2.2，受光肤色稳在约 `174 / 1000 nits`（5.7 倍 PQ 余量），云层与雪地高亮段（`v = 0.80～0.90`）`dPQ/dv` 保持饱满陡峭，极亮灯光平滑冲至 `1000 nits`。
+3. **执行路径与元数据**：GPU 路径由 `//!HOOK MAIN` GLSL 着色器直接解析计算；CPU / 无损路径烘焙为缓存的 `49³` `.cube` 3D LUT 并经 `lut3d=interp=tetrahedral` 与 `spline36 + error_diffusion` 输出有限范围 `yuv420p10le`，写入 **`MaxCLL = 1000 / MaxFALL = 260`**。
 
 ### 风格二：柔和暗室保护（`natural`，450 nit）
 
@@ -83,17 +80,17 @@ SDR 转 HDR10 提供三种独立管线（显卡有损编码默认经 Vulkan + `l
 
 ### CPU 软件编码（`libx265`）
 
-- 快速：`ultrafast`，CRF 17。
-- 标准：`fast`，CRF 17。
-- 精细：`medium`，CRF 16。
+- 快速：`ultrafast`，CRF 21。
+- 标准：`fast`，CRF 19。
+- 精细：`medium`，CRF 18。
 - 画面无损：`lossless=1`（`fast` 预设），不传 CRF 参数。
-- HDR10 颜色标记与静态元数据通过 `-x265-params` 写入码流。
+- 关键帧间隔统一为 `4 秒`（`-g round(fps * 4)`），HDR10 颜色标记与静态元数据通过 `-x265-params` 写入码流。
 
 ### 显卡硬件编码（10-bit Main 10 / `p010le`）
 
-- **NVIDIA NVENC（`hevc_nvenc`）**：快速 `p2 / VBR CQ 22`；标准 `p5 / VBR CQ 20`；精细默认单遍 `p6 / VBR CQ 18 / spatial-aq`（启用 `--multipass` 时切换 `p7 / multipass qres`）；画面无损 `-preset p4 -tune lossless`（若本地显卡自检通过）。
-- **Intel QSV（`hevc_qsv`）**：针对 10-bit HDR10 校准为快速 `faster / ICQ 19`、标准 `medium / ICQ 16`、精细 `slow / ICQ 14`，并在运行时自检通过时自动启用 `-extbrc 1 -mbbrc 1 -adaptive_i 1 -adaptive_b 1`（不支持无损档；不兼容 ExtBRC 的驱动自动回退纯 ICQ）。
-- **AMD AMF（`hevc_amf`）**：启用 `-bitdepth 10`，快速 `speed / CQP 22`；标准 `balanced / CQP 20`；精细 `quality / CQP 18`（不支持无损档）。
+- **NVIDIA NVENC（`hevc_nvenc`）**：快速 `p2 / VBR CQ 25`；标准 `p5 / VBR CQ 23`；精细默认单遍 `p6 / VBR CQ 21 / spatial-aq`（启用 `--multipass` 时切换 `p7 / multipass qres`）；画面无损 `-preset p4 -tune lossless`（若本地显卡自检通过）。
+- **Intel QSV（`hevc_qsv`）**：针对 10-bit HDR10 校准为快速 `faster / ICQ 23`、标准 `medium / ICQ 21`、精细 `slow / ICQ 19`，并在运行时自检通过时自动启用 `-extbrc 1 -mbbrc 1 -adaptive_i 1 -adaptive_b 1`（不支持无损档；不兼容 ExtBRC 的驱动自动回退纯 ICQ）。
+- **AMD AMF（`hevc_amf`）**：启用 `-bitdepth 10`，快速 `speed / CQP 25`；标准 `balanced / CQP 23`；精细 `quality / CQP 21`（不支持无损档）。
 
 ### 滤镜衔接、GPU 色彩加速与元数据传播
 

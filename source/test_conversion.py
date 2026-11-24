@@ -347,7 +347,15 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(plan_st["hdr_style"], style)
             self.assertIn(f"custom_shader_path={shader}", cmd_st[cmd_st.index("-vf") + 1])
 
-        # NVENC fine defaults to single-pass (p6, no -multipass); multipass=True enables p7 + qres.
+        # NVENC uses calibrated CQ (25/23/21) and 4-second GOP; fine defaults to single-pass (p6), multipass enables p7 + qres.
+        for q_tier, expected_cq in (("fast", "25"), ("standard", "23"), ("fine", "21")):
+            cmd_nv_q, _ = core.build_command(
+                core.Options("in.mp4", str(dest), encoder="nvenc", quality=q_tier),
+                fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=no_gpu_filter,
+            )
+            self.assertEqual(cmd_nv_q[cmd_nv_q.index("-cq") + 1], expected_cq)
+            self.assertEqual(cmd_nv_q[cmd_nv_q.index("-g") + 1], "120")
+
         cmd_nv_fine, plan_nv_fine = core.build_command(
             core.Options("in.mp4", str(dest), encoder="nvenc", quality="fine"),
             fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=no_gpu_filter,
@@ -364,8 +372,8 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(plan_nv_mp["preset"], "p7")
         self.assertEqual(cmd_nv_mp[cmd_nv_mp.index("-multipass") + 1], "qres")
 
-        # QSV uses calibrated ICQ (19/16/14) and enables ExtBRC/MBBRC only when probed supported.
-        for q_tier, expected_icq in (("fast", "19"), ("standard", "16"), ("fine", "14")):
+        # QSV uses calibrated ICQ (23/21/19) and enables ExtBRC/MBBRC only when probed supported.
+        for q_tier, expected_icq in (("fast", "23"), ("standard", "21"), ("fine", "19")):
             cmd_qsv_no_ext, plan_qsv_no_ext = core.build_command(
                 core.Options("in.mp4", str(dest), encoder="qsv", quality=q_tier),
                 fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=no_gpu_filter,
@@ -924,7 +932,7 @@ class ConversionTests(unittest.TestCase):
             v = struct.unpack(f"<{128 * 72}H", raw.stdout[256 * 144 * 2 + 128 * 72 * 2:])[128 * 36 + 64]
             return (y, u, v)
 
-        for style, expected_cll in (("balanced", (750, 260)), ("natural", (450, 200)), ("vivid", (1000, 1000))):
+        for style, expected_cll in (("balanced", (1000, 260)), ("natural", (450, 200)), ("vivid", (1000, 1000))):
             gpu_out = self.dir / f"gpu_{style}.mp4"
             cpu_out = self.dir / f"cpu_{style}.mp4"
             res_gpu = core.convert(core.Options(str(skin_src), str(gpu_out), quality="standard", encoder="auto",
@@ -970,20 +978,24 @@ class ConversionTests(unittest.TestCase):
             self.assertAlmostEqual(nits[1] / nits[0], lin20[1] / lin20[0], delta=1e-5)
             self.assertAlmostEqual(nits[2] / nits[0], lin20[2] / lin20[0], delta=1e-5)
 
-        # True black, Gamma 2.2 shadow transparency, natural midtones, wide skin headroom, and 750-nit specular punch.
+        # True black, Gamma 2.2 shadow transparency, calm skin headroom, zero cloud/snow contrast trough, and 1000-nit specular punch.
         self.assertEqual(decoded_nits((0.0, 0.0, 0.0)), (0.0, 0.0, 0.0))
         self.assertGreaterEqual(max(decoded_nits((0.05, 0.05, 0.05))), 0.30)
         shelf_nits = max(decoded_nits((0.10, 0.10, 0.10)))
-        self.assertGreaterEqual(shelf_nits, 1.4)
-        self.assertLessEqual(shelf_nits, 1.8)
+        self.assertGreaterEqual(shelf_nits, 1.35)
+        self.assertLessEqual(shelf_nits, 1.75)
         shadow_nits = max(decoded_nits((0.12, 0.10, 0.08)))
-        self.assertGreaterEqual(shadow_nits, 1.8)
-        self.assertLessEqual(shadow_nits, 2.4)
-        self.assertGreater(max(decoded_nits((0.50, 0.52, 0.56))), 70.0)
+        self.assertGreaterEqual(shadow_nits, 1.7)
+        self.assertLessEqual(shadow_nits, 2.3)
+        self.assertGreater(max(decoded_nits((0.50, 0.52, 0.56))), 60.0)
         forehead_peak = max(decoded_nits((0.92, 0.78, 0.65)))
-        self.assertGreater(forehead_peak, 195.0)
-        self.assertLess(forehead_peak, 220.0)
-        self.assertGreater(max(decoded_nits((0.99, 0.99, 0.98))), 600.0)
+        self.assertGreater(forehead_peak, 160.0)
+        self.assertLess(forehead_peak, 210.0)
+        # Verify zero contrast trough in cloud/snow highlight gradation band (v = 0.80 -> 0.86).
+        pq_80 = core.pq_encode(core.balanced_target_nits(0.80 ** core.BALANCED_GAMMA))
+        pq_86 = core.pq_encode(core.balanced_target_nits(0.86 ** core.BALANCED_GAMMA))
+        self.assertGreater((pq_86 - pq_80) / 0.06, 0.55)
+        self.assertGreater(max(decoded_nits((0.99, 0.99, 0.98))), 850.0)
         for ch in decoded_nits((1.0, 1.0, 1.0)):
             self.assertAlmostEqual(ch, core.BALANCED_PEAK_NITS, delta=0.5)
 
@@ -1026,11 +1038,11 @@ class ConversionTests(unittest.TestCase):
         out_bal = self.dir / "均衡风格_标准.mp4"
         res_bal = core.convert(core.Options(str(source), str(out_bal), quality="standard", encoder="auto", hdr_style="balanced"))
         self.assertEqual(res_bal["plan"]["hdr_style"], "balanced")
-        self.assertEqual(res_bal["plan"]["content_light"], "750,260")
+        self.assertEqual(res_bal["plan"]["content_light"], "1000,260")
         self.assertTrue(all(res_bal["validation"]["checks"].values()))
         cll_bal = next(s for s in res_bal["validation"]["first_frame_side_data"]
                        if s.get("side_data_type") == "Content light level metadata")
-        self.assertEqual((cll_bal["max_content"], cll_bal["max_average"]), (750, 260))
+        self.assertEqual((cll_bal["max_content"], cll_bal["max_average"]), (1000, 260))
 
         out_bal_ll = self.dir / "均衡风格_无损.mp4"
         res_bal_ll = core.convert(core.Options(str(source), str(out_bal_ll), quality="lossless", encoder="auto", hdr_style="balanced"))
@@ -1146,46 +1158,35 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(len(done_events), 1)
         self.assertIn("elapsed", done_events[0])
 
-    def test_responsive_layout_windowed_maximized_and_hysteresis(self):
+    def test_proportional_fullscreen_scaling_metrics(self):
         import app as gui_app
 
-        # 1. Normal windowed on 125% DPI (1175x781)
-        win = gui_app.compute_responsive_layout(1175, 781, 696, 1.25, "normal")
-        self.assertEqual(win["mode"], "normal")
-        self.assertFalse(win["need_scroll"])
-        self.assertEqual(win["card_w"], 1145)
-        self.assertEqual(win["card_x"], 15)
+        # 1. Normal windowed on 125% DPI (1250x880 -> logical 1000x704): scale ~1.0
+        win = gui_app.compute_proportional_scale(1250, 880, 1.25)
+        self.assertGreaterEqual(win["scale"], 0.95)
+        self.assertLessEqual(win["scale"], 1.05)
+        self.assertEqual(win["body_font"], 10)
 
-        # 2. Maximized 2560x1440 at 125% DPI
-        max_qhd = gui_app.compute_responsive_layout(2560, 1370, 860, 1.25, "normal")
-        self.assertEqual(max_qhd["mode"], "large")
-        self.assertEqual(max_qhd["card_w"], 1600)
-        self.assertEqual(max_qhd["card_x"], 480)
-        self.assertGreater(max_qhd["card_y"], 100)
-        self.assertFalse(max_qhd["need_scroll"])
+        # 2. Maximized 2560x1370 at 125% DPI scales up proportionally without shrinking
+        max_qhd = gui_app.compute_proportional_scale(2560, 1370, 1.25)
+        self.assertGreater(max_qhd["scale"], 1.45)
+        self.assertGreater(max_qhd["body_font"], win["body_font"])
+        self.assertGreater(max_qhd["title_font"], win["title_font"])
+        self.assertGreater(max_qhd["tree_row_h"], win["tree_row_h"])
 
-        # 3. Maximized 1920x1080 at 100% DPI
-        max_fhd_100 = gui_app.compute_responsive_layout(1920, 1010, 680, 1.0, "normal")
-        self.assertEqual(max_fhd_100["mode"], "large")
-        self.assertEqual(max_fhd_100["card_w"], 1280)
-        self.assertEqual(max_fhd_100["card_x"], 320)
-        self.assertFalse(max_fhd_100["need_scroll"])
+        # 3. Fullscreen 2560x1440 at 125% DPI scales >= maximized
+        fs_qhd = gui_app.compute_proportional_scale(2560, 1440, 1.25)
+        self.assertGreaterEqual(fs_qhd["scale"], max_qhd["scale"])
 
-        # 4. Maximized 1920x1080 at 125% DPI stays normal density + centered card without scroll
-        max_fhd_125 = gui_app.compute_responsive_layout(1920, 1010, 700, 1.25, "normal")
-        self.assertEqual(max_fhd_125["mode"], "normal")
-        self.assertEqual(max_fhd_125["card_w"], 1400)
-        self.assertEqual(max_fhd_125["card_x"], 260)
-        self.assertFalse(max_fhd_125["need_scroll"])
+        # 4. Maximized 1920x1010 at 100% DPI scales up cleanly
+        max_fhd = gui_app.compute_proportional_scale(1920, 1010, 1.0)
+        self.assertGreater(max_fhd["scale"], 1.35)
+        self.assertGreater(max_fhd["body_font"], 12)
 
-        # 5. Hysteresis band (1280x790 at 100% DPI)
-        self.assertEqual(gui_app.compute_responsive_layout(1280, 790, 560, 1.0, "normal")["mode"], "normal")
-        self.assertEqual(gui_app.compute_responsive_layout(1280, 790, 640, 1.0, "large")["mode"], "large")
-
-        # 6. Short window activates vertical scrollbar cleanly
-        short = gui_app.compute_responsive_layout(940, 340, 560, 1.0, "normal")
-        self.assertEqual(short["mode"], "normal")
-        self.assertTrue(short["need_scroll"])
+        # 5. Small compact window stays readable (never drops below 0.90 floor)
+        small = gui_app.compute_proportional_scale(820, 560, 1.0)
+        self.assertGreaterEqual(small["scale"], 0.90)
+        self.assertGreaterEqual(small["body_font"], 9)
 
     def test_multichannel_original_audio_passthrough_mp4_and_mkv(self):
         ffmpeg = core.find_tool("ffmpeg")
@@ -1370,6 +1371,128 @@ class ConversionTests(unittest.TestCase):
         )
         self.assertIn("已选 1/2 条", summary)
         self.assertIn("内嵌字幕 已选 1/2 条", summary)
+
+    def test_pause_resume_and_cancel_while_paused(self):
+        import time
+
+        ffmpeg = core.find_tool("ffmpeg")
+        source = self.dir / "暂停测试源.mp4"
+        r = core.capture([
+            ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=480x270:r=25:d=6",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2", str(source),
+        ])
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        # 1. Pause mid-encode for ~0.8s, then resume and verify clean HDR10 completion + active elapsed excludes pause.
+        out_resume = self.dir / "暂停后继续_HDR.mp4"
+        pause_ev = threading.Event()
+        events = []
+        triggered = [False]
+
+        def on_prog(ev):
+            events.append(ev)
+            if ev.get("stage") == "encoding" and ev.get("seconds", 0) >= 0.3 and not triggered[0]:
+                triggered[0] = True
+                pause_ev.set()
+                threading.Timer(0.8, pause_ev.clear).start()
+
+        wall_start = time.monotonic()
+        res = core.convert(
+            core.Options(str(source), str(out_resume), quality="standard", encoder="cpu"),
+            callback=on_prog,
+            pause=pause_ev,
+        )
+        wall_elapsed = time.monotonic() - wall_start
+        self.assertTrue(all(res["validation"]["checks"].values()))
+        self.assertTrue(any(e.get("stage") == "paused" for e in events))
+        self.assertTrue(any(e.get("stage") == "resumed" for e in events))
+        self.assertLess(res["elapsed_seconds"], wall_elapsed - 0.35)
+
+        # 2. Cancel WHILE paused must automatically resume & terminate cleanly without hanging or leaving partials.
+        out_cancel = self.dir / "暂停时取消_HDR.mp4"
+        pause_ev2 = threading.Event()
+        cancel_ev2 = threading.Event()
+        paused_once = [False]
+
+        def on_prog2(ev):
+            if ev.get("stage") == "encoding" and not paused_once[0]:
+                paused_once[0] = True
+                pause_ev2.set()
+            elif ev.get("stage") == "paused":
+                cancel_ev2.set()
+
+        with self.assertRaises(core.Cancelled):
+            core.convert(
+                core.Options(str(source), str(out_cancel), quality="standard", encoder="cpu"),
+                callback=on_prog2,
+                cancel=cancel_ev2,
+                pause=pause_ev2,
+            )
+        self.assertFalse(out_cancel.exists())
+        self.assertEqual(list(self.dir.glob("*.part.mp4")), [])
+
+    def test_keep_partial_skips_lossless_verification_and_publishes_full_file(self):
+        source = self.make_source(width=256, height=144, name="无损跳过校验源.mkv")
+        output = self.dir / "无损跳过校验_HDR.mp4"
+        keep_partial = threading.Event()
+
+        def on_prog(ev):
+            if ev.get("stage") == "verifying" and ev.get("percent") == 99.1:
+                keep_partial.set()
+
+        result = core.convert(
+            core.Options(str(source), str(output), quality="lossless", encoder="auto"),
+            callback=on_prog,
+            keep_partial=keep_partial,
+        )
+        self.assertTrue(output.is_file())
+        self.assertEqual(Path(result["output"]), output)
+        self.assertFalse(result["partial"])
+        self.assertTrue(result["skipped_lossless_verify"])
+        self.assertTrue(result["validation"]["lossless_pixels"]["skipped_by_user"])
+        self.assertTrue(all(result["validation"]["checks"].values()))
+
+    def test_custom_preview_timecode_queue_helpers_and_power_actions(self):
+        import app as gui_app
+
+        # Timecode parser
+        self.assertAlmostEqual(core.parse_timecode_seconds("90"), 90.0)
+        self.assertAlmostEqual(core.parse_timecode_seconds("01:30"), 90.0)
+        self.assertAlmostEqual(core.parse_timecode_seconds("1:02:03.5"), 3723.5)
+        for bad in ("", "-5", "1:70", "1:2:3:4", "abc"):
+            with self.assertRaises(ValueError):
+                core.parse_timecode_seconds(bad)
+
+        # Default preview window centers on middle of video
+        st, du = core.default_preview_window(600.0, 30.0)
+        self.assertEqual((st, du), (285.0, 30.0))
+        self.assertEqual(core.default_preview_window(12.0, 30.0), (0.0, 12.0))
+        self.assertEqual(core.default_preview_window(0.0, 30.0), (0.0, 30.0))
+
+        # Queue path collision avoidance across both disk and reserved queue entries
+        sample = self.dir / "movie.mkv"
+        sample.write_bytes(b"x")
+        first = gui_app.next_unique_output_path(sample, "_HDR.mkv")
+        self.assertTrue(first.endswith("movie_HDR.mkv"))
+        second = gui_app.next_unique_output_path(sample, "_HDR.mkv", reserved={first})
+        self.assertTrue(second.endswith("movie_HDR_2.mkv"))
+        summary = gui_app.format_queue_task_summary(first, "balanced", "standard", "original", "original", [1], [2])
+        self.assertIn("MKV", summary)
+        self.assertIn("影院1000nit", summary)
+        self.assertIn("音轨1", summary)
+        self.assertIn("字幕1", summary)
+
+        # Power action dispatch (mocked, never executes real OS shutdown/sleep in tests)
+        core.trigger_power_action("none")
+        with self.assertRaises(core.ConversionError):
+            core.trigger_power_action("reboot_invalid")
+        with patch.object(core.subprocess, "Popen") as mock_popen:
+            core.trigger_power_action("shutdown")
+            mock_popen.assert_called_once()
+            self.assertIn("shutdown", mock_popen.call_args[0][0][0])
 
 
 if __name__ == "__main__":
