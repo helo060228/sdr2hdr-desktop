@@ -299,7 +299,7 @@ class App:
         c_style.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         c2.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
         c3.bind("<<ComboboxSelected>>", lambda e: self.update_encoding_note())
-        audio_hint_lbl = ttk.Label(box, text="虚拟环绕输出双声道空间音效；原声模式尽可能保留原音轨，HDR 画面不重复增强。", style="Sub.TLabel")
+        audio_hint_lbl = ttk.Label(box, text="原声模式无损直拷原多声道音轨（5.1/7.1/Atmos 等，支持 MP4/MKV）；虚拟环绕输出双声道；HDR 画面不重复增强。", style="Sub.TLabel")
         audio_hint_lbl.pack(anchor="w", pady=(0, 4))
 
         div_bottom = tk.Frame(box, bg=DIVIDER_BG, height=1)
@@ -547,10 +547,12 @@ class App:
             self.set_input(p)
 
     def _next_output_path(self, source: Path, suffix: str) -> str:
-        dest = source.with_name(source.stem + suffix)
+        ext = Path(suffix).suffix or ".mp4"
+        stem_suffix = suffix[:-len(ext)] if suffix.lower().endswith(ext.lower()) else suffix
+        dest = source.with_name(source.stem + stem_suffix + ext)
         count = 2
         while dest.exists():
-            dest = source.with_name(source.stem + suffix.replace(".mp4", f"_{count}.mp4"))
+            dest = source.with_name(f"{source.stem}{stem_suffix}_{count}{ext}")
             count += 1
         return str(dest)
 
@@ -566,8 +568,18 @@ class App:
                 kind = inspected["kind"]
                 p = inspected["properties"]
                 dv = inspected["dv"]
+                audio = inspected.get("audio") or {}
                 duration_label = f"{p['duration']:.1f} 秒" if p["duration"] else "时长未提供"
-                base = f"{p['width']} × {p['height']}  ·  {p['fps']:g} 帧/秒  ·  {duration_label}  ·  "
+                if audio.get("count"):
+                    ch_info = audio.get("primary_label") or "音频"
+                    audio_tag = (
+                        f"  ·  {audio['count']} 条音轨（{ch_info} 等）"
+                        if audio["count"] > 1 else f"  ·  {ch_info}"
+                    )
+                else:
+                    audio_tag = "  ·  无音轨"
+                prefer_mkv = source.suffix.lower() == ".mkv" and bool(audio.get("needs_mkv_for_lossless_audio"))
+                base = f"{p['width']} × {p['height']}  ·  {p['fps']:g} 帧/秒  ·  {duration_label}{audio_tag}  ·  "
                 if kind == "dv_strip":
                     msg = base + f"杜比视界 {dv['profile_label']} → 秒级无损直剥 HDR10"
                     if dv.get("dv_profile") == 7:
@@ -582,14 +594,24 @@ class App:
                     msg = base + "SDR → HDR10"
                     if p["guessed"]:
                         msg += "\n" + "；".join(p["guessed"])
-                self.queue.put(dict(stage="input", path=path, message=msg, kind=kind, dv=dv, initial_output=initial_output))
+                if prefer_mkv and kind != "hdr10":
+                    msg += "\n说明：原片包含 MP4 不支持直拷的音轨，已默认设为 .mkv 以无损保留原多声道音轨（可在“保存到…”改选 MP4）。"
+                self.queue.put(dict(stage="input", path=path, message=msg, kind=kind, dv=dv,
+                                    prefer_mkv=prefer_mkv, initial_output=initial_output))
             except Exception as e:
-                self.queue.put(dict(stage="input", path=path, message=str(e), kind="sdr", dv=None))
+                self.queue.put(dict(stage="input", path=path, message=str(e), kind="sdr", dv=None, prefer_mkv=False))
         threading.Thread(target=read, daemon=True).start()
 
     def pick_output(self):
-        p = filedialog.asksaveasfilename(title="保存 HDR 副本", defaultextension=".mp4", initialfile=Path(self.output.get()).name,
-                                       filetypes=[("HDR 视频", "*.mp4")], confirmoverwrite=False)
+        current = Path(self.output.get() or "output_HDR.mp4")
+        default_ext = current.suffix.lower() if current.suffix.lower() in (".mp4", ".mkv") else ".mp4"
+        filetypes = (
+            [("MKV 视频 (*.mkv，完整保留 TrueHD/DTS-HD 等多声道)", "*.mkv"), ("MP4 视频 (*.mp4)", "*.mp4")]
+            if default_ext == ".mkv" else
+            [("MP4 视频 (*.mp4)", "*.mp4"), ("MKV 视频 (*.mkv，完整保留 TrueHD/DTS-HD 等多声道)", "*.mkv")]
+        )
+        p = filedialog.asksaveasfilename(title="保存 HDR 副本", defaultextension=default_ext, initialfile=current.name,
+                                       filetypes=filetypes, confirmoverwrite=False)
         if p:
             self.output.set(p)
 
@@ -603,10 +625,11 @@ class App:
             return
         if preview:
             p = Path(output)
-            p = p.with_name(p.stem + "_10秒试转.mp4")
+            ext = p.suffix if p.suffix.lower() in (".mp4", ".mkv") else ".mp4"
+            p = p.with_name(f"{p.stem}_10秒试转{ext}")
             n = 2
             while p.exists():
-                p = Path(output).with_name(Path(output).stem + f"_10秒试转_{n}.mp4")
+                p = Path(output).with_name(f"{Path(output).stem}_10秒试转_{n}{ext}")
                 n += 1
             output = str(p)
         resolution = {"保持原尺寸": "original", "2K · 短边 1440": "1440", "4K · 短边 2160": "2160"}[self.resolution.get()]
@@ -684,7 +707,7 @@ class App:
             return
         self.keep_partial.set()
         self.save_partial_button.configure(state="disabled")
-        self.status.set("正在正常封包并保存已转换的 MP4 片段（请勿强行关闭）…")
+        self.status.set("正在正常封包并保存已转换的视频片段（请勿强行关闭）…")
 
     def poll(self):
         try:
@@ -700,10 +723,13 @@ class App:
                             self.resolution.set("保持原尺寸")
                         if self.output.get() == p.get("initial_output"):
                             name = Path(p["path"])
+                            ext = ".mkv" if p.get("prefer_mkv") else ".mp4"
                             if self.input_kind == "hdr10":
                                 self.output.set(self._next_output_path(name, "_环绕.mp4"))
                             elif self.input_kind in ("dv_strip", "dv_reencode"):
-                                self.output.set(self._next_output_path(name, "_HDR10.mp4"))
+                                self.output.set(self._next_output_path(name, f"_HDR10{ext}"))
+                            elif p.get("prefer_mkv"):
+                                self.output.set(self._next_output_path(name, "_HDR.mkv"))
                         button_text = {
                             "dv_strip": "无损导出 HDR10",
                             "dv_reencode": "导出完整 HDR10",

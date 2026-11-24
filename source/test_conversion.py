@@ -1180,6 +1180,82 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(short["mode"], "normal")
         self.assertTrue(short["need_scroll"])
 
+    def test_multichannel_original_audio_passthrough_mp4_and_mkv(self):
+        ffmpeg = core.find_tool("ffmpeg")
+
+        def packet_hash(path: Path, track_idx: int) -> str:
+            r = core.capture([ffmpeg, "-v", "error", "-i", str(path), "-map", f"0:a:{track_idx}",
+                              "-c", "copy", "-f", "hash", "-hash", "sha256", "-"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout.strip()
+
+        # 1. Dual-track 5.1 EAC3 + 5.1 AC3 MKV -> .mp4 (audio_effect="original"): both copied losslessly.
+        src_multi = self.dir / "双轨51.mkv"
+        r1 = core.capture([
+            ffmpeg, "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc2=s=256x144:r=25:d=0.6",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=5.1", "-t", "0.6",
+            "-map", "0:v:0", "-map", "1:a:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+            "-c:a:0", "eac3", "-c:a:1", "ac3", str(src_multi),
+        ])
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        inspected_multi = core.inspect_input(src_multi)
+        self.assertEqual(inspected_multi["audio"]["count"], 2)
+        self.assertEqual(inspected_multi["audio"]["primary_channels"], 6)
+        self.assertFalse(inspected_multi["audio"]["needs_mkv_for_lossless_audio"])
+
+        out_multi_mp4 = self.dir / "双轨51_HDR.mp4"
+        res_multi = core.convert(core.Options(str(src_multi), str(out_multi_mp4), quality="fast", encoder="cpu"))
+        self.assertEqual(res_multi["plan"]["audio"], "copy")
+        self.assertEqual(res_multi["plan"]["container"], "mp4")
+        self.assertTrue(all(res_multi["validation"]["checks"].values()))
+        out_audio_multi = [s for s in core.probe(out_multi_mp4)["streams"] if s["codec_type"] == "audio"]
+        self.assertEqual(len(out_audio_multi), 2)
+        self.assertEqual([(a["codec_name"], a["channels"]) for a in out_audio_multi], [("eac3", 6), ("ac3", 6)])
+        self.assertEqual(packet_hash(src_multi, 0), packet_hash(out_multi_mp4, 0))
+        self.assertEqual(packet_hash(src_multi, 1), packet_hash(out_multi_mp4, 1))
+
+        # 2. 5.1 PCM MKV -> .mp4 (audio_effect="original"): channel-preserving 5.1 AAC fallback (NOT downmixed to 2ch).
+        src_pcm = self.dir / "PCM51.mkv"
+        r2 = core.capture([
+            ffmpeg, "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc2=s=256x144:r=25:d=0.6",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=5.1", "-t", "0.6",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+            "-c:a", "pcm_s16le", str(src_pcm),
+        ])
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        inspected_pcm = core.inspect_input(src_pcm)
+        self.assertTrue(inspected_pcm["audio"]["needs_mkv_for_lossless_audio"])
+
+        out_pcm_mp4 = self.dir / "PCM51_HDR.mp4"
+        res_pcm_mp4 = core.convert(core.Options(str(src_pcm), str(out_pcm_mp4), quality="fast", encoder="cpu"))
+        self.assertEqual(res_pcm_mp4["plan"]["audio"], "aac")
+        self.assertTrue(all(res_pcm_mp4["validation"]["checks"].values()))
+        out_audio_pcm_mp4 = [s for s in core.probe(out_pcm_mp4)["streams"] if s["codec_type"] == "audio"]
+        self.assertEqual(len(out_audio_pcm_mp4), 1)
+        self.assertEqual(out_audio_pcm_mp4[0]["codec_name"], "aac")
+        self.assertEqual(out_audio_pcm_mp4[0]["channels"], 6)
+
+        # 3. 5.1 PCM MKV -> .mkv (audio_effect="original"): true lossless PCM 5.1 stream copy + HDR10 MKV checks pass.
+        out_pcm_mkv = self.dir / "PCM51_HDR.mkv"
+        res_pcm_mkv = core.convert(core.Options(str(src_pcm), str(out_pcm_mkv), quality="fast", encoder="cpu"))
+        self.assertEqual(res_pcm_mkv["plan"]["audio"], "copy")
+        self.assertEqual(res_pcm_mkv["plan"]["container"], "mkv")
+        self.assertNotIn("hvc1_tag", res_pcm_mkv["validation"]["checks"])
+        self.assertTrue(all(res_pcm_mkv["validation"]["checks"].values()))
+        out_audio_pcm_mkv = [s for s in core.probe(out_pcm_mkv)["streams"] if s["codec_type"] == "audio"]
+        self.assertEqual(len(out_audio_pcm_mkv), 1)
+        self.assertEqual((out_audio_pcm_mkv[0]["codec_name"], out_audio_pcm_mkv[0]["channels"]), ("pcm_s16le", 6))
+        self.assertEqual(packet_hash(src_pcm, 0), packet_hash(out_pcm_mkv, 0))
+
+        # 4. Unsupported container suffix rejects cleanly.
+        with self.assertRaisesRegex(core.ConversionError, r"\.mp4 或 \.mkv"):
+            core.convert(core.Options(str(src_multi), str(self.dir / "无效容器.avi")))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -28,7 +28,9 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.5.4"
+VERSION = "1.5.5"
+SUPPORTED_OUTPUT_CONTAINERS = (".mp4", ".mkv")
+MP4_COPY_AUDIO_CODECS = frozenset({"aac", "ac3", "eac3", "dts", "flac", "alac", "mp3", "opus"})
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128
@@ -499,9 +501,71 @@ def dv_properties(info: dict, dv: dict, strip: bool) -> dict:
     )
 
 
+def _audio_streams(info: dict) -> list[dict]:
+    return [s for s in info.get("streams", []) if s.get("codec_type") == "audio"]
+
+
+def _audio_stream_copyable(stream: dict, container: str) -> bool:
+    codec = str(stream.get("codec_name") or "").lower()
+    sr = _finite_number(stream.get("sample_rate"))
+    ch = _finite_number(stream.get("channels"))
+    if not codec or sr is None or sr <= 0 or ch is None or ch <= 0:
+        return False
+    if container == "mkv":
+        return True
+    return codec in MP4_COPY_AUDIO_CODECS
+
+
+def _aac_bitrate_for_channels(channels: float | None) -> str:
+    if channels is not None and channels >= 6:
+        return "640k"
+    if channels is not None and channels >= 3:
+        return "448k"
+    return "320k"
+
+
+def _format_channel_label(channels: float | None, layout: str | None = None) -> str:
+    if channels is not None:
+        ch = int(round(channels))
+        named = {1: "1.0", 2: "2.0", 3: "2.1", 4: "4.0", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1"}
+        if ch in named:
+            return named[ch]
+        if ch > 0:
+            return f"{ch}声道"
+    return str(layout or "").strip() or "未知声道"
+
+
+def summarize_audio(info: dict) -> dict:
+    """Summarize audio streams for container selection and UI hints."""
+    streams = _audio_streams(info)
+    if not streams:
+        return dict(
+            count=0,
+            primary_codec="",
+            primary_channels=0,
+            primary_label="",
+            all_mp4_copyable=True,
+            needs_mkv_for_lossless_audio=False,
+        )
+    primary = streams[0]
+    codec = str(primary.get("codec_name") or "").upper()
+    channels = _finite_number(primary.get("channels"))
+    ch_label = _format_channel_label(channels, primary.get("channel_layout"))
+    all_mp4_copyable = all(_audio_stream_copyable(s, "mp4") for s in streams)
+    return dict(
+        count=len(streams),
+        primary_codec=codec,
+        primary_channels=int(round(channels)) if channels is not None else 0,
+        primary_label=f"{ch_label} {codec}".strip(),
+        all_mp4_copyable=all_mp4_copyable,
+        needs_mkv_for_lossless_audio=not all_mp4_copyable,
+    )
+
+
 def inspect_input(path: Path, info: dict | None = None) -> dict:
     """Classify an input file as sdr, dv_strip, dv_reencode, or hdr10."""
     info = info if info is not None else probe(path)
+    audio_summary = summarize_audio(info)
     dv = detect_dolby_vision(info, path)
     if dv is not None:
         strip = dv["strip_supported"]
@@ -509,6 +573,7 @@ def inspect_input(path: Path, info: dict | None = None) -> dict:
             kind="dv_strip" if strip else "dv_reencode",
             dv=dv,
             properties=dv_properties(info, dv, strip=strip),
+            audio=audio_summary,
             info=info,
         )
     if is_hdr_video(info):
@@ -516,12 +581,14 @@ def inspect_input(path: Path, info: dict | None = None) -> dict:
             kind="hdr10",
             dv=None,
             properties=hdr_copy_properties(info),
+            audio=audio_summary,
             info=info,
         )
     return dict(
         kind="sdr",
         dv=None,
         properties=source_properties(info),
+        audio=audio_summary,
         info=info,
     )
 
@@ -1473,15 +1540,22 @@ def build_command(opts: Options, info: dict, destination: Path,
             f"-mastering_display:{p['stream_index']}", mastering_str,
             f"-content_light:{p['stream_index']}", content_light_str,
         ]
+    container = "mkv" if destination.suffix.lower() == ".mkv" else "mp4"
+    is_mkv = container == "mkv"
+    audio_map = "0:a:0?" if opts.audio_effect == "surround" else "0:a?"
     args += ["-i", opts.source]
     if opts.duration is not None:
         args += ["-t", str(opts.duration)]
-    args += ["-map", f"0:{p['stream_index']}", "-map", "0:a:0?", "-map_metadata", "-1", "-map_chapters", "-1"]
+    args += ["-map", f"0:{p['stream_index']}", "-map", audio_map, "-map_metadata", "-1", "-map_chapters", "-1"]
 
     if video_operation == "copy_hdr":
-        args += ["-c:v", "copy", "-tag:v", "hvc1"]
+        args += ["-c:v", "copy"]
+        if not is_mkv:
+            args += ["-tag:v", "hvc1"]
     elif video_operation == "dv_strip":
-        args += ["-c:v", "copy", "-bsf:v", dv_bsf, "-tag:v", "hvc1"]
+        args += ["-c:v", "copy", "-bsf:v", dv_bsf]
+        if not is_mkv:
+            args += ["-tag:v", "hvc1"]
     elif is_hw:
         enc_args, enc_meta = _hardware_encoder_args(
             encoder_key,
@@ -1512,8 +1586,9 @@ def build_command(opts: Options, info: dict, destination: Path,
             *enc_args,
             "-g", str(max(1, round(p["fps"] * 2))), "-fps_mode", "passthrough", "-enc_time_base", "filter",
             "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv",
-            "-tag:v", "hvc1",
         ]
+        if not is_mkv:
+            args += ["-tag:v", "hvc1"]
         if video_operation == "dv_reencode" and tools and tools.get("dovi_rpu"):
             args += ["-bsf:v", "dovi_rpu=strip=1"]
     else:
@@ -1539,27 +1614,64 @@ def build_command(opts: Options, info: dict, destination: Path,
             "-profile:v", "main10", "-pix_fmt", "yuv420p10le", "-x265-params", params,
             "-g", str(max(1, round(p["fps"] * 2))), "-fps_mode", "passthrough", "-enc_time_base", "filter",
             "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv",
-            "-tag:v", "hvc1",
         ]
+        if not is_mkv:
+            args += ["-tag:v", "hvc1"]
         if video_operation == "dv_reencode" and tools and tools.get("dovi_rpu"):
             args += ["-bsf:v", "dovi_rpu=strip=1"]
 
-    audio = next((s for s in info.get("streams", []) if s.get("codec_type") == "audio"), None)
-    sample_rate = _finite_number(audio.get("sample_rate")) if audio else None
-    channels = _finite_number(audio.get("channels")) if audio else None
-    audio_duration = _known_duration(audio.get("duration"), p["duration"]) if audio else 0
+    audio_list = _audio_streams(info)
+    audio_tracks = []
     if opts.audio_effect == "surround":
-        if not audio:
+        if not audio_list:
             raise ConversionError("原片没有音轨，无法添加环绕音效。")
         args += ["-af", SURROUND_FILTER, "-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-ac", "2"]
-    elif (audio and audio.get("codec_name") == "aac" and channels is not None and 0 < channels <= 2
-          and sample_rate is not None and 0 < sample_rate <= 48000):
-        args += ["-c:a", "copy"]
+        audio_summary = "aac"
+        audio_tracks = [dict(index=0, mode="aac", channels=2, source_codec=audio_list[0].get("codec_name"))]
+        first_dur = _known_duration(audio_list[0].get("duration"), p["duration"])
+        expect_audio = bool(not first_dur or first_dur > opts.start)
+    elif not audio_list:
+        args += ["-an"]
+        audio_summary = "none"
+        expect_audio = False
     else:
-        args += ["-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-ac", "2"]
-    args += ["-movflags", "+faststart+write_colr", "-progress", "pipe:1", "-nostats", str(destination)]
+        copy_flags = [_audio_stream_copyable(s, container) for s in audio_list]
+        for idx, (s, can_copy) in enumerate(zip(audio_list, copy_flags)):
+            ch = _finite_number(s.get("channels"))
+            ch_out = int(round(ch)) if ch is not None and ch > 0 else None
+            if can_copy:
+                audio_tracks.append(dict(index=idx, mode="copy", channels=ch_out, source_codec=s.get("codec_name")))
+            else:
+                out_ch = min(8, ch_out) if ch_out is not None else None
+                audio_tracks.append(dict(index=idx, mode="aac", channels=out_ch, source_codec=s.get("codec_name")))
+        if all(copy_flags):
+            args += ["-c:a", "copy"]
+            audio_summary = "copy"
+        else:
+            for idx, (s, can_copy) in enumerate(zip(audio_list, copy_flags)):
+                if can_copy:
+                    args += [f"-c:a:{idx}", "copy"]
+                else:
+                    ch = _finite_number(s.get("channels"))
+                    args += [
+                        f"-c:a:{idx}", "aac",
+                        f"-b:a:{idx}", _aac_bitrate_for_channels(ch),
+                        f"-ar:a:{idx}", "48000",
+                    ]
+                    if ch is not None and ch > 8:
+                        args += [f"-ac:a:{idx}", "8"]
+            audio_summary = "copy+aac" if any(copy_flags) else "aac"
+        expect_audio = any(
+            (_known_duration(s.get("duration"), p["duration"]) == 0
+             or _known_duration(s.get("duration"), p["duration"]) > opts.start)
+            for s in audio_list
+        )
+    if not is_mkv:
+        args += ["-movflags", "+faststart+write_colr"]
+    args += ["-progress", "pipe:1", "-nostats", str(destination)]
     expected_duration = min(opts.duration or float("inf"), max(0, p["duration"] - opts.start))
     return args, dict(source=p, width=w, height=h, preset=preset, crf=crf,
+                      container=container,
                       lossless_video=lossless_video,
                       encoder_requested="copy" if stream_copy else opts.encoder,
                       encoder=encoder_key,
@@ -1572,7 +1684,8 @@ def build_command(opts: Options, info: dict, destination: Path,
                       qsv_extbrc=bool(encoder_key == "qsv" and qsv_extbrc),
                       encoder_note=encoder_note,
                       quality_control=quality_control,
-                      audio=args[args.index("-c:a") + 1],
+                      audio=audio_summary,
+                      audio_tracks=audio_tracks,
                       audio_effect=opts.audio_effect,
                       audio_filter=SURROUND_FILTER if opts.audio_effect == "surround" else None,
                       video_operation=video_operation,
@@ -1587,12 +1700,15 @@ def build_command(opts: Options, info: dict, destination: Path,
                       require_matrix_metadata=(p.get("matrix") == "bt2020nc") if video_operation == "dv_strip" else True,
                       require_mastering_metadata=bool(dv.get("source_has_mastering", False)) if video_operation == "dv_strip" else True,
                       require_content_light_metadata=bool(dv.get("source_has_content_light", False)) if video_operation == "dv_strip" else True,
-                      expect_audio=bool(audio and (not audio_duration or audio_duration > opts.start)),
+                      expect_audio=expect_audio,
+                      expected_audio_count=len(audio_list) if (opts.audio_effect == "original" and expect_audio) else (1 if expect_audio else 0),
                       expected_video_duration=expected_duration if math.isfinite(expected_duration) else None)
 
 
 def validate_export(path: Path, expected: dict) -> dict:
     checks, data, v, side = _hdr_probe_checks(path)
+    if expected.get("container") == "mkv" or path.suffix.lower() == ".mkv":
+        checks.pop("hvc1_tag", None)
     checks["dimensions"] = (v.get("width"), v.get("height")) == (expected["width"], expected["height"])
     optional_metadata = {}
     if expected.get("video_operation") == "dv_strip":
@@ -1754,15 +1870,16 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
         raise ConversionError("找不到输入视频。")
     if output == source or output.exists():
         raise ConversionError("输出文件已存在或与原片相同，请换一个文件名。原片不会被覆盖。")
-    if output.suffix.lower() != ".mp4":
-        raise ConversionError("输出文件请使用 .mp4 后缀。")
+    out_ext = output.suffix.lower()
+    if out_ext not in SUPPORTED_OUTPUT_CONTAINERS:
+        raise ConversionError("输出文件请使用 .mp4 或 .mkv 后缀。")
     if opts.start < 0 or opts.duration is not None and opts.duration <= 0:
         raise ConversionError("试转起点和时长设置无效。")
     opts = dataclasses.replace(opts, source=str(source), output=str(output))
     info = probe(source)
     output.parent.mkdir(parents=True, exist_ok=True)
     process = None
-    temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex[:10]}.part.mp4")
+    temporary = output.with_name(f".{output.stem}.{uuid.uuid4().hex[:10]}.part{out_ext}")
     started = time.monotonic()
     tail = ""
     with tempfile.TemporaryDirectory(prefix="sdr2hdr-") as cache:
@@ -1831,7 +1948,7 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                             keep_partial_triggered = True
                             callback(dict(stage="stopping", percent=last_percent,
                                           elapsed=round(max(0.0, time.monotonic() - started), 2),
-                                          message="正在正常封包并保存已转换的 MP4 片段（请勿强行关闭）…"))
+                                          message="正在正常封包并保存已转换的视频片段（请勿强行关闭）…"))
                             try:
                                 if process.stdin:
                                     process.stdin.write("q\n")
@@ -1968,7 +2085,11 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                           dolby_vision=plan.get("dolby_vision"),
                           method=method_desc,
                           video_encoding=video_enc_desc,
-                          audio_effect_description=("Stereo spatial enhancement through channel widening, short cross delay and peak limiting. AAC audio is re-encoded." if opts.audio_effect == "surround" else "Original audio retained where AAC stream copy is possible."),
+                          audio_effect_description=(
+                              "Stereo spatial enhancement through channel widening, short cross delay and peak limiting. AAC audio is re-encoded."
+                              if opts.audio_effect == "surround" else
+                              "All original audio streams retained losslessly via stream copy when supported by the target container, with channel-preserving AAC fallback."
+                          ),
                           nominal_mastering_target=mastering_desc,
                           declared_light_bounds=light_desc,
                           fidelity_limit=fidelity_desc)
