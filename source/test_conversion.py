@@ -309,31 +309,47 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(plan_amf_auto["encoder"], "amf")
         self.assertEqual(plan_amf_auto["video_codec"], "hevc_amf")
 
-        # Verify metadata placement before -i, filter chain ending, and codec-specific flags.
+        # Verify metadata placement before -i, fast SIMD zscale default, and opt-in libplacebo GPU shader path.
         no_gpu_filter = dict(libplacebo_shader=False, vulkan_hwdec=False, reason="off")
         yes_gpu_filter = dict(libplacebo_shader=True, vulkan_hwdec=True, reason="")
+        hevc_info = {**fake_info, "streams": [{**fake_info["streams"][0], "codec_name": "hevc"}, fake_info["streams"][1]]}
         for enc_key, expected_flags in [
             ("nvenc", ["-c:v", "hevc_nvenc", "-rc", "vbr", "-cq"]),
             ("qsv", ["-c:v", "hevc_qsv", "-global_quality"]),
             ("amf", ["-c:v", "hevc_amf", "-bitdepth", "10", "-rc", "cqp"]),
         ]:
+            # Default gpu_filter="auto" selects fast multi-threaded SIMD zscale (ordered dither, direct p010le) + GPU encoder.
             cmd, plan = core.build_command(core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard"),
-                                           fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=no_gpu_filter)
+                                           fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
             self.assertEqual(plan["encoder"], enc_key)
             self.assertFalse(plan["gpu_filter"])
+            self.assertTrue(plan["fast_hw_filter"])
+            self.assertFalse(plan["vulkan_hwdec"])
             input_pos = cmd.index("-i")
             md_pos = cmd.index("-mastering_display:1")
             cl_pos = cmd.index("-content_light:1")
             self.assertLess(md_pos, input_pos)
             self.assertLess(cl_pos, input_pos)
             vf = cmd[cmd.index("-vf") + 1]
-            self.assertTrue(vf.endswith("format=yuv420p10le,setsar=1,format=p010le"))
+            self.assertIn("d=ordered", vf)
+            self.assertTrue(vf.endswith("format=p010le,setsar=1"))
             for flag in expected_flags:
                 self.assertIn(flag, cmd)
 
-            # With libplacebo + Vulkan hwdec enabled, GPU shader path + Vulkan hwdec is selected.
-            cmd_g, plan_g = core.build_command(core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard"),
-                                               fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
+            # Opt-in gpu_filter="on" selects libplacebo GPU shader; Vulkan hwdec enabled for HEVC/AV1 only (not H.264).
+            cmd_g_h264, plan_g_h264 = core.build_command(
+                core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard", gpu_filter="on"),
+                fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter,
+            )
+            self.assertTrue(plan_g_h264["gpu_filter"])
+            self.assertFalse(plan_g_h264["vulkan_hwdec"])
+            self.assertNotIn("-hwaccel", cmd_g_h264)
+            self.assertIn("custom_shader_path=balanced.hook", cmd_g_h264[cmd_g_h264.index("-vf") + 1])
+
+            cmd_g, plan_g = core.build_command(
+                core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard", gpu_filter="on"),
+                hevc_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter,
+            )
             self.assertTrue(plan_g["gpu_filter"])
             self.assertTrue(plan_g["vulkan_hwdec"])
             self.assertIn("-hwaccel", cmd_g)
@@ -342,8 +358,8 @@ class ConversionTests(unittest.TestCase):
             self.assertIn("custom_shader_path=balanced.hook", cmd_g[cmd_g.index("-vf") + 1])
 
         for style, shader in (("balanced", "balanced.hook"), ("natural", "natural.hook"), ("vivid", "vivid.hook")):
-            cmd_st, plan_st = core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc", hdr_style=style),
-                                                 fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
+            cmd_st, plan_st = core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc", hdr_style=style, gpu_filter="on"),
+                                                 hevc_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
             self.assertEqual(plan_st["hdr_style"], style)
             self.assertIn(f"custom_shader_path={shader}", cmd_st[cmd_st.index("-vf") + 1])
 
@@ -392,23 +408,26 @@ class ConversionTests(unittest.TestCase):
             for flag in ("-extbrc", "-mbbrc", "-adaptive_i", "-adaptive_b"):
                 self.assertEqual(cmd_qsv_ext[cmd_qsv_ext.index(flag) + 1], "1")
 
-        # Unsupported codec for Vulkan Video (e.g. ffv1) keeps GPU shader but skips -hwaccel vulkan.
+        # Unsupported codec for Vulkan Video (e.g. ffv1) keeps GPU shader when gpu_filter="on" but skips -hwaccel vulkan.
         ffv1_info = {**fake_info, "streams": [{**fake_info["streams"][0], "codec_name": "ffv1", "pix_fmt": "yuv444p10le"}, fake_info["streams"][1]]}
-        cmd_ffv1, plan_ffv1 = core.build_command(core.Options("in.mkv", str(dest), encoder="nvenc", quality="standard"),
+        cmd_ffv1, plan_ffv1 = core.build_command(core.Options("in.mkv", str(dest), encoder="nvenc", quality="standard", gpu_filter="on"),
                                                  ffv1_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
         self.assertTrue(plan_ffv1["gpu_filter"])
         self.assertFalse(plan_ffv1["vulkan_hwdec"])
         self.assertNotIn("-hwaccel", cmd_ffv1)
         self.assertIn("setparams=", cmd_ffv1[cmd_ffv1.index("-vf") + 1])
 
-        # Lossless and gpu_filter='off' always use the deterministic CPU filter chain.
+        # Lossless and gpu_filter='off' always use the deterministic CPU filter chain (error_diffusion + yuv420p10le).
         cmd_ll_hw, plan_ll_hw = core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc", quality="lossless"),
                                                    fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
         self.assertFalse(plan_ll_hw["gpu_filter"])
+        self.assertFalse(plan_ll_hw["fast_hw_filter"])
         self.assertTrue(cmd_ll_hw[cmd_ll_hw.index("-vf") + 1].endswith("format=yuv420p10le,setsar=1,format=p010le"))
-        _, plan_off = core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc", gpu_filter="off"),
-                                         fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
+        cmd_off, plan_off = core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc", gpu_filter="off"),
+                                               fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
         self.assertFalse(plan_off["gpu_filter"])
+        self.assertFalse(plan_off["fast_hw_filter"])
+        self.assertTrue(cmd_off[cmd_off.index("-vf") + 1].endswith("format=yuv420p10le,setsar=1,format=p010le"))
 
         cmd_cpu, plan_cpu = core.build_command(core.Options("in.mp4", str(dest), encoder="cpu"), fake_info, dest, detected_encoders=all_hw)
         self.assertEqual(plan_cpu["encoder"], "cpu")
@@ -933,27 +952,35 @@ class ConversionTests(unittest.TestCase):
             return (y, u, v)
 
         for style, expected_cll in (("balanced", (1000, 260)), ("natural", (450, 200)), ("vivid", (1000, 1000))):
+            fast_out = self.dir / f"fast_{style}.mp4"
             gpu_out = self.dir / f"gpu_{style}.mp4"
             cpu_out = self.dir / f"cpu_{style}.mp4"
+            res_fast = core.convert(core.Options(str(skin_src), str(fast_out), quality="standard", encoder="auto",
+                                                 hdr_style=style, gpu_filter="auto"))
             res_gpu = core.convert(core.Options(str(skin_src), str(gpu_out), quality="standard", encoder="auto",
-                                                hdr_style=style, gpu_filter="auto"))
+                                                hdr_style=style, gpu_filter="on"))
             res_cpu = core.convert(core.Options(str(skin_src), str(cpu_out), quality="standard", encoder="auto",
                                                 hdr_style=style, gpu_filter="off"))
+            self.assertTrue(res_fast["plan"]["fast_hw_filter"])
+            self.assertFalse(res_fast["plan"]["gpu_filter"])
             self.assertTrue(res_gpu["plan"]["gpu_filter"])
-            self.assertEqual(res_gpu["plan"]["vulkan_hwdec"], gpu_caps["vulkan_hwdec"])
+            self.assertFalse(res_gpu["plan"]["vulkan_hwdec"])
             self.assertFalse(res_cpu["plan"]["gpu_filter"])
+            self.assertTrue(all(res_fast["validation"]["checks"].values()))
             self.assertTrue(all(res_gpu["validation"]["checks"].values()))
-            cll = next(s for s in res_gpu["validation"]["first_frame_side_data"]
+            cll = next(s for s in res_fast["validation"]["first_frame_side_data"]
                        if s.get("side_data_type") == "Content light level metadata")
             self.assertEqual((cll["max_content"], cll["max_average"]), expected_cll)
-            g_yuv, c_yuv = center_yuv10(gpu_out), center_yuv10(cpu_out)
+            f_yuv, g_yuv, c_yuv = center_yuv10(fast_out), center_yuv10(gpu_out), center_yuv10(cpu_out)
+            for f_ch, c_ch in zip(f_yuv, c_yuv):
+                self.assertLessEqual(abs(f_ch - c_ch), 4, f"{style} FastSIMD {f_yuv} vs CPU {c_yuv}")
             for g_ch, c_ch in zip(g_yuv, c_yuv):
                 self.assertLessEqual(abs(g_ch - c_ch), 4, f"{style} GPU {g_yuv} vs CPU {c_yuv}")
 
-        # Verify -ss / -t clipping works cleanly with Vulkan hwdec + libplacebo.
+        # Verify -ss / -t clipping works cleanly with both default fast SIMD and opt-in libplacebo.
         clip_out = self.dir / "gpu_clipped.mp4"
         res_clip = core.convert(core.Options(str(skin_src), str(clip_out), quality="fast", encoder="auto",
-                                             start=0.2, duration=0.4, hdr_style="natural"))
+                                             start=0.2, duration=0.4, hdr_style="natural", gpu_filter="on"))
         self.assertTrue(res_clip["plan"]["gpu_filter"])
         self.assertTrue(all(res_clip["validation"]["checks"].values()))
 

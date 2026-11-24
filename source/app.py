@@ -1827,14 +1827,7 @@ class App:
                             enc_part = "显卡加速：" + "、".join(hw_labels)
                         else:
                             enc_part = "显卡加速：未检测到可用硬编（使用 CPU x265）"
-                        gpu_part = ""
-                        if self.gpu_filter_caps:
-                            if self.gpu_filter_caps.get("libplacebo_shader") and self.gpu_filter_caps.get("vulkan_hwdec"):
-                                gpu_part = "；色彩管线：Vulkan 全 GPU 加速"
-                            elif self.gpu_filter_caps.get("libplacebo_shader"):
-                                gpu_part = "；色彩管线：libplacebo GPU 加速"
-                            else:
-                                gpu_part = "；色彩管线：CPU 浮点滤镜"
+                        gpu_part = "；色彩管线：多线程 SIMD + 显卡独占硬编" if hw_labels else "；色彩管线：CPU 浮点滤镜"
                         dv_part = ""
                         if self.dv_tools:
                             if self.dv_tools.get("strip_available") and self.dv_tools.get("libplacebo"):

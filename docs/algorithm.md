@@ -94,8 +94,9 @@ SDR 转 HDR10 提供三种独立管线（显卡有损编码默认经 Vulkan + `l
 
 ### 滤镜衔接、GPU 色彩加速与元数据传播
 
-- **GPU 色彩加速路径（默认自动启用）**：在显卡有损编码（`NVENC` / `QSV` / `AMF`）且通过运行时 Vulkan / `libplacebo` 自检时，SDR 转 HDR 的三种风格均通过自包含 `//!HOOK MAIN` GLSL 着色器在 GPU 执行（关闭 `libplacebo` 内置色调映射与传递转换 `color_primaries=auto:color_trc=auto:disable_linear=true`，由着色器直接执行精确的 `balanced` / `natural` BT.1886→BT.2020→PQ 公式或 `vivid` 色差+对数公式，随后在 GPU 内完成 BT.2020nc 转换与 10-bit 抖动）；输入为 H.264 8-bit 或 HEVC / AV1 8/10-bit 且支持 Vulkan Video 时自动启用 `-hwaccel vulkan -hwaccel_output_format vulkan` 零拷贝硬解，实测与 CPU 管线在平场色块误差 `≤ 1 / 1023`。
-- **CPU 浮点滤镜回退路径**：当使用 `libx265` 软件编码、选择“画面无损编码”、使用 `--gpu-filter off` 或本地环境无 Vulkan / `libplacebo` 支持时，自动使用 `zscale` + `balanced.cube` / `natural.cube` / `tone.cube` 浮点管线，末尾输出 `yuv420p10le`、`setsar=1`（显卡路径追加 `,format=p010le`）。
+- **高速异构并行路径（SDR 显卡有损编码默认，v1.6.1）**：使用多线程 SIMD `zscale`（`d=ordered`，原尺寸不缩放时 `bilinear`、2K/4K 缩放时 `spline36`）+ `49³` 四面体 `lut3d` / `65536` 点 `lut1d`，末尾直接输出 `p010le` 送入 `NVENC` / `QSV` / `AMF` 独占硬编，避免 Windows 下 Vulkan→系统内存→显卡编码器的双倍 PCIe 往返拷贝及 H.264 Vulkan 硬解同步卡顿；10-bit 像素与浮点参考管线最大误差 `≤ 2 / 1023`。
+- **可选 GPU 着色器路径（`--gpu-filter on`）**：在通过 Vulkan / `libplacebo` 自检时，通过自包含 `//!HOOK MAIN` GLSL 着色器在 GPU 执行对应曲线（仅对 HEVC / AV1 启用 Vulkan 硬解，避免 H.264 卡顿）。
+- **精确参考浮点路径（CPU 编码 / 画面无损 / `--gpu-filter off`）**：使用 `zscale`（`spline36 + error_diffusion`）+ LUT 输出确定性 `yuv420p10le`（硬件无损档追加 `,format=p010le`），保证逐帧 SHA-256 校验 100% 确定一致。
 - 硬件编码通过输入流选项 `-mastering_display:<stream>` 与 `-content_light:<stream>` 传入 HDR10 静态元数据（放在 `-i` 之前），并配合输出 VUI 标记（`bt2020` / `smpte2084` / `bt2020nc` / `tv`）和 `hvc1` 标签。
 - 硬件编码限用于 `160×128` 至 `8192×8192` 的输出分辨率；超出范围或显卡不支持无损时，“自动”模式会回退到 `libx265`。
 

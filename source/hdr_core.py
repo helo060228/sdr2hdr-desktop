@@ -31,7 +31,7 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 SUPPORTED_OUTPUT_CONTAINERS = (".mp4", ".mkv")
 MP4_COPY_AUDIO_CODECS = frozenset({"aac", "ac3", "eac3", "dts", "flac", "alac", "mp3", "opus"})
 MP4_TEXT_SUBTITLE_CODECS = frozenset({"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"})
@@ -1085,25 +1085,39 @@ def write_curve(path: Path, peak=1000.0):
             f.write(f"{value:.10f} {value:.10f} {value:.10f}\n")
 
 
-def filter_chain(p: dict, width: int, height: int, lut_name="tone.cube", style="vivid") -> str:
+def filter_chain(p: dict, width: int, height: int, lut_name="tone.cube", style="vivid",
+                 fast_hw: bool = False) -> str:
     # LUT filename is controlled by the application; FFmpeg runs in a private
     # temporary directory. No user filename is interpolated into filter syntax.
+    resizing = bool(p.get("width") and p.get("height") and (width != p["width"] or height != p["height"]))
     if style in ("balanced", "natural"):
         if lut_name != STYLE_LUT_NAMES[style]:
             raise ValueError("Unexpected LUT filename")
+        if fast_hw:
+            in_filter = "bilinear"
+            out_filter = "spline36" if resizing else "bilinear"
+            dither = "ordered"
+            tail = ["format=p010le", "setsar=1"]
+        else:
+            in_filter = "spline36"
+            out_filter = "spline36"
+            dither = "error_diffusion"
+            tail = ["format=yuv420p10le", "setsar=1"]
         flags = (f"pin={p['primaries']}:tin={p['transfer']}:min={p['matrix']}:rin={p['range']}:"
-                 "p=bt709:t=bt709:m=gbr:r=full:filter=spline36")
+                 f"p=bt709:t=bt709:m=gbr:r=full:filter={in_filter}")
         return ",".join([
             "zscale=" + flags, "format=gbrpf32le",
             f"lut3d=file={lut_name}:interp=tetrahedral",
             "setparams=range=full:color_primaries=bt2020:color_trc=smpte2084:colorspace=gbr",
-            f"zscale=pin=bt2020:tin=smpte2084:min=gbr:rin=full:p=bt2020:t=smpte2084:m=bt2020nc:r=limited:w={width}:h={height}:filter=spline36:d=error_diffusion",
-            "format=yuv420p10le", "setsar=1",
+            f"zscale=pin=bt2020:tin=smpte2084:min=gbr:rin=full:p=bt2020:t=smpte2084:m=bt2020nc:r=limited:w={width}:h={height}:filter={out_filter}:d={dither}",
+            *tail,
         ])
     if style != "vivid":
         raise ConversionError("未知的 HDR 风格设置。")
     if lut_name != "tone.cube":
         raise ValueError("Unexpected LUT filename")
+    dither = "ordered" if fast_hw else "error_diffusion"
+    tail = ["format=p010le", "setsar=1"] if fast_hw else ["format=yuv420p10le", "setsar=1"]
     flags = (f"pin={p['primaries']}:tin={p['transfer']}:min={p['matrix']}:rin={p['range']}:"
              f"p={p['primaries']}:t={p['transfer']}:m=gbr:r=full:filter=bilinear")
     rows = chroma_matrix("bt709" if p["matrix"] == "gbr" else p["matrix"])
@@ -1113,8 +1127,8 @@ def filter_chain(p: dict, width: int, height: int, lut_name="tone.cube", style="
         "zscale=" + flags, "format=gbrpf32le", "colorchannelmixer=" + mixer,
         "lut1d=file=tone.cube:interp=linear",
         "setparams=range=full:color_primaries=bt2020:color_trc=smpte2084:colorspace=gbr",
-        f"zscale=pin=bt2020:tin=smpte2084:min=gbr:rin=full:p=bt2020:t=smpte2084:m=bt2020nc:r=limited:w={width}:h={height}:filter=bilinear:d=error_diffusion",
-        "format=yuv420p10le", "setsar=1",
+        f"zscale=pin=bt2020:tin=smpte2084:min=gbr:rin=full:p=bt2020:t=smpte2084:m=bt2020nc:r=limited:w={width}:h={height}:filter=bilinear:d={dither}",
+        *tail,
     ])
 
 
@@ -1215,27 +1229,32 @@ def gpu_sdr_filter_chain(p: dict, width: int, height: int, shader_name: str, sty
         raise ConversionError("未知的 HDR 风格设置。")
     if shader_name != expected:
         raise ValueError("Unexpected shader filename")
+    resizing = bool(p.get("width") and p.get("height") and (width != p["width"] or height != p["height"]))
+    scalers = "" if resizing else "upscaler=bilinear:downscaler=bilinear:"
     prefix = ([] if use_hwdec else [
         f"setparams=range={p['range']}:color_primaries={p['primaries']}:color_trc={p['transfer']}:colorspace={p['matrix']}"
     ])
     return ",".join([
         *prefix,
-        (f"libplacebo=w={width}:h={height}:format={pix_fmt}:"
+        (f"libplacebo=w={width}:h={height}:format={pix_fmt}:{scalers}"
          "colorspace=bt2020nc:color_primaries=auto:color_trc=auto:range=tv:"
          "disable_linear=true:tonemapping=clip:gamut_mode=clip:peak_detect=false:"
-         f"dithering=ordered_fixed:custom_shader_path={shader_name}"),
+         f"dithering=none:custom_shader_path={shader_name}"),
         "setparams=range=limited:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
         "setsar=1",
     ])
 
 
-def dv_filter_chain(width: int, height: int, pix_fmt: str = "yuv420p10le") -> str:
+def dv_filter_chain(width: int, height: int, pix_fmt: str = "yuv420p10le",
+                    fast_lossy: bool = False, resizing: bool = False) -> str:
     """Convert Dolby Vision (e.g. Profile 5 IPTPQc2 / Profile 8.4 HLG) to PQ BT.2020."""
+    scalers = "upscaler=bilinear:downscaler=bilinear:" if (fast_lossy and not resizing) else ""
+    dither = "none" if fast_lossy else "ordered_fixed"
     return (
-        f"libplacebo=w={width}:h={height}:format={pix_fmt}:"
+        f"libplacebo=w={width}:h={height}:format={pix_fmt}:{scalers}"
         "colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084:range=tv:"
         "apply_dolbyvision=true:peak_detect=false:tonemapping=clip:gamut_mode=clip:"
-        "dithering=ordered_fixed,setsar=1"
+        f"dithering={dither},setsar=1"
     )
 
 
@@ -1687,7 +1706,7 @@ def build_command(opts: Options, info: dict, destination: Path,
         raise ConversionError("未知的杜比视界处理模式。")
     if opts.hdr_style not in STYLE_LUT_NAMES:
         raise ConversionError("未知的 HDR 风格设置。")
-    if opts.gpu_filter not in ("auto", "off"):
+    if opts.gpu_filter not in ("auto", "on", "off"):
         raise ConversionError("未知的 GPU 滤镜加速设置。")
 
     dv = None
@@ -1767,30 +1786,36 @@ def build_command(opts: Options, info: dict, destination: Path,
         encoder_label = ENCODER_SPECS[encoder_key]["label"]
 
     use_gpu_filter = False
+    use_fast_hw_filter = False
     use_vulkan_hwdec = False
-    if video_operation == "sdr_to_hdr" and is_hw and not lossless_video and opts.gpu_filter == "auto":
-        eligible_input = (
-            p["matrix"] != "gbr"
-            and p["transfer"] in ("bt709", "smpte170m", "bt470bg", "bt2020-10", "bt2020-12")
-        )
-        if eligible_input:
-            gpu_caps = gpu_filter_caps if gpu_filter_caps is not None else detect_gpu_filter()
-            if gpu_caps.get("libplacebo_shader"):
-                use_gpu_filter = True
-                codec_name = p.get("codec_name", "")
-                pix_fmt = p.get("pixel_format", "")
-                hwdec_codec_ok = (
-                    (codec_name == "h264" and pix_fmt in ("yuv420p", "nv12"))
-                    or (codec_name in ("hevc", "av1") and pix_fmt in ("yuv420p", "yuv420p10le", "nv12", "p010le"))
-                )
-                hwdec_color_ok = (
-                    p["range"] == "limited"
-                    and p["transfer"] in ("bt709", "smpte170m", "bt2020-10", "bt2020-12")
-                )
-                use_vulkan_hwdec = bool(gpu_caps.get("vulkan_hwdec") and hwdec_codec_ok and hwdec_color_ok)
-                pipeline_note = "Vulkan 硬解 + libplacebo GPU 色彩管线" if use_vulkan_hwdec else "libplacebo GPU 色彩管线"
-                encoder_note = f"{encoder_note}（{pipeline_note}）" if encoder_note else f"已启用 {pipeline_note}"
-    elif video_operation == "dv_reencode" and not lossless_video and opts.gpu_filter == "auto":
+    if video_operation == "sdr_to_hdr" and is_hw and not lossless_video:
+        if opts.gpu_filter == "on":
+            eligible_input = (
+                p["matrix"] != "gbr"
+                and p["transfer"] in ("bt709", "smpte170m", "bt470bg", "bt2020-10", "bt2020-12")
+            )
+            if eligible_input:
+                gpu_caps = gpu_filter_caps if gpu_filter_caps is not None else detect_gpu_filter()
+                if gpu_caps.get("libplacebo_shader"):
+                    use_gpu_filter = True
+                    codec_name = p.get("codec_name", "")
+                    pix_fmt = p.get("pixel_format", "")
+                    # Avoid NVIDIA Windows Vulkan Video H.264 decoder stall; use Vulkan hwdec only for HEVC/AV1.
+                    hwdec_codec_ok = codec_name in ("hevc", "av1") and pix_fmt in ("yuv420p", "yuv420p10le", "nv12", "p010le")
+                    hwdec_color_ok = (
+                        p["range"] == "limited"
+                        and p["transfer"] in ("bt709", "smpte170m", "bt2020-10", "bt2020-12")
+                    )
+                    use_vulkan_hwdec = bool(gpu_caps.get("vulkan_hwdec") and hwdec_codec_ok and hwdec_color_ok)
+                    pipeline_note = "Vulkan 硬解 + libplacebo GPU 色彩管线" if use_vulkan_hwdec else "libplacebo GPU 色彩管线"
+                    encoder_note = f"{encoder_note}（{pipeline_note}）" if encoder_note else f"已启用 {pipeline_note}"
+        elif opts.gpu_filter == "auto":
+            # Windows FFmpeg lacks zero-copy Vulkan<->CUDA hwmap; multi-threaded SIMD zscale (ordered dither,
+            # direct p010le) + dedicated GPU hardware encoding runs 1.5x-6x faster than Vulkan roundtrip.
+            use_fast_hw_filter = True
+            pipeline_note = "多线程 SIMD 色彩 + 显卡独占硬编"
+            encoder_note = f"{encoder_note}（{pipeline_note}）" if encoder_note else f"已启用 {pipeline_note}"
+    elif video_operation == "dv_reencode" and not lossless_video and opts.gpu_filter in ("auto", "on"):
         gpu_caps = gpu_filter_caps if gpu_filter_caps is not None else detect_gpu_filter()
         codec_name = p.get("codec_name", "")
         pix_fmt = p.get("pixel_format", "")
@@ -1883,14 +1908,18 @@ def build_command(opts: Options, info: dict, destination: Path,
         crf = enc_meta["crf"]
         quality_control = enc_meta["quality_control"]
         if video_operation == "dv_reencode":
-            # Direct p010le output in libplacebo is >3x faster at 4K for lossy encodes;
-            # lossless mode uses exact yuv420p10le first for bit-exact SHA-256 verification.
-            vf = (dv_filter_chain(w, h, pix_fmt="yuv420p10le") + ",format=p010le"
-                  if lossless_video else dv_filter_chain(w, h, pix_fmt="p010le"))
+            # Direct p010le output + fast lossy scaler/dither avoids Vulkan stalls at 4K;
+            # lossless mode uses exact yuv420p10le + ordered_fixed for bit-exact SHA-256 verification.
+            dv_resizing = bool(w != p["width"] or h != p["height"])
+            vf = (dv_filter_chain(w, h, pix_fmt="yuv420p10le", fast_lossy=False) + ",format=p010le"
+                  if lossless_video else dv_filter_chain(w, h, pix_fmt="p010le", fast_lossy=True, resizing=dv_resizing))
         elif use_gpu_filter:
             shader_name = STYLE_SHADER_NAMES[opts.hdr_style]
             vf = gpu_sdr_filter_chain(p, w, h, shader_name=shader_name, style=opts.hdr_style,
                                       use_hwdec=use_vulkan_hwdec, pix_fmt="p010le")
+        elif use_fast_hw_filter:
+            lut_name = STYLE_LUT_NAMES[opts.hdr_style]
+            vf = filter_chain(p, w, h, lut_name=lut_name, style=opts.hdr_style, fast_hw=True)
         else:
             # Append p010le after setsar=1 rather than replacing yuv420p10le so zscale's
             # bit-exact 10-bit dithered plane layout is preserved before semi-planar packing.
@@ -2007,6 +2036,7 @@ def build_command(opts: Options, info: dict, destination: Path,
                       encoder_label=encoder_label,
                       hardware_accelerated=is_hw,
                       gpu_filter=use_gpu_filter,
+                      fast_hw_filter=use_fast_hw_filter,
                       vulkan_hwdec=use_vulkan_hwdec,
                       multipass=bool(opts.multipass and encoder_key == "nvenc" and not lossless_video and not stream_copy),
                       qsv_extbrc=bool(encoder_key == "qsv" and qsv_extbrc),
@@ -2460,6 +2490,8 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 if plan.get("gpu_filter"):
                     dec_prefix = "Vulkan hwdec + " if plan.get("vulkan_hwdec") else ""
                     method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (Gamma 2.2 BT.709->BT.2020 zero-trough balanced 1000 nits -> PQ) + 10-bit HEVC ({plan['video_codec']})"
+                elif plan.get("fast_hw_filter"):
+                    method_desc = f"Multi-threaded SIMD zscale (ordered dither, direct p010le) + Gamma 2.2 balanced 49^3 tetrahedral 3D LUT + 10-bit HEVC ({plan['video_codec']})"
                 else:
                     method_desc = f"Gamma 2.2 linear BT.709->BT.2020 zero-trough balanced luminance-preserving 49^3 tetrahedral 3D LUT + spline36 + 10-bit HEVC ({plan['video_codec']})"
                 video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
@@ -2471,6 +2503,8 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 if plan.get("gpu_filter"):
                     dec_prefix = "Vulkan hwdec + " if plan.get("vulkan_hwdec") else ""
                     method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (BT.1886 BT.709->BT.2020 luminance-preserving 450 nits -> PQ) + 10-bit HEVC ({plan['video_codec']})"
+                elif plan.get("fast_hw_filter"):
+                    method_desc = f"Multi-threaded SIMD zscale (ordered dither, direct p010le) + BT.1886 natural 49^3 tetrahedral 3D LUT + 10-bit HEVC ({plan['video_codec']})"
                 else:
                     method_desc = f"BT.1886 linear BT.709->BT.2020 luminance-preserving 49^3 tetrahedral 3D LUT + spline36 + 10-bit HEVC ({plan['video_codec']})"
                 video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
@@ -2482,6 +2516,8 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 if plan.get("gpu_filter"):
                     dec_prefix = "Vulkan hwdec + " if plan.get("vulkan_hwdec") else ""
                     method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (UV x0.56 + log curve) + 10-bit HEVC ({plan['video_codec']})"
+                elif plan.get("fast_hw_filter"):
+                    method_desc = f"Multi-threaded SIMD zscale (ordered dither, direct p010le) + float RGB matrix (UV x0.56) + 65536-point log curve + 10-bit HEVC ({plan['video_codec']})"
                 else:
                     method_desc = f"float RGB matrix (UV x0.56 equivalent) + 65536-point log curve + 10-bit HEVC ({plan['video_codec']})"
                 video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
@@ -2583,8 +2619,8 @@ def cli():
     parser.add_argument("--quality", choices=["fast", "standard", "fine", "lossless"], default="standard")
     parser.add_argument("--style", dest="hdr_style", choices=["balanced", "natural", "vivid"], default="balanced",
                         help="SDR 转 HDR 风格：balanced 影院均衡高光（推荐电影·1000 nit），natural 柔和暗室保护（450 nit），vivid 高对比风格（原版·动漫）")
-    parser.add_argument("--gpu-filter", choices=["auto", "off"], default="auto",
-                        help="GPU 色彩滤镜加速：auto 自动启用 Vulkan/libplacebo GPU 着色器（不支持时回退 CPU），off 强制 CPU 滤镜")
+    parser.add_argument("--gpu-filter", choices=["auto", "on", "off"], default="auto",
+                        help="色彩滤镜模式：auto 默认使用高速多线程 SIMD 色彩 + 显卡独占硬编（杜比视界自动用 Vulkan），on 强制启用 Vulkan/libplacebo GPU 着色器，off 强制精确参考 CPU 滤镜")
     parser.add_argument("--multipass", action="store_true",
                         help="为 NVIDIA NVENC 有损档启用双遍分析（画质略优但耗时增加）")
     parser.add_argument("--encoder", choices=["auto", "cpu", "nvenc", "qsv", "amf"], default="auto")

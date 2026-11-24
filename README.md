@@ -13,7 +13,7 @@
 - **杜比视界（DV）转 HDR10**：自动识别 Profile 5 / 7 / 8.1 / 8.4——
   - **Profile 8.1 / Profile 7（含 HDR10 兼容层）**：秒级无损直剥（不重编码，保留原生 10-bit HDR10 基础层并剥离 RPU／增强层，零画质损失，并兼容未标注容器矩阵的蓝光 Remux）；
   - **Profile 5（IPTPQc2，普通屏幕偏绿偏紫）与 Profile 8.4（HLG 杜比视界）**：通过 **Vulkan 硬解 + `libplacebo`** 进行杜比视界色彩还原，再由显卡硬编或 CPU 导出标准 HDR10。
-- 支持 **NVIDIA NVENC / Intel QSV / AMD AMF** 10-bit 显卡硬编加速，并在显卡有损编码时自动启用 **Vulkan 硬解 + `libplacebo` GPU 色彩管线**（将色域转换、高光保护曲线与 10-bit 抖动移入 GPU 执行，不支持或无损/CPU 编码时无缝回退至 CPU 浮点滤镜）。
+- 支持 **NVIDIA NVENC / Intel QSV / AMD AMF** 10-bit 显卡硬编加速：SDR 转 HDR10 默认采用 **多线程 SIMD 色彩（`zscale d=ordered` + LUT 直出 `p010le`）+ 显卡独占硬编** 异构并行管线（避免 Windows 下 Vulkan→内存→硬编 PCIe 往返与 H.264 卡顿，实测 1080p 达 4～5×、4K 提速最高 6×）；杜比视界 Profile 5 / 8.4 自动启用 Vulkan + `libplacebo` 色彩还原；命令行仍支持 `--gpu-filter on/off` 切换。
 - 保持原尺寸和帧率，或选择短边 1440 / 2160 的输出尺寸。
 - 提供快速、标准、精细、画面无损四种编码方式。
 - 无损档自动比较编码前后每一帧的像素摘要，全部一致才保存最终文件。

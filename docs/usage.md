@@ -51,7 +51,7 @@ SDR2HDR/
 - **NVIDIA 显卡 (NVENC)** / **Intel 显卡 (QSV)** / **AMD 显卡 (AMF)**：强制使用指定显卡硬件加速；若本地环境不支持或规格不满足会明确提示原因。
 - **CPU 软件编码 (x265)**：始终使用 `libx265` 软件编码，速度较慢但兼容性最广，同体积下压缩率通常更高。
 
-注：当使用显卡硬件编码且环境通过 Vulkan / `libplacebo` 自检时，程序会自动启用 **Vulkan 硬解 + `libplacebo` GPU 色彩管线**（在 GPU 内完成解码、色域变换、曲线计算、缩放与 10-bit 抖动，并同样适用于杜比视界 Profile 5 / 8.4 的色彩还原重编码），相比 CPU 浮点滤镜可明显提速（实测 1080p / 4K 约快 1.6×～1.7×）；若显卡驱动不支持 Vulkan、选择 CPU 编码或选择“画面无损编码”，会自动使用 CPU 高精度浮点与 `zscale` 管线。
+注：v1.6.1 起，SDR 转 HDR10 在显卡有损编码下默认采用 **多线程 SIMD 色彩（`zscale d=ordered` + LUT，原尺寸直出 `p010le` 零冗余拷贝，缩放时自动 `spline36`）+ 显卡 100% 独占硬编** 异构并行管线，避免 Windows 无法 Vulkan↔CUDA 零拷贝造成的 PCIe 双向往返与 H.264 Vulkan 卡顿（RTX 4060 实测 1080p 达 `125～150 fps`、4K H.264 提速 6×）；杜比视界 Profile 5 / 8.4 继续使用优化后的 Vulkan + `libplacebo` 还原。命令行可通过 `--gpu-filter {auto,on,off}` 切换。
 
 ### 编码画质校准与 NVENC 双遍分析
 
