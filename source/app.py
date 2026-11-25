@@ -43,6 +43,7 @@ ENCODER_LABELS = {
 STYLE_LABELS = {
     "影院均衡高光（推荐电影·1000 nit）": "balanced",
     "柔和暗室保护（450 nit）": "natural",
+    "暗室提亮（试调·450 nit）": "darkroom",
     "高对比风格（原版·动漫）": "vivid",
 }
 
@@ -73,6 +74,7 @@ AUDIO_EFFECT_LABELS = {
 STYLE_SHORT = {
     "balanced": "影院1000nit",
     "natural": "柔和450nit",
+    "darkroom": "暗室提亮450nit",
     "vivid": "高对比",
 }
 
@@ -847,6 +849,8 @@ class App:
                 notes.append("影院均衡高光：Gamma 2.2 通透暗部（纯黑 0 nit）+ 无凹陷云层雪地高光层次 + 等色度肤色保护，峰值直达 1000 nit。")
             elif style_key == "natural":
                 notes.append("柔和暗室保护：BT.1886 (Gamma 2.4) 全黑暗室基准与 450 nits 峰值，适合全黑环境观影与保守高光控制。")
+            elif style_key == "darkroom":
+                notes.append("暗室提亮：保留纯黑，提亮阴影和中间调，高光逐渐收至 450 nit。可与柔和暗室对照片段。")
             else:
                 notes.append("高对比风格：原版对数曲线，暗部更沉、色彩更艳丽，适合动漫与暗景；明亮实拍人脸可能偏亮。")
         enc_key = ENCODER_LABELS[self.encoder.get()]

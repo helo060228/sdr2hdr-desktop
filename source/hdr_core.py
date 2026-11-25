@@ -1,11 +1,12 @@
 """Offline SDR / Dolby Vision to HDR10 transcoder.
 
-SDR-to-HDR offers three styles:
+SDR-to-HDR styles:
 - balanced (default): colorimetric Gamma 2.2 linear BT.709->BT.2020 luminance-preserving
   zero-trough expansion with transparent shadow detail, rich cloud/snow highlight
   gradation, and specular headroom up to 1000 nits.
 - natural: softer colorimetric BT.1886 luminance-preserving curve capped at 450 nits
   for dark-room viewing and conservative highlight protection.
+- darkroom: shadow lift and a gradual highlight shoulder, with the same 450-nit peak.
 - vivid (legacy): fixed logarithmic expansion in nonlinear RGB for stylized high-contrast
   presentations such as anime and dark scenes.
 """
@@ -31,7 +32,7 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.6.1"
+VERSION = "1.6.2-preview.1"
 SUPPORTED_OUTPUT_CONTAINERS = (".mp4", ".mkv")
 MP4_COPY_AUDIO_CODECS = frozenset({"aac", "ac3", "eac3", "dts", "flac", "alac", "mp3", "opus"})
 MP4_TEXT_SUBTITLE_CODECS = frozenset({"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"})
@@ -59,9 +60,15 @@ NATURAL_BASE_NITS = 190.0
 NATURAL_KNEE = 0.62
 NATURAL_BOOST_NITS = 260.0
 NATURAL_PEAK_NITS = 450.0
+DARKROOM_SHADOW_GAIN = 0.70
+DARKROOM_SHADOW_PIVOT_NITS = 14.0
+DARKROOM_MID_GAIN = 0.16
+DARKROOM_SHOULDER_GAIN = 0.53
+DARKROOM_SHOULDER_ORDER = 5
+DARKROOM_CONTENT_LIGHT = "450,450"  # Conservative upper bounds, not measured frame averages.
 NATURAL_LUT_SIZE = 49
-STYLE_LUT_NAMES = {"balanced": "balanced.cube", "natural": "natural.cube", "vivid": "tone.cube"}
-STYLE_SHADER_NAMES = {"balanced": "balanced.hook", "natural": "natural.hook", "vivid": "vivid.hook"}
+STYLE_LUT_NAMES = {"balanced": "balanced.cube", "natural": "natural.cube", "darkroom": "darkroom.cube", "vivid": "tone.cube"}
+STYLE_SHADER_NAMES = {"balanced": "balanced.hook", "natural": "natural.hook", "darkroom": "darkroom.hook", "vivid": "vivid.hook"}
 M_BT709_TO_BT2020 = (
     (0.6274040, 0.3292820, 0.0433136),
     (0.0690970, 0.9195400, 0.0113612),
@@ -966,6 +973,15 @@ def natural_target_nits(y: float) -> float:
     return NATURAL_PEAK_NITS
 
 
+def darkroom_target_nits(y: float) -> float:
+    """Lift near-black differences at zero black offset and ease into reference white."""
+    base_nits = natural_target_nits(y)
+    white_fraction = base_nits / NATURAL_PEAK_NITS
+    shadow_gain = DARKROOM_SHADOW_GAIN / (1.0 + base_nits / DARKROOM_SHADOW_PIVOT_NITS)
+    shoulder_gain = DARKROOM_SHOULDER_GAIN * white_fraction ** DARKROOM_SHOULDER_ORDER
+    return base_nits + base_nits * (1.0 - white_fraction) * (shadow_gain + DARKROOM_MID_GAIN + shoulder_gain)
+
+
 def _colorimetric_reference_rgb(rgb: tuple[float, float, float], target_fn: Callable[[float], float],
                                 peak_cap: float, gamma: float = NATURAL_GAMMA) -> tuple[float, float, float]:
     """Analytical linear BT.709->BT.2020 luminance-preserving PQ transform."""
@@ -996,14 +1012,16 @@ def natural_reference_rgb(rgb: tuple[float, float, float]) -> tuple[float, float
 
 
 def _write_colorimetric_lut(path: Path, style: str, size: int = NATURAL_LUT_SIZE):
-    """Write a cached 49^3 tetrahedral 3D LUT for balanced or natural HDR10."""
+    """Write the selected linear-light mapping into a cached tetrahedral LUT."""
     cache_key = (style, size)
     with _NATURAL_LUT_LOCK:
         cached = _NATURAL_LUT_CACHE.get(cache_key)
     if cached is None:
         is_balanced = style == "balanced"
-        if not is_balanced and style != "natural":
+        targets = {"balanced": balanced_target_nits, "natural": natural_target_nits, "darkroom": darkroom_target_nits}
+        if style not in targets:
             raise ConversionError("未知的 HDR 风格设置。")
+        target_nits = targets[style]
         inv = 1.0 / (size - 1)
         gamma = BALANCED_GAMMA if is_balanced else NATURAL_GAMMA
         pow_tbl = [(i * inv) ** gamma for i in range(size)]
@@ -1012,14 +1030,7 @@ def _write_colorimetric_lut(path: Path, style: str, size: int = NATURAL_LUT_SIZE
         m20, m21, m22 = M_BT709_TO_BT2020[2]
         yr, yg, yb = Y_BT2020
         cap = BALANCED_PEAK_NITS if is_balanced else NATURAL_PEAK_NITS
-        title = (
-            'TITLE "Colorimetric Gamma 2.2 Balanced Highlight-Protected SDR-to-PQ (1000 nits)"'
-            if is_balanced else 'TITLE "Colorimetric Highlight-Protected SDR-to-PQ (450 nits)"'
-        )
-        knee = NATURAL_KNEE
-        inv_span = 1.0 / (1.0 - knee)
-        base = NATURAL_BASE_NITS
-        boost = NATURAL_BOOST_NITS
+        title = f'TITLE "Colorimetric {style} SDR-to-PQ ({cap:g} nits)"'
         lines = [f"{title}\nLUT_3D_SIZE {size}\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n"]
         append = lines.append
         for bi in range(size):
@@ -1037,14 +1048,7 @@ def _write_colorimetric_lut(path: Path, style: str, size: int = NATURAL_LUT_SIZE
                     if y <= 1e-9:
                         append("0.0000000 0.0000000 0.0000000\n")
                         continue
-                    if is_balanced:
-                        tn = balanced_target_nits(y)
-                    elif y <= knee:
-                        tn = base * y
-                    else:
-                        t = (y - knee) * inv_span
-                        tn = base * y + boost * t * t
-                    gain = tn / y
+                    gain = target_nits(y) / y
                     rn, gn, bn = r20 * gain, g20 * gain, b20 * gain
                     peak = rn if rn >= gn and rn >= bn else (gn if gn >= bn else bn)
                     if peak > cap:
@@ -1090,7 +1094,7 @@ def filter_chain(p: dict, width: int, height: int, lut_name="tone.cube", style="
     # LUT filename is controlled by the application; FFmpeg runs in a private
     # temporary directory. No user filename is interpolated into filter syntax.
     resizing = bool(p.get("width") and p.get("height") and (width != p["width"] or height != p["height"]))
-    if style in ("balanced", "natural"):
+    if style in ("balanced", "natural", "darkroom"):
         if lut_name != STYLE_LUT_NAMES[style]:
             raise ValueError("Unexpected LUT filename")
         if fast_hw:
@@ -1164,7 +1168,7 @@ def write_balanced_shader(path: Path, primaries: str = "bt709"):
     path.write_text(shader, encoding="ascii", newline="\n")
 
 
-def write_natural_shader(path: Path, primaries: str = "bt709"):
+def write_natural_shader(path: Path, primaries: str = "bt709", *, lifted: bool = False):
     """Write a self-contained MAIN-stage GLSL shader for highlight-protected HDR10.
 
     Running with libplacebo color_primaries=auto:color_trc=auto:disable_linear=true
@@ -1174,6 +1178,17 @@ def write_natural_shader(path: Path, primaries: str = "bt709"):
     m = PRIMARY_TO_BT2020.get(primaries, M_BT709_TO_BT2020)
     yr, yg, yb = Y_BT2020
     span = 1.0 - NATURAL_KNEE
+    mapping = (
+        f"    float tn = (y <= {NATURAL_KNEE:.6f}) ? ({NATURAL_BASE_NITS:.6f} * y) : "
+        f"({NATURAL_BASE_NITS:.6f} * y + {NATURAL_BOOST_NITS:.6f} * pow(min((y - {NATURAL_KNEE:.6f}) / {span:.6f}, 1.0), 2.0));\n"
+    )
+    if lifted:
+        mapping += (
+            f"    float wf = clamp(tn / {NATURAL_PEAK_NITS:.6f}, 0.0, 1.0);\n"
+            f"    float shadows = {DARKROOM_SHADOW_GAIN:.6f} / (1.0 + tn / {DARKROOM_SHADOW_PIVOT_NITS:.6f});\n"
+            f"    float shoulder = {DARKROOM_SHOULDER_GAIN:.6f} * pow(wf, {float(DARKROOM_SHOULDER_ORDER):.1f});\n"
+            f"    tn += tn * (1.0 - wf) * (shadows + {DARKROOM_MID_GAIN:.6f} + shoulder);\n"
+        )
     shader = (
         "//!HOOK MAIN\n"
         "//!BIND HOOKED\n"
@@ -1187,8 +1202,7 @@ def write_natural_shader(path: Path, primaries: str = "bt709"):
         "    );\n"
         f"    float y = dot(b20, vec3({yr:.4f}, {yg:.4f}, {yb:.4f}));\n"
         "    if (y <= 1e-9) return vec4(0.0, 0.0, 0.0, c.a);\n"
-        f"    float tn = (y <= {NATURAL_KNEE:.6f}) ? ({NATURAL_BASE_NITS:.6f} * y) : "
-        f"({NATURAL_BASE_NITS:.6f} * y + {NATURAL_BOOST_NITS:.6f} * pow(min((y - {NATURAL_KNEE:.6f}) / {span:.6f}, 1.0), 2.0));\n"
+        f"{mapping}"
         "    vec3 nits = b20 * (tn / y);\n"
         "    float pk = max(nits.r, max(nits.g, nits.b));\n"
         f"    if (pk > {NATURAL_PEAK_NITS:.6f}) nits *= ({NATURAL_PEAK_NITS:.6f} / pk);\n"
@@ -1779,6 +1793,8 @@ def build_command(opts: Options, info: dict, destination: Path,
             mastering_str, content_light_str, peak_nits = MASTERING_DISPLAY, BALANCED_CONTENT_LIGHT, int(BALANCED_PEAK_NITS)
         elif opts.hdr_style == "natural":
             mastering_str, content_light_str, peak_nits = MASTERING_DISPLAY, NATURAL_CONTENT_LIGHT, int(NATURAL_PEAK_NITS)
+        elif opts.hdr_style == "darkroom":
+            mastering_str, content_light_str, peak_nits = MASTERING_DISPLAY, DARKROOM_CONTENT_LIGHT, int(NATURAL_PEAK_NITS)
         detected_map = detected_encoders if detected_encoders is not None else detect_encoders()
         encoder_key, encoder_note = resolve_encoder(opts.encoder, opts.quality, w, h, detected=detected_map)
         is_hw = encoder_key in HARDWARE_PRIORITY
@@ -2293,14 +2309,13 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
             if plan.get("gpu_filter"):
                 if style_key == "balanced":
                     write_balanced_shader(cache_path / STYLE_SHADER_NAMES["balanced"], plan["source"]["primaries"])
-                elif style_key == "natural":
-                    write_natural_shader(cache_path / STYLE_SHADER_NAMES["natural"], plan["source"]["primaries"])
+                elif style_key in ("natural", "darkroom"):
+                    write_natural_shader(cache_path / STYLE_SHADER_NAMES[style_key], plan["source"]["primaries"],
+                                         lifted=style_key == "darkroom")
                 else:
                     write_vivid_shader(cache_path / STYLE_SHADER_NAMES["vivid"], plan["source"]["matrix"])
-            elif style_key == "balanced":
-                write_balanced_lut(cache_path / STYLE_LUT_NAMES["balanced"])
-            elif style_key == "natural":
-                write_natural_lut(cache_path / STYLE_LUT_NAMES["natural"])
+            elif style_key in ("balanced", "natural", "darkroom"):
+                _write_colorimetric_lut(cache_path / STYLE_LUT_NAMES[style_key], style_key)
             else:
                 write_curve(cache_path / STYLE_LUT_NAMES["vivid"])
         total = min(opts.duration or float("inf"), max(0, plan["source"]["duration"] - opts.start))
@@ -2501,6 +2516,14 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 mastering_desc = "BT.2020 / D65 / 1000 nits mastering container; curve peak aligned to 1000 nits"
                 light_desc = "1000/260 nits declared MaxCLL/MaxFALL matching balanced curve ceiling (1000 nits) and diffuse reference (~235 nits)"
                 fidelity_desc = "Colorimetric Gamma 2.2 BT.709-to-BT.2020 zero-trough mapping keeps pure blacks at 0 nits while preserving legible shadow detail, natural skin tones, crisp cloud/snow highlight gradation, and full 1000-nit specular punch. Lost SDR detail cannot be synthesized. Online platform transcoding is outside this tool."
+            elif plan.get("hdr_style") == "darkroom":
+                algorithm_desc = "Colorimetric darkroom shadow lift and soft shoulder (450 nits peak)"
+                path_desc = "GPU GLSL" if plan["gpu_filter"] else "49^3 tetrahedral LUT"
+                method_desc = f"{path_desc}, Gamma 2.4, luminance-dependent RGB gain, PQ HEVC ({plan['video_codec']})"
+                video_enc_desc = f"{plan['video_codec']} ({plan['quality_control']})"
+                mastering_desc = "BT.2020 / D65 / 1000 nits mastering container; 450-nit curve peak"
+                light_desc = "450/450 nits declared upper bounds, not measured content light levels"
+                fidelity_desc = "Fixed luminance mapping with proportional RGB scaling and zero black offset."
             elif plan.get("hdr_style") == "natural":
                 algorithm_desc = NATURAL_ALGORITHM_ID
                 if plan.get("gpu_filter"):
@@ -2620,8 +2643,8 @@ def cli():
     parser.add_argument("output", nargs="?")
     parser.add_argument("--resolution", choices=["original", "1440", "2160"], default="original")
     parser.add_argument("--quality", choices=["fast", "standard", "fine", "lossless"], default="standard")
-    parser.add_argument("--style", dest="hdr_style", choices=["balanced", "natural", "vivid"], default="balanced",
-                        help="SDR 转 HDR 风格：balanced 影院均衡高光（推荐电影·1000 nit），natural 柔和暗室保护（450 nit），vivid 高对比风格（原版·动漫）")
+    parser.add_argument("--style", dest="hdr_style", choices=list(STYLE_LUT_NAMES), default="balanced",
+                        help="SDR 转 HDR 风格：balanced 影院均衡高光，natural 柔和暗室保护，darkroom 暗室提亮，vivid 高对比风格")
     parser.add_argument("--gpu-filter", choices=["auto", "on", "off", "simd"], default="auto",
                         help="SDR 显卡有损编码：auto 优先 GPU 色彩并限制软件解码和滤镜线程，simd 使用多线程 CPU 滤镜，on 请求 Vulkan 滤镜，off 使用参考 CPU 滤镜")
     parser.add_argument("--multipass", action="store_true",

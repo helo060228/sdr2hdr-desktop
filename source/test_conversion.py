@@ -962,7 +962,8 @@ class ConversionTests(unittest.TestCase):
             v = struct.unpack(f"<{128 * 72}H", raw.stdout[256 * 144 * 2 + 128 * 72 * 2:])[128 * 36 + 64]
             return (y, u, v)
 
-        for style, expected_cll in (("balanced", (1000, 260)), ("natural", (450, 200)), ("vivid", (1000, 1000))):
+        for style, expected_cll in (("balanced", (1000, 260)), ("natural", (450, 200)),
+                                    ("darkroom", (450, 450)), ("vivid", (1000, 1000))):
             fast_out = self.dir / f"fast_{style}.mp4"
             gpu_out = self.dir / f"gpu_{style}.mp4"
             cpu_out = self.dir / f"cpu_{style}.mp4"
@@ -994,6 +995,29 @@ class ConversionTests(unittest.TestCase):
                                              start=0.2, duration=0.4, hdr_style="natural", gpu_filter="on"))
         self.assertTrue(res_clip["plan"]["gpu_filter"])
         self.assertTrue(all(res_clip["validation"]["checks"].values()))
+
+    def test_darkroom_lift_and_shoulder(self):
+        points = [core.darkroom_target_nits(i / 4096) for i in range(4097)]
+        self.assertEqual(points[0], 0)
+        self.assertEqual(points[-1], 450)
+        self.assertTrue(all(right > left for left, right in zip(points, points[1:])))
+        for code in (0.05, 0.1, 0.2, 0.5):
+            linear = code ** 2.4
+            self.assertGreater(core.darkroom_target_nits(linear), 1.15 * core.natural_target_nits(linear))
+        # Compare equal SDR code intervals approaching white, retaining positive slope.
+        def nits(code):
+            return core.darkroom_target_nits(code ** 2.4)
+        self.assertLess(nits(1.0) - nits(0.99), nits(0.97) - nits(0.96))
+        # Keep the concentration of the lift in shadows, with less gain on lit skin and clouds.
+        relative_gains = [nits(v) / core.natural_target_nits(v ** 2.4) for v in (0.1, 0.5, 0.85, 0.95)]
+        self.assertEqual(relative_gains, sorted(relative_gains, reverse=True))
+        self.assertLess(relative_gains[2], 1.20)
+        source = self.make_source(width=256, height=144)
+        result = core.convert(core.Options(str(source), str(self.dir / "lift.mp4"),
+                                           encoder="cpu", hdr_style="darkroom", quality="lossless"))
+        self.assertEqual(result["hdr_style"], "darkroom")
+        self.assertEqual(result["validation"]["lossless_pixels"]["all_frames_equal"], True)
+        self.assertEqual(result["plan"]["content_light"], "450,450")
 
     def test_balanced_style_lut_accuracy_midtone_and_headroom(self):
         # Verify strict monotonicity over [0, 1].
