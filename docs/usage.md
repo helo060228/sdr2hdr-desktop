@@ -51,7 +51,7 @@ SDR2HDR/
 - **NVIDIA 显卡 (NVENC)** / **Intel 显卡 (QSV)** / **AMD 显卡 (AMF)**：强制使用指定显卡硬件加速；若本地环境不支持或规格不满足会明确提示原因。
 - **CPU 软件编码 (x265)**：始终使用 `libx265` 软件编码，速度较慢但兼容性最广，同体积下压缩率通常更高。
 
-注：v1.6.1 起，SDR 转 HDR10 在显卡有损编码下默认采用 **多线程 SIMD 色彩（`zscale d=ordered` + LUT，原尺寸直出 `p010le` 零冗余拷贝，缩放时自动 `spline36`）+ 显卡 100% 独占硬编** 异构并行管线，避免 Windows 无法 Vulkan↔CUDA 零拷贝造成的 PCIe 双向往返与 H.264 Vulkan 卡顿（RTX 4060 实测 1080p 达 `125～150 fps`、4K H.264 提速 6×）；杜比视界 Profile 5 / 8.4 继续使用优化后的 Vulkan + `libplacebo` 还原。命令行可通过 `--gpu-filter {auto,on,off}` 切换。
+v1.6.1 修订版中，GUI 和命令行默认的 `--gpu-filter auto` 会在普通 SDR 显卡有损转换时优先使用通过自检的 Vulkan 滤镜。HEVC / AV1 在条件满足时使用 Vulkan 硬解。H.264 由 CPU 解码。软件解码和回退的 CPU 滤镜各限 1～4 个线程。选择 `--gpu-filter simd` 可使用之前的高速 CPU 滤镜搭配显卡编码，适合优先考虑吞吐量的任务。
 
 ### 编码画质校准与 NVENC 双遍分析
 

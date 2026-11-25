@@ -561,22 +561,28 @@ class App:
 
         q_hdr = ttk.Frame(queue_panel)
         q_hdr.pack(fill="x", pady=(0, 4))
-        ttk.Label(q_hdr, text="任务列表", style="Section.TLabel").pack(side="left")
-        ttk.Label(q_hdr, textvariable=self.queue_summary, style="Sub.TLabel").pack(side="left", padx=(10, 0))
+        self.queue_heading = ttk.Frame(q_hdr)
+        self.queue_heading.grid(row=0, column=0, sticky="w")
+        q_hdr.columnconfigure(0, weight=1)
+        ttk.Label(self.queue_heading, text="任务列表", style="Section.TLabel").pack(side="left")
+        ttk.Label(self.queue_heading, textvariable=self.queue_summary, style="Sub.TLabel").pack(side="left", padx=(10, 0))
 
-        btn_clear_all = ttk.Button(q_hdr, text="清空列表", style="Small.TButton", command=self.clear_queue)
-        btn_clear_all.pack(side="right")
-        btn_clear_done = ttk.Button(q_hdr, text="清理已完成", style="Small.TButton", command=self.clear_completed_tasks)
-        btn_clear_done.pack(side="right", padx=(0, 5))
-        btn_remove = ttk.Button(q_hdr, text="移除", style="Small.TButton", command=self.remove_selected_task)
-        btn_remove.pack(side="right", padx=(0, 5))
-        btn_down = ttk.Button(q_hdr, text="下移", style="Small.TButton", command=lambda: self.move_selected_task(1))
-        btn_down.pack(side="right", padx=(0, 5))
-        btn_up = ttk.Button(q_hdr, text="上移", style="Small.TButton", command=lambda: self.move_selected_task(-1))
-        btn_up.pack(side="right", padx=(0, 5))
-        btn_batch = ttk.Button(q_hdr, text="批量添加视频…", style="Small.TButton", command=self.batch_add_to_queue)
-        btn_batch.pack(side="right", padx=(0, 8))
-        self.queue_edit_buttons = [btn_batch, btn_up, btn_down, btn_remove, btn_clear_done, btn_clear_all]
+        self.queue_toolbar = ttk.Frame(q_hdr)
+        self.queue_toolbar.grid(row=1, column=0, columnspan=2, sticky="w")
+        for label, action in (
+            ("批量添加视频…", self.batch_add_to_queue),
+            ("上移", lambda: self.move_selected_task(-1)),
+            ("下移", lambda: self.move_selected_task(1)),
+            ("移除", self.remove_selected_task),
+            ("清理已完成", self.clear_completed_tasks),
+            ("清空列表", self.clear_queue),
+        ):
+            button = ttk.Button(self.queue_toolbar, text=label, command=action, style="Small.TButton", width=-1)
+            button.pack(side="left", padx=(0, 5))
+            self.queue_edit_buttons.append(button)
+        q_hdr.bind("<Configure>", self._layout_queue_toolbar)
+        self.queue_heading.bind("<Configure>", self._layout_queue_toolbar)
+        self.queue_toolbar.bind("<Configure>", self._layout_queue_toolbar)
 
         tree_border = tk.Frame(queue_panel, bg=BORDER_COLOR, padx=1, pady=1)
         tree_border.pack(fill="both", expand=True)
@@ -703,6 +709,17 @@ class App:
             div.pack_configure(pady=(div_pad, div_pad + 2))
         self._last_wrap = 0
         return True
+
+    def _layout_queue_toolbar(self, _event=None):
+        width = self.queue_toolbar.master.winfo_width()
+        needed = self.queue_heading.winfo_reqwidth() + self.queue_toolbar.winfo_reqwidth() + 10
+        wrapped = width < needed
+        if bool(int(self.queue_toolbar.grid_info()["row"])) == wrapped:
+            return
+        if wrapped:
+            self.queue_toolbar.grid_configure(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        else:
+            self.queue_toolbar.grid_configure(row=0, column=1, columnspan=1, sticky="e", pady=0)
 
     def _schedule_sync_layout(self, _event=None):
         if self._syncing:
@@ -1827,7 +1844,12 @@ class App:
                             enc_part = "显卡加速：" + "、".join(hw_labels)
                         else:
                             enc_part = "显卡加速：未检测到可用硬编（使用 CPU x265）"
-                        gpu_part = "；色彩管线：多线程 SIMD + 显卡独占硬编" if hw_labels else "；色彩管线：CPU 浮点滤镜"
+                        if not hw_labels:
+                            gpu_part = "；色彩管线：CPU 浮点滤镜"
+                        elif (self.gpu_filter_caps or {}).get("libplacebo_shader"):
+                            gpu_part = "；SDR 显卡有损转换优先使用 GPU 滤镜"
+                        else:
+                            gpu_part = "；SDR 显卡有损转换使用低线程 CPU 滤镜"
                         dv_part = ""
                         if self.dv_tools:
                             if self.dv_tools.get("strip_available") and self.dv_tools.get("libplacebo"):

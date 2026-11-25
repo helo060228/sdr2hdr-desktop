@@ -1706,7 +1706,7 @@ def build_command(opts: Options, info: dict, destination: Path,
         raise ConversionError("未知的杜比视界处理模式。")
     if opts.hdr_style not in STYLE_LUT_NAMES:
         raise ConversionError("未知的 HDR 风格设置。")
-    if opts.gpu_filter not in ("auto", "on", "off"):
+    if opts.gpu_filter not in ("auto", "on", "off", "simd"):
         raise ConversionError("未知的 GPU 滤镜加速设置。")
 
     dv = None
@@ -1789,7 +1789,7 @@ def build_command(opts: Options, info: dict, destination: Path,
     use_fast_hw_filter = False
     use_vulkan_hwdec = False
     if video_operation == "sdr_to_hdr" and is_hw and not lossless_video:
-        if opts.gpu_filter == "on":
+        if opts.gpu_filter in ("auto", "on"):
             eligible_input = (
                 p["matrix"] != "gbr"
                 and p["transfer"] in ("bt709", "smpte170m", "bt470bg", "bt2020-10", "bt2020-12")
@@ -1809,13 +1809,12 @@ def build_command(opts: Options, info: dict, destination: Path,
                     use_vulkan_hwdec = bool(gpu_caps.get("vulkan_hwdec") and hwdec_codec_ok and hwdec_color_ok)
                     pipeline_note = "Vulkan 硬解 + libplacebo GPU 色彩管线" if use_vulkan_hwdec else "libplacebo GPU 色彩管线"
                     encoder_note = f"{encoder_note}（{pipeline_note}）" if encoder_note else f"已启用 {pipeline_note}"
-        elif opts.gpu_filter == "auto":
-            # Windows FFmpeg lacks zero-copy Vulkan<->CUDA hwmap; multi-threaded SIMD zscale (ordered dither,
-            # direct p010le) + dedicated GPU hardware encoding runs 1.5x-6x faster than Vulkan roundtrip.
+        if opts.gpu_filter == "simd" or (opts.gpu_filter == "auto" and not use_gpu_filter):
             use_fast_hw_filter = True
-            pipeline_note = "多线程 SIMD 色彩 + 显卡独占硬编"
+            pipeline_note = ("CPU 高速滤镜 + 显卡编码" if opts.gpu_filter == "simd"
+                             else "显卡滤镜不适用，使用低线程 CPU 滤镜 + 显卡编码")
             encoder_note = f"{encoder_note}（{pipeline_note}）" if encoder_note else f"已启用 {pipeline_note}"
-    elif video_operation == "dv_reencode" and not lossless_video and opts.gpu_filter in ("auto", "on"):
+    elif video_operation == "dv_reencode" and not lossless_video and opts.gpu_filter != "off":
         gpu_caps = gpu_filter_caps if gpu_filter_caps is not None else detect_gpu_filter()
         codec_name = p.get("codec_name", "")
         pix_fmt = p.get("pixel_format", "")
@@ -1827,6 +1826,10 @@ def build_command(opts: Options, info: dict, destination: Path,
 
     filter_threads = min(16, os.cpu_count() or 4) if is_hw else min(8, os.cpu_count() or 4)
     codec_threads = min(8, os.cpu_count() or 4)
+    if video_operation == "sdr_to_hdr" and is_hw and not lossless_video and opts.gpu_filter == "auto":
+        # Reserve host capacity for other applications, including on software-decode/fallback paths.
+        background_threads = max(1, min(4, (os.cpu_count() or 4) // 4))
+        filter_threads = codec_threads = background_threads
     args = [find_tool("ffmpeg"), "-hide_banner", "-loglevel", "warning", "-n",
             "-filter_threads", str(filter_threads), "-threads", str(codec_threads)]
     if use_vulkan_hwdec:
@@ -2619,8 +2622,8 @@ def cli():
     parser.add_argument("--quality", choices=["fast", "standard", "fine", "lossless"], default="standard")
     parser.add_argument("--style", dest="hdr_style", choices=["balanced", "natural", "vivid"], default="balanced",
                         help="SDR 转 HDR 风格：balanced 影院均衡高光（推荐电影·1000 nit），natural 柔和暗室保护（450 nit），vivid 高对比风格（原版·动漫）")
-    parser.add_argument("--gpu-filter", choices=["auto", "on", "off"], default="auto",
-                        help="色彩滤镜模式：auto 默认使用高速多线程 SIMD 色彩 + 显卡独占硬编（杜比视界自动用 Vulkan），on 强制启用 Vulkan/libplacebo GPU 着色器，off 强制精确参考 CPU 滤镜")
+    parser.add_argument("--gpu-filter", choices=["auto", "on", "off", "simd"], default="auto",
+                        help="SDR 显卡有损编码：auto 优先 GPU 色彩并限制软件解码和滤镜线程，simd 使用多线程 CPU 滤镜，on 请求 Vulkan 滤镜，off 使用参考 CPU 滤镜")
     parser.add_argument("--multipass", action="store_true",
                         help="为 NVIDIA NVENC 有损档启用双遍分析（画质略优但耗时增加）")
     parser.add_argument("--encoder", choices=["auto", "cpu", "nvenc", "qsv", "amf"], default="auto")

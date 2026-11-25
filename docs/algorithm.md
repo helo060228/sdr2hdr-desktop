@@ -94,8 +94,8 @@ SDR 转 HDR10 提供三种独立管线（显卡有损编码默认经 Vulkan + `l
 
 ### 滤镜衔接、GPU 色彩加速与元数据传播
 
-- **高速异构并行路径（SDR 显卡有损编码默认，v1.6.1）**：使用多线程 SIMD `zscale`（`d=ordered`，原尺寸不缩放时 `bilinear`、2K/4K 缩放时 `spline36`）+ `49³` 四面体 `lut3d` / `65536` 点 `lut1d`，末尾直接输出 `p010le` 送入 `NVENC` / `QSV` / `AMF` 独占硬编，避免 Windows 下 Vulkan→系统内存→显卡编码器的双倍 PCIe 往返拷贝及 H.264 Vulkan 硬解同步卡顿；10-bit 像素与浮点参考管线最大误差 `≤ 2 / 1023`。
-- **可选 GPU 着色器路径（`--gpu-filter on`）**：在通过 Vulkan / `libplacebo` 自检时，通过自包含 `//!HOOK MAIN` GLSL 着色器在 GPU 执行对应曲线（仅对 HEVC / AV1 启用 Vulkan 硬解，避免 H.264 卡顿）。
+- **默认路径**（`--gpu-filter auto`）优先使用通过自检的 Vulkan/libplacebo GPU 滤镜。输入或设备不支持时回退 SIMD 色彩处理。自动模式按逻辑处理器数为软件解码和滤镜分别分配 1～4 个线程。
+- `--gpu-filter simd` 显式启用多线程 zscale、LUT、ordered 抖动和 p010le 输出，交由显卡编码。`--gpu-filter on` 保留现有 Vulkan 请求语义。HDR 色彩着色器支持的输入与硬解能力分别检查，H.264 使用软件解码。
 - **精确参考浮点路径（CPU 编码 / 画面无损 / `--gpu-filter off`）**：使用 `zscale`（`spline36 + error_diffusion`）+ LUT 输出确定性 `yuv420p10le`（硬件无损档追加 `,format=p010le`），保证逐帧 SHA-256 校验 100% 确定一致。
 - 硬件编码通过输入流选项 `-mastering_display:<stream>` 与 `-content_light:<stream>` 传入 HDR10 静态元数据（放在 `-i` 之前），并配合输出 VUI 标记（`bt2020` / `smpte2084` / `bt2020nc` / `tv`）和 `hvc1` 标签。
 - 硬件编码限用于 `160×128` 至 `8192×8192` 的输出分辨率；超出范围或显卡不支持无损时，“自动”模式会回退到 `libx265`。

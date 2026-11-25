@@ -309,7 +309,7 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(plan_amf_auto["encoder"], "amf")
         self.assertEqual(plan_amf_auto["video_codec"], "hevc_amf")
 
-        # Verify metadata placement before -i, fast SIMD zscale default, and opt-in libplacebo GPU shader path.
+        # Verify hardware encoding and GPU-first color processing independently.
         no_gpu_filter = dict(libplacebo_shader=False, vulkan_hwdec=False, reason="off")
         yes_gpu_filter = dict(libplacebo_shader=True, vulkan_hwdec=True, reason="")
         hevc_info = {**fake_info, "streams": [{**fake_info["streams"][0], "codec_name": "hevc"}, fake_info["streams"][1]]}
@@ -318,12 +318,12 @@ class ConversionTests(unittest.TestCase):
             ("qsv", ["-c:v", "hevc_qsv", "-global_quality"]),
             ("amf", ["-c:v", "hevc_amf", "-bitdepth", "10", "-rc", "cqp"]),
         ]:
-            # Default gpu_filter="auto" selects fast multi-threaded SIMD zscale (ordered dither, direct p010le) + GPU encoder.
+            # H.264 takes the GPU color path with a bounded software decoder.
             cmd, plan = core.build_command(core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard"),
                                            fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter)
             self.assertEqual(plan["encoder"], enc_key)
-            self.assertFalse(plan["gpu_filter"])
-            self.assertTrue(plan["fast_hw_filter"])
+            self.assertTrue(plan["gpu_filter"])
+            self.assertFalse(plan["fast_hw_filter"])
             self.assertFalse(plan["vulkan_hwdec"])
             input_pos = cmd.index("-i")
             md_pos = cmd.index("-mastering_display:1")
@@ -331,8 +331,9 @@ class ConversionTests(unittest.TestCase):
             self.assertLess(md_pos, input_pos)
             self.assertLess(cl_pos, input_pos)
             vf = cmd[cmd.index("-vf") + 1]
-            self.assertIn("d=ordered", vf)
-            self.assertTrue(vf.endswith("format=p010le,setsar=1"))
+            self.assertIn("custom_shader_path=balanced.hook", vf)
+            self.assertLessEqual(int(cmd[cmd.index("-threads") + 1]), 4)
+            self.assertNotIn("-hwaccel", cmd)
             for flag in expected_flags:
                 self.assertIn(flag, cmd)
 
@@ -347,7 +348,7 @@ class ConversionTests(unittest.TestCase):
             self.assertIn("custom_shader_path=balanced.hook", cmd_g_h264[cmd_g_h264.index("-vf") + 1])
 
             cmd_g, plan_g = core.build_command(
-                core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard", gpu_filter="on"),
+                core.Options("in.mp4", str(dest), encoder=enc_key, quality="standard"),
                 hevc_info, dest, detected_encoders=all_hw, gpu_filter_caps=yes_gpu_filter,
             )
             self.assertTrue(plan_g["gpu_filter"])
@@ -356,6 +357,16 @@ class ConversionTests(unittest.TestCase):
             self.assertIn("vulkan", cmd_g)
             self.assertLess(cmd_g.index("-mastering_display:1"), cmd_g.index("-i"))
             self.assertIn("custom_shader_path=balanced.hook", cmd_g[cmd_g.index("-vf") + 1])
+
+            fallback, plan_fallback = core.build_command(
+                core.Options("in.mp4", str(dest), encoder=enc_key),
+                fake_info, dest, detected_encoders=all_hw, gpu_filter_caps=no_gpu_filter,
+            )
+            self.assertFalse(plan_fallback["gpu_filter"])
+            self.assertTrue(plan_fallback["fast_hw_filter"])
+            self.assertEqual(plan_fallback["encoder"], enc_key)
+            self.assertLessEqual(int(fallback[fallback.index("-filter_threads") + 1]), 4)
+            self.assertIn("d=ordered", fallback[fallback.index("-vf") + 1])
 
         for style, shader in (("balanced", "balanced.hook"), ("natural", "natural.hook"), ("vivid", "vivid.hook")):
             cmd_st, plan_st = core.build_command(core.Options("in.mp4", str(dest), encoder="nvenc", hdr_style=style, gpu_filter="on"),
@@ -956,9 +967,9 @@ class ConversionTests(unittest.TestCase):
             gpu_out = self.dir / f"gpu_{style}.mp4"
             cpu_out = self.dir / f"cpu_{style}.mp4"
             res_fast = core.convert(core.Options(str(skin_src), str(fast_out), quality="standard", encoder="auto",
-                                                 hdr_style=style, gpu_filter="auto"))
+                                                 hdr_style=style, gpu_filter="simd"))
             res_gpu = core.convert(core.Options(str(skin_src), str(gpu_out), quality="standard", encoder="auto",
-                                                hdr_style=style, gpu_filter="on"))
+                                                hdr_style=style))
             res_cpu = core.convert(core.Options(str(skin_src), str(cpu_out), quality="standard", encoder="auto",
                                                 hdr_style=style, gpu_filter="off"))
             self.assertTrue(res_fast["plan"]["fast_hw_filter"])
@@ -977,7 +988,7 @@ class ConversionTests(unittest.TestCase):
             for g_ch, c_ch in zip(g_yuv, c_yuv):
                 self.assertLessEqual(abs(g_ch - c_ch), 4, f"{style} GPU {g_yuv} vs CPU {c_yuv}")
 
-        # Verify -ss / -t clipping works cleanly with both default fast SIMD and opt-in libplacebo.
+        # Verify a clipped export on the explicitly requested Vulkan path.
         clip_out = self.dir / "gpu_clipped.mp4"
         res_clip = core.convert(core.Options(str(skin_src), str(clip_out), quality="fast", encoder="auto",
                                              start=0.2, duration=0.4, hdr_style="natural", gpu_filter="on"))
@@ -1184,6 +1195,31 @@ class ConversionTests(unittest.TestCase):
         done_events = [e for e in events if e.get("stage") == "done"]
         self.assertEqual(len(done_events), 1)
         self.assertIn("elapsed", done_events[0])
+
+    def test_queue_toolbar_fits_window_and_long_summary(self):
+        import app as gui_app
+        import tkinter as tk
+
+        root = tk.Tk()
+        self.addCleanup(root.destroy)
+        root.attributes("-alpha", 0)
+        root.tk.call("tk", "scaling", 1.25 * 96 / 72)
+        with patch.object(gui_app.App, "detect_encoders_async"):
+            app = gui_app.App(root)
+        for size in ("1275x900", "1050x720", "1920x1080", "1275x900"):
+            root.geometry(size)
+            for summary in ("暂无任务，可直接转换或点击“加入任务列表”排队执行",
+                            "共 100 项 · 等待 20 · 完成 50 · 失败 30"):
+                app.queue_summary.set(summary)
+                root.update_idletasks()
+                app.sync_layout()
+                root.update_idletasks()
+                header = app.queue_toolbar.master
+                for button in app.queue_edit_buttons:
+                    self.assertTrue(button.winfo_ismapped(), (size, button.cget("text")))
+                    self.assertGreaterEqual(button.winfo_width(), button.winfo_reqwidth())
+                    self.assertLessEqual(button.winfo_rootx() + button.winfo_width(),
+                                         header.winfo_rootx() + header.winfo_width())
 
     def test_proportional_fullscreen_scaling_metrics(self):
         import app as gui_app
