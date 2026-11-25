@@ -287,6 +287,37 @@ def _known_duration(*values) -> float:
     return 0.0
 
 
+def _video_span(video: dict) -> float:
+    """Duration of the video track itself, when the header provides it."""
+    seconds = _known_duration(video.get("duration"))
+    if seconds:
+        return seconds
+    tags = {key.upper(): val for key, val in video.get("tags", {}).items()}
+    stamp = tags.get("DURATION") or tags.get("DURATION-ENG")
+    match = re.fullmatch(r"(\d+):([0-5]\d):([0-5]\d(?:\.\d+)?)", str(stamp))
+    if not match:
+        return 0.0
+    seconds = int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3])
+    # MKVToolNix statistics give elapsed time. FFmpeg's Matroska muxer
+    # writes the end timestamp, including any initial mux/codec delay.
+    if not any(key.startswith("_STATISTICS_") for key in tags):
+        seconds -= _finite_number(video.get("start_time")) or 0.0
+    return max(0.0, seconds)
+
+
+def _video_offset(info: dict, video: dict) -> float:
+    start = _finite_number(video.get("start_time"))
+    origin = _finite_number(info.get("format", {}).get("start_time")) or 0.0
+    return max(0.0, start - origin) if start is not None else 0.0
+
+
+def _video_timeline_end(info: dict, video: dict) -> float:
+    span = _video_span(video)
+    if span:
+        return _video_offset(info, video) + span
+    return _known_duration(info.get("format", {}).get("duration"))
+
+
 def _positive_ratio(value, default=1.0) -> float:
     try:
         number = float(Fraction(str(value).replace(":", "/")))
@@ -623,7 +654,7 @@ def dv_properties(info: dict, dv: dict, strip: bool) -> dict:
     if not strip and abs(rotation) % 180 == 90:
         width, height, sar = height, width, 1 / sar
     fps = _positive_ratio(v.get("avg_frame_rate"), _positive_ratio(v.get("r_frame_rate"), 25.0))
-    duration = _known_duration(v.get("duration"), info.get("format", {}).get("duration"))
+    duration = _video_timeline_end(info, v)
     color_range = "full" if v.get("color_range") == "pc" else ("limited" if v.get("color_range") == "tv" else "unknown")
     return dict(
         width=width, height=height, sar=sar, fps=fps or 25, duration=duration,
@@ -888,7 +919,7 @@ def hdr_copy_properties(info: dict) -> dict:
         raise ConversionError("画面直拷目前支持 HEVC 10-bit、PQ／BT.2020 的 HDR 文件，例如本工具先前导出的文件。")
     fps = _positive_ratio(v.get("avg_frame_rate"), _positive_ratio(v.get("r_frame_rate"), 25.0))
     return dict(width=v["width"], height=v["height"], sar=1.0, fps=fps or 25,
-                duration=_known_duration(v.get("duration"), info.get("format", {}).get("duration")),
+                duration=_video_timeline_end(info, v),
                 matrix=v["color_space"], transfer=v["color_transfer"], primaries=v["color_primaries"],
                 range="limited", guessed=[], stream_index=v["index"], pixel_format=v["pix_fmt"])
 
@@ -938,7 +969,7 @@ def source_properties(info: dict) -> dict:
     if abs(rotation) % 180 == 90:
         width, height, sar = height, width, 1 / sar
     fps = _positive_ratio(v.get("avg_frame_rate"), _positive_ratio(v.get("r_frame_rate"), 25.0))
-    duration = _known_duration(v.get("duration"), info.get("format", {}).get("duration"))
+    duration = _video_timeline_end(info, v)
     return dict(width=width, height=height, sar=sar, fps=fps or 25, duration=duration,
                 matrix=matrix, primaries=primaries, transfer=trc, range=range_,
                 guessed=guessed, stream_index=v["index"], pixel_format=pix_fmt,
@@ -1899,8 +1930,12 @@ def build_command(opts: Options, info: dict, destination: Path,
     )
 
     args += ["-i", opts.source]
-    if opts.duration is not None:
-        args += ["-t", str(opts.duration)]
+    timed_mkv = is_mkv and not stream_copy and opts.duration is not None
+    clip_length = opts.duration
+    if timed_mkv and p["duration"] > opts.start:
+        clip_length = min(clip_length, p["duration"] - opts.start)
+    if clip_length is not None:
+        args += ["-t", str(clip_length)]
     args += ["-map", f"0:{p['stream_index']}"]
     for s in active_audio:
         args += ["-map", f"0:{s['index']}"]
@@ -2049,10 +2084,30 @@ def build_command(opts: Options, info: dict, destination: Path,
     if copy_attachments:
         args += ["-c:t", "copy"]
 
+    if timed_mkv:
+        # Input seeking decodes video accurately but also forwards copied
+        # packets from the preceding keyframe. Keep audio packet contents intact.
+        if opts.start:
+            for track in audio_tracks:
+                if track["mode"] == "copy":
+                    args += [f"-bsf:a:{track['index']}", "noise=drop='lte(pts+duration,0)'"]
+        # A text cue can cross either cut. Intersect its interval with the
+        # preview rather than letting it shift the timeline or prolong playback.
+        end = f"{clip_length:.9f}/TB"
+        subtitle_filter = (
+            "noise=drop='lte(pts+duration,0)*gt(duration,0)',"
+            "setts=pts='max(PTS,0)':dts='max(DTS,0)':"
+            f"duration='if(gt(DURATION,0),max(0,min(PTS+DURATION,{end})-max(PTS,0)),DURATION)'"
+        )
+        for index, subtitle in enumerate(selected_subs):
+            if _subtitle_codec_mp4_supported(subtitle.get("codec_name")):
+                args += [f"-bsf:s:{index}", subtitle_filter]
+
     if not is_mkv:
         args += ["-movflags", "+faststart+write_colr"]
     args += ["-progress", "pipe:1", "-nostats", str(destination)]
-    expected_duration = min(opts.duration or float("inf"), max(0, p["duration"] - opts.start))
+    end = min(p["duration"], opts.start + (opts.duration or float("inf")))
+    expected_duration = max(0.0, end - max(opts.start, _video_offset(info, video_stream(info))))
     return args, dict(source=p, width=w, height=h, preset=preset, crf=crf,
                       container=container,
                       lossless_video=lossless_video,
@@ -2084,6 +2139,7 @@ def build_command(opts: Options, info: dict, destination: Path,
                       content_light=content_light_str,
                       nominal_peak_nits=peak_nits,
                       clipped_stream_copy=bool(stream_copy and (opts.start or opts.duration is not None)),
+                      timed_mkv=timed_mkv,
                       require_limited_range=(p.get("range") == "limited") if video_operation == "dv_strip" else True,
                       require_matrix_metadata=(p.get("matrix") == "bt2020nc") if video_operation == "dv_strip" else True,
                       require_mastering_metadata=bool(dv.get("source_has_mastering", False)) if video_operation == "dv_strip" else True,
@@ -2091,6 +2147,25 @@ def build_command(opts: Options, info: dict, destination: Path,
                       expect_audio=expect_audio,
                       expected_audio_count=len(active_audio) if expect_audio else 0,
                       expected_video_duration=expected_duration if math.isfinite(expected_duration) else None)
+
+
+def _video_packet_span(path: Path, video: dict, fps: float) -> float:
+    """Measure presentation span without decoding or keeping a full packet list."""
+    command = [find_tool("ffprobe"), "-v", "error", "-select_streams", str(video["index"]),
+               "-show_entries", "packet=pts_time,duration_time", "-of", "compact=p=0", str(path)]
+    first = math.inf
+    end = -math.inf
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW) as proc:
+        for line in proc.stdout:
+            fields = dict(field.split("=", 1) for field in line.strip().split("|") if "=" in field)
+            pts = _finite_number(fields.get("pts_time"))
+            if pts is not None:
+                first = min(first, pts)
+                end = max(end, pts + (_known_duration(fields.get("duration_time")) or 1.0 / fps))
+        if proc.wait() != 0:
+            raise ConversionError("无法读取输出视频轨的时间戳。")
+    return max(0.0, end - first)
 
 
 def validate_export(path: Path, expected: dict) -> dict:
@@ -2108,23 +2183,29 @@ def validate_export(path: Path, expected: dict) -> dict:
             optional_metadata["mastering_metadata"] = checks.pop("mastering_metadata")
         if not expected.get("require_content_light_metadata", True):
             optional_metadata["content_light_metadata"] = checks.pop("content_light_metadata")
-    if expected.get("expected_video_duration"):
-        actual_duration = _known_duration(v.get("duration"), data.get("format", {}).get("duration"))
-        if expected.get("clipped_stream_copy"):
-            checks["duration"] = actual_duration > 0
-        else:
-            checks["duration"] = abs(actual_duration - expected["expected_video_duration"]) < max(.15, 3 / expected["source"]["fps"])
-    elif expected.get("require_nonzero_duration"):
-        actual_duration = _known_duration(v.get("duration"), data.get("format", {}).get("duration"))
+    target_duration = expected.get("expected_video_duration")
+    actual_duration = None
+    if target_duration or expected.get("require_nonzero_duration") or expected.get("timed_mkv"):
+        fps = expected["source"]["fps"]
+        actual_duration = _video_span(v)
+        if expected.get("timed_mkv") or not actual_duration:
+            actual_duration = _video_packet_span(path, v, fps)
         checks["duration"] = actual_duration > 0
+        if target_duration and not expected.get("clipped_stream_copy"):
+            checks["duration"] &= abs(actual_duration - target_duration) < max(.15, 3 / fps)
     if expected.get("expect_audio"):
         checks["audio_present"] = any(s.get("codec_type") == "audio" for s in data.get("streams", []))
     if expected.get("audio_effect") == "surround":
         a = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), {})
         checks["stereo_aac_48k"] = a.get("codec_name") == "aac" and a.get("channels") == 2 and a.get("sample_rate") == "48000"
     if not all(checks.values()):
-        raise ConversionError("输出验证未通过：" + "、".join(k for k, ok in checks.items() if not ok))
+        failures = [k for k, ok in checks.items() if not ok]
+        if "duration" in failures and target_duration:
+            failures[failures.index("duration")] = f"视频轨时长（预期 {target_duration:.3f} 秒，实际 {actual_duration:.3f} 秒）"
+        raise ConversionError("输出验证未通过：" + "、".join(failures))
     result = dict(checks=checks, stream=v, first_frame_side_data=side, format=data.get("format", {}))
+    if actual_duration is not None:
+        result["video_duration_seconds"] = actual_duration
     if optional_metadata:
         result["optional_metadata"] = optional_metadata
     return result

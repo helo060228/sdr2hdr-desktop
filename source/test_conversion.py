@@ -200,6 +200,7 @@ class ConversionTests(unittest.TestCase):
                 v = core.video_stream(data)
                 v.update(duration="N/A", avg_frame_rate="N/A", sample_aspect_ratio="N/A",
                          side_data_list=[{"rotation": "N/A"}])
+                v.get("tags", {}).pop("DURATION", None)
                 data["format"]["duration"] = "N/A"
                 audio = next(s for s in data["streams"] if s.get("codec_type") == "audio")
                 audio.update(sample_rate="N/A", duration="N/A")
@@ -213,6 +214,73 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(result["plan"]["source"]["duration"], 0)
         self.assertEqual(result["plan"]["source"]["fps"], 25)
         self.assertTrue(any(e.get("total") == 0 for e in events if "total" in e))
+
+    def test_middle_mkv_preview_uses_video_duration_and_clips_copied_tracks(self):
+        subtitle = self.dir / "crossing.srt"
+        subtitle.write_text("1\n00:00:01,000 --> 00:00:05,000\nfirst\n\n"
+                            "2\n00:00:05,300 --> 00:00:08,200\nsecond\n\n"
+                            "3\n00:00:09,800 --> 00:00:13,000\nlast\n", encoding="utf-8")
+        source = self.dir / "long-gop.mkv"
+        result = core.capture([core.find_tool("ffmpeg"), "-v", "error", "-f", "lavfi", "-i",
+                               "testsrc2=size=384x160:rate=24:duration=12", "-f", "lavfi", "-i",
+                               "aevalsrc=0.25*sin(2*PI*(300*t+20*t*t)):s=48000:d=12", "-i", str(subtitle),
+                               "-map", "0:v", "-map", "1:a", "-map", "2:s", "-c:v", "libx265", "-preset", "ultrafast",
+                               "-x265-params", "keyint=96:min-keyint=96:scenecut=0:pools=2:log-level=error",
+                               "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                               "-ac", "6", "-c:a", "eac3", "-c:s", "srt", str(source)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertAlmostEqual(core.source_properties(core.probe(source))["duration"], 12, delta=.05)
+
+        def packets(file, stream):
+            result = core.capture([core.find_tool("ffprobe"), "-v", "error", "-select_streams", stream,
+                                   "-show_packets", "-show_data_hash", "sha256", "-show_entries",
+                                   "packet=pts_time,duration_time,data_hash", "-of", "json", str(file)])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)["packets"]
+
+        source_hashes = [packet["data_hash"] for packet in packets(source, "a:0")]
+        for start, seconds in ((3, 3), (11, 1)):
+            with self.subTest(start=start):
+                output = self.dir / f"preview-{start}.mkv"
+                report = core.convert(core.Options(str(source), str(output), encoder="cpu", quality="fast",
+                                                   start=start, duration=3))
+                valid = report["validation"]
+                self.assertAlmostEqual(valid["video_duration_seconds"], seconds, delta=.05)
+                self.assertLess(float(valid["stream"]["start_time"]), .05)
+                self.assertAlmostEqual(float(valid["format"]["duration"]), seconds, delta=.06)
+                self.assertEqual(len(packets(output, "v:0")), seconds * 24)
+                audio = packets(output, "a:0")
+                self.assertEqual(core.probe(output)["streams"][1]["channels"], 6)
+                kept = [packet["data_hash"] for packet in audio]
+                position = source_hashes.index(kept[0])
+                self.assertEqual(kept, source_hashes[position:position+len(kept)])
+                self.assertAlmostEqual(position * .032, start, delta=.04)
+                cues = packets(output, "s:0")
+                self.assertEqual(len(cues), 2 if start == 3 else 1)
+                self.assertLess(float(cues[0]["pts_time"]), .05)
+                self.assertAlmostEqual(float(cues[-1]["pts_time"]) + float(cues[-1]["duration_time"]),
+                                       seconds, delta=.05)
+
+        # A three-second subtitle must not mask a genuinely short video track.
+        subtitle.write_text("1\n00:00:00,000 --> 00:00:03,000\npadding\n", encoding="utf-8")
+        short = self.dir / "truncated.mkv"
+        result = core.capture([core.find_tool("ffmpeg"), "-v", "error", "-i", str(output),
+                               "-i", str(subtitle), "-map", "0:v:0", "-map", "0:a:0", "-map", "1:s",
+                               "-c", "copy", str(short)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertAlmostEqual(float(core.probe(short)["format"]["duration"]), 3, delta=.06)
+        with self.assertRaisesRegex(core.ConversionError, "视频轨时长.*预期 3.000 秒"):
+            core.validate_export(short, {**report["plan"], "expected_video_duration": 3})
+
+    def test_video_duration_tags_and_timeline_origin(self):
+        stream = {"start_time": "2.25", "tags": {"DURATION": "00:00:05.250000000"}}
+        info = {"format": {"start_time": "1.25", "duration": "20"}}
+        self.assertEqual(core._video_span(stream), 3)
+        self.assertEqual(core._video_timeline_end(info, stream), 4)
+        stream["tags"] = {"DURATION-eng": "00:00:03.000000000", "_STATISTICS_TAGS-eng": "BPS DURATION"}
+        self.assertEqual(core._video_span(stream), 3)
+        stream["tags"] = {"DURATION": "N/A"}
+        self.assertEqual(core._video_timeline_end(info, stream), 20)
 
     def test_lossless_roundtrip_matches_every_preencode_frame(self):
         source = self.make_source()
