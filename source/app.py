@@ -846,7 +846,7 @@ class App:
         if self.input_kind == "sdr":
             style_key = STYLE_LABELS[self.hdr_style.get()]
             if style_key == "balanced":
-                notes.append("影院均衡高光：Gamma 2.2 通透暗部（纯黑 0 nit）+ 无凹陷云层雪地高光层次 + 等色度肤色保护，峰值直达 1000 nit。")
+                notes.append("影院均衡高光：提亮阴影和中间调，接近白点时逐渐减小高光增幅，峰值 1000 nit。")
             elif style_key == "natural":
                 notes.append("柔和暗室保护：BT.1886 (Gamma 2.4) 全黑暗室基准与 450 nits 峰值，适合全黑环境观影与保守高光控制。")
             elif style_key == "darkroom":
