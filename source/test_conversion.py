@@ -1108,12 +1108,22 @@ class ConversionTests(unittest.TestCase):
             self.assertAlmostEqual(nits[1] / nits[0], lin20[1] / lin20[0], delta=1e-5)
             self.assertAlmostEqual(nits[2] / nits[0], lin20[2] / lin20[0], delta=1e-5)
 
-        # Lift shadow separations while anchoring black and reserving headroom above lit skin.
+        # Preserve the complete v1.6.1 shadow/midtone range, not just the black point.
+        for i in range(361):
+            y = i / 1000.0
+            self.assertAlmostEqual(core.balanced_target_nits(y), 235.0 * y, places=8)
+        # Joins must not introduce visible kinks even when the maximum remains unchanged.
+        h = 1e-6
+        for y, nits in core.BALANCED_KNOTS[:-1]:
+            self.assertAlmostEqual(core.balanced_target_nits(y), nits, places=7)
+            left = (nits - core.balanced_target_nits(y - h)) / h
+            right = (core.balanced_target_nits(y + h) - nits) / h
+            self.assertAlmostEqual(left, right, delta=0.001 * left)
         self.assertEqual(decoded_nits((0.0, 0.0, 0.0)), (0.0, 0.0, 0.0))
         self.assertGreaterEqual(max(decoded_nits((0.05, 0.05, 0.05))), 0.30)
         shelf_nits = max(decoded_nits((0.10, 0.10, 0.10)))
-        self.assertGreaterEqual(shelf_nits, 2.0)
-        self.assertLessEqual(shelf_nits, 3.0)
+        self.assertAlmostEqual(shelf_nits, 1.48, delta=0.03)
+        self.assertAlmostEqual(max(decoded_nits((0.5, 0.5, 0.5))), 51.14, delta=0.1)
         shadow_nits = max(decoded_nits((0.12, 0.10, 0.08)))
         self.assertGreater(shadow_nits, shelf_nits)
         self.assertLess(shadow_nits, 4.0)
@@ -1128,7 +1138,10 @@ class ConversionTests(unittest.TestCase):
         upper_step = pq_at(0.95) - pq_at(0.94)
         self.assertGreater(top_step, 2.0 / 876)
         self.assertLess(top_step, 0.85 * upper_step)
-        self.assertGreater(pq_at(0.86) - pq_at(0.80), 0.025)
+        # Keep several distinct 10-bit PQ levels while narrowing the lit-face range.
+        face_step = pq_at(0.86) - pq_at(0.80)
+        self.assertGreater(face_step, 12 / 876)
+        self.assertLess(face_step, 21 / 876)
         self.assertGreater(max(decoded_nits((0.99, 0.99, 0.98))), 850.0)
         for ch in decoded_nits((1.0, 1.0, 1.0)):
             self.assertAlmostEqual(ch, core.BALANCED_PEAK_NITS, delta=0.5)

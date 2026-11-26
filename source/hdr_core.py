@@ -2,7 +2,7 @@
 
 SDR-to-HDR styles:
 - balanced (default): colorimetric Gamma 2.2 linear BT.709->BT.2020 luminance-preserving
-  expansion with lifted shadows and a gradual highlight shoulder up to 1000 nits.
+  expansion with reference shadows and a gradual highlight shoulder up to 1000 nits.
 - natural: softer colorimetric BT.1886 luminance-preserving curve capped at 450 nits
   for dark-room viewing and conservative highlight protection.
 - darkroom: shadow lift and a gradual highlight shoulder, with the same 450-nit peak.
@@ -31,7 +31,7 @@ import uuid
 from fractions import Fraction
 from typing import Callable
 
-VERSION = "1.6.2-preview.2"
+VERSION = "1.6.2-preview.3"
 SUPPORTED_OUTPUT_CONTAINERS = (".mp4", ".mkv")
 MP4_COPY_AUDIO_CODECS = frozenset({"aac", "ac3", "eac3", "dts", "flac", "alac", "mp3", "opus"})
 MP4_TEXT_SUBTITLE_CODECS = frozenset({"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"})
@@ -40,7 +40,7 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 M1, M2 = 2610 / 16384, 2523 / 32
 C1, C2, C3 = 3424 / 4096, 2413 / 128, 2392 / 128
 ALGORITHM_ID = "Fixed logarithmic SDR-to-PQ tone expansion with chroma gain 0.56"
-BALANCED_ALGORITHM_ID = "Colorimetric Gamma 2.2 BT.709-to-BT.2020 cinema mapping with shadow lift and gradual highlight shoulder (1000 nits peak)"
+BALANCED_ALGORITHM_ID = "Gamma 2.2 BT.709-to-BT.2020 cinema mapping with 235-nit shadow scale and monotone Hermite highlights (1000 nits peak)"
 NATURAL_ALGORITHM_ID = "Colorimetric BT.1886 linear BT.709-to-BT.2020 luminance-preserving highlight-protected SDR-to-PQ expansion (450 nits peak)"
 DV_STRIP_ALGORITHM_ID = "Lossless Dolby Vision RPU/EL strip preserving native 10-bit HDR10 base layer"
 DV_REENCODE_ALGORITHM_ID = "Dolby Vision to HDR10 conversion via libplacebo (apply_dolbyvision=true)"
@@ -49,13 +49,15 @@ CONTENT_LIGHT = "1000,1000"
 BALANCED_CONTENT_LIGHT = "1000,260"
 BALANCED_GAMMA = 2.2
 BALANCED_BASE_NITS = 235.0
-BALANCED_KNEE = 0.52
-BALANCED_BOOST_NITS = 765.0
-BALANCED_POWER = 2.75
-BALANCED_SHADOW_GAIN = 0.90
-BALANCED_SHADOW_PIVOT_NITS = 36.0
-BALANCED_SHOULDER_GAIN = 0.31
 BALANCED_PEAK_NITS = 1000.0
+# Relative linear BT.2020 luminance, output nits. Below the first knot the
+# slope is the v1.6.1 reference. Keep a positive slope into specular white.
+BALANCED_REFERENCE_END = 0.36
+BALANCED_KNOTS = (
+    (BALANCED_REFERENCE_END, BALANCED_BASE_NITS * BALANCED_REFERENCE_END),
+    (0.53, 135.0), (0.64, 160.0), (0.73, 192.0), (0.84, 369.0),
+    (0.91, 570.0), (0.97, 875.0), (1.0, BALANCED_PEAK_NITS),
+)
 NATURAL_CONTENT_LIGHT = "450,200"
 NATURAL_GAMMA = 2.4
 NATURAL_BASE_NITS = 190.0
@@ -69,7 +71,7 @@ DARKROOM_SHOULDER_GAIN = 0.53
 DARKROOM_SHOULDER_ORDER = 5
 DARKROOM_CONTENT_LIGHT = "450,450"  # Conservative upper bounds, not measured frame averages.
 NATURAL_LUT_SIZE = 49
-BALANCED_LUT_SIZE = 97
+BALANCED_LUT_SIZE = 113
 STYLE_LUT_NAMES = {"balanced": "balanced.cube", "natural": "natural.cube", "darkroom": "darkroom.cube", "vivid": "tone.cube"}
 STYLE_SHADER_NAMES = {"balanced": "balanced.hook", "natural": "natural.hook", "darkroom": "darkroom.hook", "vivid": "vivid.hook"}
 M_BT709_TO_BT2020 = (
@@ -985,14 +987,33 @@ def dimensions(p: dict, resolution="original") -> tuple[int, int]:
     return max(2, round(w / 2) * 2), max(2, round(h / 2) * 2)
 
 
+def _balanced_hermite_segments():
+    """Harmonic-mean tangents join adjacent intervals with the same slope."""
+    pairs = list(zip(BALANCED_KNOTS, BALANCED_KNOTS[1:]))
+    secants = [(y1 - y0) / (x1 - x0) for (x0, y0), (x1, y1) in pairs]
+    slopes = [BALANCED_BASE_NITS]
+    slopes.extend(2.0 * a * b / (a + b) for a, b in zip(secants, secants[1:]))
+    slopes.append(1900.0)  # nits per unit of linear luminance at the white endpoint
+    segments = []
+    for i, ((x0, y0), (x1, y1)) in enumerate(pairs):
+        width = x1 - x0
+        m0, m1 = width * slopes[i], width * slopes[i + 1]
+        delta = y1 - y0
+        segments.append((x0, x1, 1.0 / width, m0 + m1 - 2 * delta, 3 * delta - 2 * m0 - m1, m0, y0))
+    return tuple(segments)
+
+
+_BALANCED_SEGMENTS = _balanced_hermite_segments()
+
+
 def balanced_target_nits(y: float) -> float:
-    """Map relative linear luminance to nits, with small-signal lift and a finite white slope."""
-    y = min(1.0, max(0.0, y))
-    t = max(0.0, y - BALANCED_KNEE) / (1.0 - BALANCED_KNEE)
-    base = BALANCED_BASE_NITS * y + BALANCED_BOOST_NITS * t ** BALANCED_POWER
-    white = base / BALANCED_PEAK_NITS
-    lift = BALANCED_SHADOW_GAIN / (1.0 + base / BALANCED_SHADOW_PIVOT_NITS)
-    return base + base * (1.0 - white) * (lift + BALANCED_SHOULDER_GAIN * white * white)
+    if y <= BALANCED_REFERENCE_END:
+        return max(y, 0.0) * BALANCED_BASE_NITS
+    for start, end, inverse_width, a, b, c, d in _BALANCED_SEGMENTS:
+        if y < end:
+            t = (y - start) * inverse_width
+            return ((a * t + b) * t + c) * t + d
+    return BALANCED_PEAK_NITS
 
 
 def natural_target_nits(y: float) -> float:
@@ -1175,7 +1196,14 @@ def write_balanced_shader(path: Path, primaries: str = "bt709"):
     """Write a self-contained MAIN-stage GLSL shader for balanced 1000-nit cinema HDR10."""
     m = PRIMARY_TO_BT2020.get(primaries, M_BT709_TO_BT2020)
     yr, yg, yb = Y_BT2020
-    span = 1.0 - BALANCED_KNEE
+    # Emit the LUT's polynomial coefficients directly into the GPU program.
+    mapping = [f"    float tn = {BALANCED_PEAK_NITS:.8f};\n",
+               f"    if (y <= {BALANCED_REFERENCE_END:.8f}) tn = {BALANCED_BASE_NITS:.8f} * max(0.0, y);\n"]
+    for start, end, inverse_width, a, b, c, d in _BALANCED_SEGMENTS:
+        mapping.append(f"    else if (y < {end:.8f}) {{\n"
+                       f"        float t = (y - {start:.8f}) * {inverse_width:.10f};\n"
+                       f"        tn = (({a:.10f} * t + {b:.10f}) * t + {c:.10f}) * t + {d:.10f};\n"
+                       "    }\n")
     shader = (
         "//!HOOK MAIN\n"
         "//!BIND HOOKED\n"
@@ -1189,12 +1217,7 @@ def write_balanced_shader(path: Path, primaries: str = "bt709"):
         "    );\n"
         f"    float y = dot(b20, vec3({yr:.4f}, {yg:.4f}, {yb:.4f}));\n"
         "    if (y <= 1e-9) return vec4(0.0, 0.0, 0.0, c.a);\n"
-        "    float u = clamp(y, 0.0, 1.0);\n"
-        f"    float t = max(0.0, u - {BALANCED_KNEE:.6f}) / {span:.6f};\n"
-        f"    float base = {BALANCED_BASE_NITS:.6f} * u + {BALANCED_BOOST_NITS:.6f} * pow(t, {BALANCED_POWER:.6f});\n"
-        f"    float white = base / {BALANCED_PEAK_NITS:.6f};\n"
-        f"    float lift = {BALANCED_SHADOW_GAIN:.6f} / (1.0 + base / {BALANCED_SHADOW_PIVOT_NITS:.6f});\n"
-        f"    float tn = base + base * (1.0 - white) * (lift + {BALANCED_SHOULDER_GAIN:.6f} * white * white);\n"
+        f"{''.join(mapping)}"
         "    vec3 nits = b20 * (tn / y);\n"
         "    float pk = max(nits.r, max(nits.g, nits.b));\n"
         f"    if (pk > {BALANCED_PEAK_NITS:.6f}) nits *= ({BALANCED_PEAK_NITS:.6f} / pk);\n"
@@ -2595,7 +2618,7 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 algorithm_desc = BALANCED_ALGORITHM_ID
                 if plan.get("gpu_filter"):
                     dec_prefix = "Vulkan hwdec + " if plan.get("vulkan_hwdec") else ""
-                    method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (Gamma 2.2 BT.709->BT.2020 balanced shadow lift and shoulder -> PQ) + 10-bit HEVC ({plan['video_codec']})"
+                    method_desc = f"{dec_prefix}libplacebo GPU GLSL MAIN shader (Gamma 2.2 BT.709->BT.2020 balanced Hermite highlights -> PQ) + 10-bit HEVC ({plan['video_codec']})"
                 elif plan.get("fast_hw_filter"):
                     method_desc = f"Multi-threaded SIMD zscale (ordered dither, direct p010le) + Gamma 2.2 balanced {BALANCED_LUT_SIZE}^3 tetrahedral 3D LUT + 10-bit HEVC ({plan['video_codec']})"
                 else:
@@ -2603,7 +2626,7 @@ def convert(opts: Options, callback: Callable[[dict], None] | None = None,
                 video_enc_desc = f"{plan['video_codec']} true lossless" if plan["lossless_video"] else f"{plan['video_codec']} ({plan['quality_control']})"
                 mastering_desc = "BT.2020 / D65 / 1000 nits mastering container; curve peak aligned to 1000 nits"
                 light_desc = "1000/260 nits preset MaxCLL/MaxFALL; not measured per title"
-                fidelity_desc = "Fixed luminance mapping increases near-black and midtone gain. The high-end slope tapers towards a 1000-nit peak. RGB channels share the same linear-light gain."
+                fidelity_desc = "Fixed luminance mapping retains the v1.6.1 shadow and midtone scale up to relative Y=0.36. Highlights follow a monotone Hermite curve to 1000 nits. RGB channels share the same linear-light gain."
             elif plan.get("hdr_style") == "darkroom":
                 algorithm_desc = "Colorimetric darkroom shadow lift and soft shoulder (450 nits peak)"
                 path_desc = "GPU GLSL" if plan["gpu_filter"] else "49^3 tetrahedral LUT"
